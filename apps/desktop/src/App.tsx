@@ -1,6 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
+
+declare global {
+  interface Window {
+    __TAURI_INTERNALS__?: unknown;
+  }
+}
 
 type Check = { id: string; label: string; ok: boolean; detail: string };
 type ScanResult = { input_path: string; pdf_count: number; courses: Record<string, number> };
@@ -10,6 +17,14 @@ const API = "http://127.0.0.1:8766";
 
 function defaultOutputPath() {
   return "~/Documents/Exam Generator Output";
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function isTauri() {
+  return typeof window !== "undefined" && Boolean(window.__TAURI_INTERNALS__);
 }
 
 async function post<T>(path: string, body: unknown): Promise<T> {
@@ -31,20 +46,34 @@ export default function App() {
   const [job, setJob] = useState<Job | null>(null);
   const [error, setError] = useState("");
   const [backendReady, setBackendReady] = useState(false);
+  const [backendStarting, setBackendStarting] = useState(false);
 
   const allRequiredOk = useMemo(() => checks.filter((item) => item.id !== "port").every((item) => item.ok), [checks]);
 
   async function checkBackend() {
     setError("");
     try {
-      await fetch(`${API}/api/health`);
+      let response = await fetch(`${API}/api/health`).catch(() => null);
+      if (!response?.ok && isTauri()) {
+        setBackendStarting(true);
+        await invoke("start_backend");
+        for (let attempt = 0; attempt < 12; attempt += 1) {
+          await sleep(400);
+          response = await fetch(`${API}/api/health`).catch(() => null);
+          if (response?.ok) break;
+        }
+      }
+      if (!response?.ok) throw new Error("Backend unavailable");
       setBackendReady(true);
       const data = await post<{ checks: Check[]; default_output: string }>("/api/check", { output_path: outputPath });
       setChecks(data.checks);
       if (outputPath === defaultOutputPath()) setOutputPath(data.default_output);
     } catch (err) {
       setBackendReady(false);
-      setError("Backend is not running. Start the Python sidecar: python3 -m exam_backend.cli serve --port 8766");
+      const detail = err instanceof Error ? err.message : String(err);
+      setError(isTauri() ? `Could not start the local backend automatically: ${detail}` : "Backend is not running. For browser development, run scripts/dev-backend.sh first.");
+    } finally {
+      setBackendStarting(false);
     }
   }
 
@@ -110,7 +139,7 @@ export default function App() {
           <h1>Exam Generator</h1>
           <p className="lede">Choose a folder of lecture PDFs, generate exams, and open the local exam index.</p>
         </div>
-        <button className="secondary" onClick={checkBackend}>Check again</button>
+        <button className="secondary" onClick={checkBackend} disabled={backendStarting}>{backendStarting ? "Starting..." : "Check again"}</button>
       </header>
 
       {error && <section className="notice error">{error}</section>}
