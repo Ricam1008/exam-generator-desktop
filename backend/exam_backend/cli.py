@@ -10,6 +10,7 @@ import shutil
 import sys
 import threading
 import uuid
+import importlib.util
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -114,6 +115,15 @@ def check_dependencies(output_path: str | None = None, model: str = DEFAULT_MODE
     checks.append({"id": "backend", "label": "Python backend resources", "ok": templates_ok, "detail": str(PACKAGE_DIR)})
     ok = ok and templates_ok
 
+    pypdf_ok = importlib.util.find_spec("pypdf") is not None
+    checks.append({
+        "id": "pypdf",
+        "label": "PDF text extractor",
+        "ok": pypdf_ok,
+        "detail": "pypdf available" if pypdf_ok else "Run: python3 -m pip install --user pypdf",
+    })
+    ok = ok and pypdf_ok
+
     out = Path(output_path).expanduser() if output_path else DEFAULT_OUTPUT_DIR
     try:
         out.mkdir(parents=True, exist_ok=True)
@@ -187,12 +197,14 @@ def materialize_input(input_path: str, output_path: str, overwrite: bool = False
     return out_root
 
 
-def generator_args(root: Path, overwrite: bool = False) -> argparse.Namespace:
+def generator_args(root: Path, overwrite: bool = False, example: bool = False) -> argparse.Namespace:
+    min_mc, max_mc = (12, 20) if example else (40, 60)
+    min_open, max_open = (4, 8) if example else (10, 20)
     return argparse.Namespace(
         root=str(root), overwrite=overwrite, only_folder=None, limit=None,
-        min_mc=40, max_mc=60, min_open=10, max_open=20,
+        min_mc=min_mc, max_mc=max_mc, min_open=min_open, max_open=max_open,
         endpoint="http://localhost:11434/api/chat", model=DEFAULT_MODEL,
-        timeout=600, retries=2, allow_heuristic_fallback=False,
+        timeout=600, retries=3, allow_heuristic_fallback=True,
     )
 
 
@@ -222,7 +234,7 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
         STATE.preview_root = project_root
 
         if mode in {"example", "all"}:
-            args = generator_args(project_root, overwrite=overwrite)
+            args = generator_args(project_root, overwrite=overwrite, example=mode == "example")
             pdfs = generate_exams.find_pdfs(project_root, args.only_folder)
             if mode == "example":
                 pdfs = pdfs[:1]

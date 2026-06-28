@@ -18,6 +18,7 @@ Start the Python backend first:
 
 ```bash
 cd backend
+python3 -m pip install --user pypdf
 python3 -m exam_backend.cli serve --port 8766
 ```
 

@@ -347,8 +347,8 @@ def scaled_retry_counts(mc: int, open_count: int, attempt: int, args: argparse.N
     if attempt <= 0:
         return mc, open_count
     factor = 0.85 if attempt == 1 else 0.7
-    retry_mc = max(args.min_mc, int(round(mc * factor)))
-    retry_open = max(args.min_open, int(round(open_count * factor)))
+    retry_mc = max(8, int(round(mc * factor)))
+    retry_open = max(3, int(round(open_count * factor)))
     return min(args.max_mc, retry_mc), min(args.max_open, retry_open)
 
 
@@ -389,6 +389,20 @@ def ensure_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
 
 
+def first_list(model_exam: dict[str, Any], keys: list[str]) -> list[Any]:
+    for key in keys:
+        value = model_exam.get(key)
+        if isinstance(value, list):
+            return value
+    questions = model_exam.get("questions")
+    if isinstance(questions, dict):
+        for key in keys:
+            value = questions.get(key)
+            if isinstance(value, list):
+                return value
+    return []
+
+
 def normalize_exam(
     model_exam: dict[str, Any],
     course: str,
@@ -397,7 +411,10 @@ def normalize_exam(
     source_word_count: int,
 ) -> dict[str, Any]:
     mc_questions = []
-    for index, question in enumerate(ensure_list(model_exam.get("multiple_choice")), start=1):
+    mc_source = first_list(model_exam, ["multiple_choice", "multiple_choice_questions", "mc_questions", "mcq", "mc"])
+    for index, question in enumerate(mc_source, start=1):
+        if not isinstance(question, dict):
+            continue
         options = []
         for option in ensure_list(question.get("options"))[:6]:
             if not isinstance(option, dict):
@@ -419,7 +436,10 @@ def normalize_exam(
         )
 
     open_questions = []
-    for index, question in enumerate(ensure_list(model_exam.get("open_ended")), start=1):
+    open_source = first_list(model_exam, ["open_ended", "open_ended_questions", "open_questions", "short_answer", "essay_questions"])
+    for index, question in enumerate(open_source, start=1):
+        if not isinstance(question, dict):
+            continue
         rubric = question.get("grading_rubric")
         if not isinstance(rubric, dict):
             rubric = {
@@ -486,14 +506,14 @@ def heuristic_exam(
             {
                 "id": f"mc-{index:03d}",
                 "topic": topic,
-                "question": f"Which statements are supported by the slide text about: {topic}?",
+                "question": f"Welche Aussagen werden durch den Quellentext zu folgendem Punkt gestützt: {topic}?",
                 "options": [
                     {"text": sentence[:220], "is_correct": True},
-                    {"text": "The source presents this point as unrelated to the lecture topic.", "is_correct": False},
-                    {"text": "The source treats the concept as a purely historical detail with no exam relevance.", "is_correct": False},
-                    {"text": "The point should be understood in relation to the surrounding lecture concepts.", "is_correct": True},
+                    {"text": "Die Quelle stellt diesen Punkt als unabhängig vom Thema der Lehrveranstaltung dar.", "is_correct": False},
+                    {"text": "Die Quelle behandelt dieses Konzept nur als historische Randnotiz ohne Prüfungsrelevanz.", "is_correct": False},
+                    {"text": "Der Punkt sollte im Zusammenhang mit den umliegenden Konzepten aus der Quelle verstanden werden.", "is_correct": True},
                 ],
-                "explanation": "This inspection-only fallback uses extracted text directly because the LLM generation endpoint was unavailable.",
+                "explanation": "Diese Notfallfrage nutzt direkt extrahierten Quellentext, weil die KI kein vollständig verwertbares Prüfungs-JSON geliefert hat.",
             }
         )
     open_questions = []
@@ -501,21 +521,21 @@ def heuristic_exam(
         open_questions.append(
             {
                 "id": f"open-{index:03d}",
-                "question": f"Explain the exam relevance of this slide point: {sentence[:180]}",
+                "question": f"Erkläre die Prüfungsrelevanz dieses Quellpunkts: {sentence[:180]}",
                 "expected_answer": sentence,
                 "key_concepts": [word for word in re.findall(r"\b[A-Za-zÄÖÜäöüß][\wÄÖÜäöüß-]{5,}\b", sentence)[:6]],
                 "grading_rubric": {
-                    "90-100": "Precise, complete explanation grounded in the quoted source point.",
-                    "61-89": "Mostly correct explanation with minor gaps.",
-                    "41-60": "Relevant but incomplete or imprecise.",
-                    "21-40": "Only loosely related to the source point.",
-                    "0-20": "Missing, wrong, or generic answer.",
+                    "90-100": "Präzise, vollständige Erklärung, die klar am zitierten Quellpunkt verankert ist.",
+                    "61-89": "Überwiegend korrekte Erklärung mit kleineren Lücken.",
+                    "41-60": "Relevant, aber unvollständig oder unpräzise.",
+                    "21-40": "Nur locker mit dem Quellpunkt verbunden.",
+                    "0-20": "Fehlende, falsche oder sehr allgemeine Antwort.",
                 },
                 "max_score": 100,
             }
         )
     warning = extraction_warning or ""
-    warning = (warning + " " if warning else "") + "LLM generation was unavailable; this is a small heuristic inspection exam, not a final study set."
+    warning = (warning + " " if warning else "") + "Die KI konnte kein vollständig verwertbares Prüfungs-JSON liefern; diese Datei ist eine kleinere Notfall-Inspektionsprüfung aus direkt extrahiertem Quellentext."
     return normalize_exam(
         {"multiple_choice": mc, "open_ended": open_questions},
         course,
@@ -569,8 +589,9 @@ def write_exam_folder(
         if attempt:
             prompt += (
                 "\n\nIMPORTANT RETRY INSTRUCTION:\n"
-                "Your previous response for this PDF was not valid JSON. Return one complete, syntactically valid JSON object only. "
+                "Your previous response for this PDF was invalid, incomplete, or failed schema validation. Return one complete, syntactically valid JSON object only. "
                 "Do not include markdown, comments, trailing commas, undefined values, or text outside the JSON object. "
+                f"Include both a multiple_choice array with {target_mc} usable questions and an open_ended array with {target_open} usable questions. "
                 "Use shorter but still substantive question and explanation text if needed."
             )
         try:
