@@ -8,13 +8,20 @@ use tauri::Manager;
 
 struct BackendState(Mutex<Option<Child>>);
 
-impl Drop for BackendState {
-    fn drop(&mut self) {
+impl BackendState {
+    fn stop(&self) {
         if let Ok(mut child) = self.0.lock() {
             if let Some(mut process) = child.take() {
                 let _ = process.kill();
+                let _ = process.wait();
             }
         }
+    }
+}
+
+impl Drop for BackendState {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -59,12 +66,30 @@ fn start_backend(app: tauri::AppHandle, state: tauri::State<BackendState>) -> Re
     Ok(())
 }
 
+#[tauri::command]
+fn stop_backend(state: tauri::State<BackendState>) {
+    state.stop();
+}
+
 fn main() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .manage(BackendState(Mutex::new(None)))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![start_backend])
-        .run(tauri::generate_context!())
-        .expect("error while running Exam Generator Desktop");
+        .invoke_handler(tauri::generate_handler![start_backend, stop_backend])
+        .build(tauri::generate_context!())
+        .expect("error while building Exam Generator Desktop");
+
+    app.run(|app_handle, event| match event {
+        tauri::RunEvent::Exit | tauri::RunEvent::ExitRequested { .. } => {
+            app_handle.state::<BackendState>().stop();
+        }
+        tauri::RunEvent::WindowEvent {
+            event: tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed,
+            ..
+        } => {
+            app_handle.state::<BackendState>().stop();
+        }
+        _ => {}
+    });
 }
