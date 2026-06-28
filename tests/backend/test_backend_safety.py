@@ -1,5 +1,6 @@
 from pathlib import Path
 from types import SimpleNamespace
+import os
 import sys
 import subprocess
 import tempfile
@@ -138,6 +139,44 @@ class BackendSafetyTests(unittest.TestCase):
                 generate_exams.extract_pdf_text(Path("/tmp/fake.pdf"))
         finally:
             generate_exams.marker_cli_path = original_marker  # type: ignore[assignment]
+
+    def test_marker_cli_path_supports_explicit_env_path(self) -> None:
+        original_marker_path = os.environ.get("MARKER_SINGLE_PATH")
+        original_path = os.environ.get("PATH", "")
+
+        with tempfile.TemporaryDirectory() as temp:
+            marker = Path(temp) / ("marker_single.exe" if os.name == "nt" else "marker_single")
+            marker.write_text("#!/bin/sh\n", encoding="utf-8")
+            marker.chmod(0o755)
+            os.environ["MARKER_SINGLE_PATH"] = str(marker)
+            os.environ["PATH"] = ""
+            try:
+                self.assertEqual(generate_exams.marker_cli_path(), str(marker))
+            finally:
+                if original_marker_path is None:
+                    os.environ.pop("MARKER_SINGLE_PATH", None)
+                else:
+                    os.environ["MARKER_SINGLE_PATH"] = original_marker_path
+                os.environ["PATH"] = original_path
+
+    def test_marker_cli_path_finds_homebrew_when_gui_path_is_sparse(self) -> None:
+        if os.name == "nt":
+            self.skipTest("Homebrew path check is macOS-specific.")
+        marker = Path("/opt/homebrew/bin/marker_single")
+        if not marker.exists():
+            self.skipTest("Homebrew marker_single is not installed on this machine.")
+        original_marker_path = os.environ.get("MARKER_SINGLE_PATH")
+        original_path = os.environ.get("PATH", "")
+        try:
+            os.environ.pop("MARKER_SINGLE_PATH", None)
+            os.environ["PATH"] = "/usr/bin:/bin"
+            self.assertEqual(generate_exams.marker_cli_path(), str(marker))
+        finally:
+            if original_marker_path is None:
+                os.environ.pop("MARKER_SINGLE_PATH", None)
+            else:
+                os.environ["MARKER_SINGLE_PATH"] = original_marker_path
+            os.environ["PATH"] = original_path
 
     def test_marker_failure_falls_back_to_legacy_parser(self) -> None:
         original_marker = generate_exams.marker_cli_path
