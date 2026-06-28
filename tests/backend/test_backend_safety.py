@@ -7,7 +7,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "backend"))
 
-from exam_backend import cli  # noqa: E402
+from exam_backend import cli, local_server  # noqa: E402
 from exam_backend import generate_exams  # noqa: E402
 from exam_backend.cli import Job, backup_existing_project, ensure_separate_output, final_args, generator_args, job_log, materialize_input, scan_folder  # noqa: E402
 
@@ -205,6 +205,16 @@ class BackendSafetyTests(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertIn("no message", result["detail"])
+
+    def test_grading_prompt_is_austrian_tutor_not_flirty(self) -> None:
+        prompt = local_server.TUTOR_EVALUATOR_SYSTEM_PROMPT
+
+        self.assertIn("österreich", prompt.casefold())
+        self.assertIn("Schmäh", prompt)
+        self.assertIn("Schimpfwörter", prompt)
+        forbidden = ["flirtend", "anzüglich", "sexualisiert", "romantisch", "lusterregend"]
+        for word in forbidden:
+            self.assertNotIn(word, prompt.casefold())
 
     def test_chunk_text_keeps_all_content(self) -> None:
         text = "alpha " * 900 + "\n\n" + "beta " * 900 + "\n\n" + "gamma " * 900
