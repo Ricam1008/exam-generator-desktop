@@ -8,6 +8,7 @@ __pycache__/
 dist/
 build/
 target/
+apps/desktop/src-tauri/gen/
 *.spec
 
 # generated content

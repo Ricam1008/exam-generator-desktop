@@ -19,7 +19,7 @@ impl Drop for BackendState {
 }
 
 fn backend_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    let dev_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../backend");
+    let dev_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../backend");
     if dev_dir.exists() {
         return Ok(dev_dir);
     }
