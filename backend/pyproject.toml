@@ -10,3 +10,9 @@ build = ["pyinstaller>=6"]
 
 [project.scripts]
 exam-generator-backend = "exam_backend.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["exam_backend*"]
+
+[tool.setuptools.package-data]
+exam_backend = ["templates/*"]

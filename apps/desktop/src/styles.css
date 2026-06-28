@@ -43,6 +43,7 @@ p { margin: 0; }
 .model-status.ok strong { color: var(--good); }
 .model-status.neutral strong { color: var(--accent-dark); }
 .model-status p { color: var(--muted); font-size: .9rem; margin-top: 3px; }
+.model-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
 .dot { width: 10px; height: 10px; border-radius: 999px; margin-top: 6px; background: var(--bad); flex: none; }
 .dot.ok { background: var(--good); }
 .actions-panel { display: flex; justify-content: space-between; gap: 16px; align-items: center; }

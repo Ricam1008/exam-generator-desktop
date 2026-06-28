@@ -38,6 +38,35 @@ fn backend_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Err("Could not find the bundled Python backend.".to_string())
 }
 
+fn sidecar_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "exam-generator-backend.exe"
+    } else {
+        "exam-generator-backend"
+    }
+}
+
+fn bundled_backend(app: &tauri::AppHandle) -> Option<PathBuf> {
+    let resource_dir = app.path().resource_dir().ok()?;
+    let exe = resource_dir.join("sidecar-bin").join(sidecar_name());
+    if exe.exists() {
+        return Some(exe);
+    }
+    let mut stack = vec![resource_dir];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.file_name().and_then(|name| name.to_str()) == Some(sidecar_name()) {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
 #[tauri::command]
 fn start_backend(app: tauri::AppHandle, state: tauri::State<BackendState>) -> Result<(), String> {
     let mut guard = state.0.lock().map_err(|err| err.to_string())?;
@@ -47,20 +76,39 @@ fn start_backend(app: tauri::AppHandle, state: tauri::State<BackendState>) -> Re
         }
     }
 
-    let dir = backend_dir(&app)?;
-    let child = Command::new("python3")
-        .arg("-m")
-        .arg("exam_backend.cli")
-        .arg("serve")
-        .arg("--port")
-        .arg("8766")
-        .env("PYTHONPATH", &dir)
-        .current_dir(&dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|err| format!("Could not start Python backend from {}: {err}", dir.display()))?;
+    let child = if let Some(exe) = bundled_backend(&app) {
+        Command::new(&exe)
+            .arg("serve")
+            .arg("--port")
+            .arg("8766")
+            .arg("--parent-pid")
+            .arg(std::process::id().to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|err| format!("Could not start bundled backend from {}: {err}", exe.display()))?
+    } else {
+        if !cfg!(debug_assertions) {
+            return Err("Could not find the bundled backend executable.".to_string());
+        }
+        let dir = backend_dir(&app)?;
+        Command::new("python3")
+            .arg("-m")
+            .arg("exam_backend.cli")
+            .arg("serve")
+            .arg("--port")
+            .arg("8766")
+            .arg("--parent-pid")
+            .arg(std::process::id().to_string())
+            .env("PYTHONPATH", &dir)
+            .current_dir(&dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|err| format!("Could not start Python backend from {}: {err}", dir.display()))?
+    };
 
     *guard = Some(child);
     Ok(())

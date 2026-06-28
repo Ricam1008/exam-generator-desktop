@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import datetime as dt
 import json
 import math
+import os
 import shutil
 import sys
 import threading
+import time
 import uuid
 import importlib.util
 from dataclasses import dataclass, field
@@ -30,6 +33,9 @@ DEFAULT_MODEL = "gemma4:31b-cloud"
 DEFAULT_OLLAMA = "http://localhost:11434"
 DEFAULT_OUTPUT_DIR = Path.home() / "Documents" / "Exam Generator Output"
 METRICS_LIMIT = 80
+
+if getattr(sys, "frozen", False):
+    PACKAGE_DIR = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)).resolve()
 
 
 def now_iso() -> str:
@@ -174,6 +180,34 @@ def model_is_available(model: str, names: list[str]) -> bool:
     return model in names or any(name.startswith(model + ":") for name in names)
 
 
+def module_available(name: str) -> bool:
+    if importlib.util.find_spec(name) is not None:
+        return True
+    try:
+        __import__(name)
+        return True
+    except Exception:
+        return False
+
+
+def pull_model(model: str) -> dict[str, Any]:
+    selected_model = (model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    payload = {"name": selected_model, "stream": False}
+    try:
+        result = ollama_json("/api/pull", payload, timeout=3600)
+        STATE.selected_model = selected_model
+        return {"ok": True, "model": selected_model, "detail": "Model downloaded", "ollama": result}
+    except error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace") if exc.fp else str(exc)
+        return {"ok": False, "model": selected_model, "detail": detail or str(exc)}
+    except error.URLError as exc:
+        return {"ok": False, "model": selected_model, "detail": f"Could not reach Ollama: {exc}"}
+    except TimeoutError:
+        return {"ok": False, "model": selected_model, "detail": "Model download timed out."}
+    except Exception as exc:
+        return {"ok": False, "model": selected_model, "detail": str(exc)}
+
+
 def check_dependencies(output_path: str | None = None, model: str = DEFAULT_MODEL) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
     ok = True
@@ -210,7 +244,7 @@ def check_dependencies(output_path: str | None = None, model: str = DEFAULT_MODE
     checks.append({"id": "backend", "label": "Python backend resources", "ok": templates_ok, "detail": str(PACKAGE_DIR)})
     ok = ok and templates_ok
 
-    pypdf_ok = importlib.util.find_spec("pypdf") is not None
+    pypdf_ok = module_available("pypdf")
     checks.append({
         "id": "pypdf",
         "label": "PDF text extractor",
@@ -551,6 +585,8 @@ class Handler(BaseHTTPRequestHandler):
                 json_response(self, 200, check_dependencies(payload.get("output_path"), payload.get("model", DEFAULT_MODEL)))
             elif parsed_path.path == "/api/test-model":
                 json_response(self, 200, test_model(str(payload.get("model") or DEFAULT_MODEL)))
+            elif parsed_path.path == "/api/pull-model":
+                json_response(self, 200, pull_model(str(payload.get("model") or DEFAULT_MODEL)))
             elif parsed_path.path == "/api/scan":
                 json_response(self, 200, scan_folder(payload.get("input_path", ""), payload.get("model", DEFAULT_MODEL)))
             elif parsed_path.path == "/api/generate":
@@ -600,7 +636,34 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def serve(port: int) -> int:
+def parent_is_alive(parent_pid: int) -> bool:
+    if parent_pid <= 0:
+        return True
+    if os.name != "nt":
+        try:
+            os.kill(parent_pid, 0)
+            return True
+        except OSError:
+            return False
+    handle = ctypes.windll.kernel32.OpenProcess(0x00100000, False, parent_pid)
+    if not handle:
+        return False
+    try:
+        return ctypes.windll.kernel32.WaitForSingleObject(handle, 0) == 0x00000102
+    finally:
+        ctypes.windll.kernel32.CloseHandle(handle)
+
+
+def watch_parent(parent_pid: int) -> None:
+    while True:
+        time.sleep(2)
+        if not parent_is_alive(parent_pid):
+            os._exit(0)
+
+
+def serve(port: int, parent_pid: int = 0) -> int:
+    if parent_pid:
+        threading.Thread(target=watch_parent, args=(parent_pid,), daemon=True).start()
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(json.dumps({"event": "ready", "port": port}), flush=True)
     try:
@@ -617,9 +680,10 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     serve_parser = sub.add_parser("serve")
     serve_parser.add_argument("--port", type=int, default=8766)
+    serve_parser.add_argument("--parent-pid", type=int, default=0)
     args = parser.parse_args()
     if args.command == "serve":
-        return serve(args.port)
+        return serve(args.port, args.parent_pid)
     return 2
 
 

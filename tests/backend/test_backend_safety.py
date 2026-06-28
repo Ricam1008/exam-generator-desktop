@@ -250,6 +250,20 @@ class BackendSafetyTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("no message", result["detail"])
 
+    def test_pull_model_success_updates_selected_model(self) -> None:
+        original_ollama_json = cli.ollama_json
+        original_model = cli.STATE.selected_model
+
+        try:
+            cli.ollama_json = lambda *args, **kwargs: {"status": "success"}  # type: ignore[assignment]
+            result = cli.pull_model("qwen2.5:14b")
+        finally:
+            cli.ollama_json = original_ollama_json  # type: ignore[assignment]
+            cli.STATE.selected_model = original_model
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["model"], "qwen2.5:14b")
+
     def test_grading_prompt_is_austrian_tutor_not_flirty(self) -> None:
         prompt = local_server.TUTOR_EVALUATOR_SYSTEM_PROMPT
 

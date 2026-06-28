@@ -15,6 +15,16 @@ This repository is separate from the production exam workspace. Do not commit PD
 - Keeps input folders read-only.
 - Shows a rough generation-time estimate after scanning a folder.
 
+## Screenshots
+
+Startup/status view:
+
+![Exam Generator status screen](docs/screenshots/status.png)
+
+Folder review after scanning PDFs:
+
+![Exam Generator folder review](docs/screenshots/folder-review.png)
+
 ## Current Install Status
 
 This is currently a developer-style install from GitHub, not yet a polished one-click installer.
@@ -29,6 +39,37 @@ That means you need to install a few dependencies once:
 - At least one Ollama model
 
 After setup, the app can be started from the project folder.
+
+## Packaging Branch
+
+The `packaging/installers` branch is separate from `main`.
+
+Its goal is to produce normal-user installers:
+
+- macOS `.dmg`
+- Windows installer `.exe`
+- bundled Python backend
+- no required Node, Rust, Git, Python, or Apple Command Line Tools for normal users
+
+The packaging test app is deliberately named:
+
+```text
+Exam Generator Packaging Test
+```
+
+This prevents it from replacing the current working `Exam Generator` app during testing.
+
+Ollama is still external. Users must install Ollama, and the app can guide them or download the selected model once Ollama is running.
+
+To build installers from the packaging branch:
+
+```bash
+git switch packaging/installers
+cd apps/desktop
+npm run tauri build
+```
+
+GitHub Actions also builds macOS and Windows artifacts when this branch is pushed.
 
 ## Mac Installation
 

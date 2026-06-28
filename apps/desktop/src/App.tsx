@@ -120,6 +120,7 @@ export default function App() {
   const [selectedModel, setSelectedModel] = useState(savedModel());
   const [modelTest, setModelTest] = useState<ModelTest | null>(null);
   const [modelTesting, setModelTesting] = useState(false);
+  const [modelPulling, setModelPulling] = useState(false);
   const [scan, setScan] = useState<ScanResult | null>(null);
   const [job, setJob] = useState<Job | null>(null);
   const [error, setError] = useState("");
@@ -180,6 +181,20 @@ export default function App() {
       setModelTest({ ok: false, model, detail: err instanceof Error ? err.message : String(err) });
     } finally {
       setModelTesting(false);
+    }
+  }
+
+  async function pullSelectedModel() {
+    setModelPulling(true);
+    setModelTest({ ok: false, model: selectedModel, detail: "Downloading model..." });
+    try {
+      const result = await post<ModelTest>("/api/pull-model", { model: selectedModel });
+      setModelTest(result);
+      await checkBackend();
+    } catch (err) {
+      setModelTest({ ok: false, model: selectedModel, detail: err instanceof Error ? err.message : String(err) });
+    } finally {
+      setModelPulling(false);
     }
   }
 
@@ -303,6 +318,14 @@ export default function App() {
           <div className={`model-status ${modelReady ? "ok" : modelTesting ? "neutral" : "bad"}`}>
             <strong>{modelTesting ? "Testing..." : modelReady ? "Model responded" : "Model not ready"}</strong>
             <p>{modelTest?.detail || (availableModels.length === 0 ? `No models installed. Run: ollama pull ${FALLBACK_MODEL}` : "Choose an installed Ollama model.")}</p>
+            <div className="model-actions">
+              {!ollamaReachable && <button className="secondary" onClick={() => openUrl("https://ollama.com")}>Get Ollama</button>}
+              {ollamaReachable && !selectedModelAvailable && (
+                <button className="secondary" onClick={pullSelectedModel} disabled={modelPulling}>
+                  {modelPulling ? "Downloading..." : "Download model"}
+                </button>
+              )}
+            </div>
           </div>
         </div>
         <div className="checks">

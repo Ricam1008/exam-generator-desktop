@@ -3,12 +3,15 @@ node_modules/
 .venv/
 __pycache__/
 *.pyc
+*.egg-info/
+.codebase-memory/
 
 # builds
 dist/
 build/
 target/
 apps/desktop/src-tauri/gen/
+backend/sidecar-bin/
 *.spec
 
 # generated content
