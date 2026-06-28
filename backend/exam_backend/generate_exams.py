@@ -24,6 +24,7 @@ DEFAULT_MODEL = "gemma4:31b-cloud"
 MIN_WORDS_FOR_FULL_EXAM = 3000
 LOW_TEXT_WORD_THRESHOLD = 800
 MAX_PROMPT_TEXT_CHARS = 52000
+FULL_COVERAGE_TEXT_CHARS = 22000
 
 
 EXAM_JSON_SCHEMA: dict[str, Any] = {
@@ -45,6 +46,12 @@ EXAM_JSON_SCHEMA: dict[str, Any] = {
                 "generated_date": {"type": "string"},
                 "text_extraction_warning": {"type": ["string", "null"]},
                 "generator": {"type": "string"},
+                "source_word_count": {"type": "integer"},
+                "coverage_mode": {"type": "string"},
+                "source_chunk_count": {"type": "integer"},
+                "processed_chunk_count": {"type": "integer"},
+                "failed_chunk_count": {"type": "integer"},
+                "coverage_warning": {"type": ["string", "null"]},
                 "question_count": {"type": "object"},
             },
         },
@@ -172,6 +179,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--timeout", type=int, default=600, help="LLM request timeout in seconds.")
     parser.add_argument("--retries", type=int, default=2, help="Retries per PDF when the model returns malformed JSON.")
+    parser.add_argument(
+        "--coverage-mode",
+        choices=["representative", "full_coverage", "auto"],
+        default="auto",
+        help="Use representative excerpts, full multi-chunk coverage, or automatic full coverage for long PDFs.",
+    )
     parser.add_argument(
         "--allow-heuristic-fallback",
         action="store_true",
@@ -324,6 +337,43 @@ def chunk_for_prompt(text: str, max_chars: int = MAX_PROMPT_TEXT_CHARS) -> str:
     return "\n\n".join(labeled)
 
 
+def chunk_text(text: str, max_chars: int = FULL_COVERAGE_TEXT_CHARS) -> list[str]:
+    if len(text) <= max_chars:
+        return [text]
+    chunks = []
+    current: list[str] = []
+    current_len = 0
+    for block in text.split("\n\n"):
+        block_len = len(block) + 2
+        if current and current_len + block_len > max_chars:
+            chunks.append("\n\n".join(current))
+            current = []
+            current_len = 0
+        if block_len > max_chars:
+            for index in range(0, len(block), max_chars):
+                chunks.append(block[index : index + max_chars])
+            continue
+        current.append(block)
+        current_len += block_len
+    if current:
+        chunks.append("\n\n".join(current))
+    return chunks
+
+
+def resolve_coverage_mode(text: str, args: argparse.Namespace) -> str:
+    mode = getattr(args, "coverage_mode", "representative")
+    if mode == "auto":
+        return "full_coverage" if len(text) > MAX_PROMPT_TEXT_CHARS else "representative"
+    return mode
+
+
+def distribute_counts(total: int, buckets: int) -> list[int]:
+    if buckets <= 0:
+        return []
+    base, remainder = divmod(total, buckets)
+    return [base + (1 if index < remainder else 0) for index in range(buckets)]
+
+
 def target_counts(words: int, args: argparse.Namespace) -> tuple[int, int]:
     if words < LOW_TEXT_WORD_THRESHOLD:
         return min(12, args.min_mc), min(4, args.min_open)
@@ -385,6 +435,28 @@ def load_json_from_model(raw: str) -> dict[str, Any]:
         return json.loads(raw[start : end + 1])
 
 
+def call_json_with_retries(args: argparse.Namespace, prompt: str, context: str, progress: Callable[[str], None] | None = None) -> dict[str, Any]:
+    last_error: Exception | None = None
+    for attempt in range(max(0, args.retries) + 1):
+        retry_prompt = prompt
+        if attempt:
+            retry_prompt += (
+                "\n\nSTRICT RETRY INSTRUCTION:\n"
+                "Return one complete valid JSON object only. No markdown, no comments, no prose outside JSON."
+            )
+        try:
+            if progress:
+                progress(f"Waiting for Ollama: {context} (attempt {attempt + 1}/{max(0, args.retries) + 1})")
+            return load_json_from_model(post_ollama(args.endpoint, args.model, retry_prompt, args.timeout))
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError, OSError) as exc:
+            last_error = exc
+            if attempt < max(0, args.retries):
+                if progress:
+                    progress(f"RETRY {attempt + 1}/{args.retries} for {context}: {exc}")
+                continue
+    raise RuntimeError(f"Could not get valid JSON for {context}: {last_error}") from last_error
+
+
 def ensure_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
 
@@ -401,6 +473,86 @@ def first_list(model_exam: dict[str, Any], keys: list[str]) -> list[Any]:
             if isinstance(value, list):
                 return value
     return []
+
+
+def question_signature(text: str) -> str:
+    text = re.sub(r"\s+", " ", text.casefold()).strip()
+    text = re.sub(r"[^a-z0-9äöüß ]", "", text)
+    return text[:180]
+
+
+def normalize_mc_items(raw_questions: Any, existing: set[str]) -> list[dict[str, Any]]:
+    questions = []
+    if not isinstance(raw_questions, list):
+        return questions
+    for raw in raw_questions:
+        if not isinstance(raw, dict):
+            continue
+        question_text = str(raw.get("question") or "").strip()
+        explanation = str(raw.get("explanation") or "").strip()
+        if not question_text or not explanation:
+            continue
+        signature = question_signature(question_text)
+        if signature in existing:
+            continue
+        options = []
+        for option in ensure_list(raw.get("options"))[:6]:
+            if not isinstance(option, dict):
+                continue
+            option_text = str(option.get("text") or "").strip()
+            if option_text:
+                options.append({"text": option_text, "is_correct": bool(option.get("is_correct", False))})
+        if len(options) < 4:
+            continue
+        questions.append(
+            {
+                "id": "",
+                "topic": str(raw.get("topic") or "").strip(),
+                "question": question_text,
+                "options": options,
+                "explanation": explanation,
+            }
+        )
+        existing.add(signature)
+    return questions
+
+
+def normalize_open_items(raw_questions: Any, existing: set[str]) -> list[dict[str, Any]]:
+    questions = []
+    if not isinstance(raw_questions, list):
+        return questions
+    for raw in raw_questions:
+        if not isinstance(raw, dict):
+            continue
+        question_text = str(raw.get("question") or "").strip()
+        expected = str(raw.get("expected_answer") or "").strip()
+        if not question_text or not expected:
+            continue
+        signature = question_signature(question_text)
+        if signature in existing:
+            continue
+        rubric = raw.get("grading_rubric")
+        if not isinstance(rubric, dict):
+            rubric = {
+                "90-100": "Präzise, vollständige Antwort.",
+                "76-89": "Gute Antwort mit kleineren Lücken.",
+                "61-75": "Solide Antwort mit merklichen Lücken.",
+                "41-60": "Grundsätzlich thematisch, aber unvollständig.",
+                "21-40": "Teilweise relevant mit großen Lücken.",
+                "0-20": "Falsch, leer oder sehr allgemein.",
+            }
+        questions.append(
+            {
+                "id": "",
+                "question": question_text,
+                "expected_answer": expected,
+                "key_concepts": [str(item) for item in ensure_list(raw.get("key_concepts")) if str(item).strip()],
+                "grading_rubric": rubric,
+                "max_score": 100,
+            }
+        )
+        existing.add(signature)
+    return questions
 
 
 def normalize_exam(
@@ -490,6 +642,213 @@ def normalize_exam(
     }
 
 
+def apply_coverage_metadata(
+    exam: dict[str, Any],
+    coverage_mode: str,
+    source_chunk_count: int,
+    processed_chunk_count: int,
+    failed_chunk_count: int,
+    coverage_warning: str | None,
+) -> dict[str, Any]:
+    metadata = exam.setdefault("metadata", {})
+    metadata["coverage_mode"] = coverage_mode
+    metadata["source_chunk_count"] = source_chunk_count
+    metadata["processed_chunk_count"] = processed_chunk_count
+    metadata["failed_chunk_count"] = failed_chunk_count
+    metadata["coverage_warning"] = coverage_warning
+    if coverage_warning:
+        existing = metadata.get("text_extraction_warning")
+        metadata["text_extraction_warning"] = f"{existing} {coverage_warning}".strip() if existing else coverage_warning
+    return exam
+
+
+def build_chunk_coverage_prompt(course: str, source_pdf: str, chunk: str, chunk_index: int, chunk_count: int) -> str:
+    return f"""Create compact coverage notes for one source chunk from a university lecture PDF.
+
+Course: {course}
+Source PDF: {source_pdf}
+Chunk: {chunk_index} of {chunk_count}
+
+Write notes in German, preserving established technical terms, study names, formulas, and author names where useful.
+Focus on exam-relevant definitions, theories, models, findings, distinctions, examples, applications, and conceptual traps.
+
+Return JSON only:
+{{
+  "coverage_notes": [
+    {{
+      "topic": "string",
+      "exam_targets": ["string"],
+      "common_traps": ["string"],
+      "source_area": "string"
+    }}
+  ]
+}}
+
+SOURCE CHUNK:
+<<<SOURCE
+{chunk}
+SOURCE>>>"""
+
+
+def build_chunk_questions_prompt(
+    course: str,
+    source_pdf: str,
+    chunk: str,
+    coverage_notes: dict[str, Any],
+    target_mc: int,
+    target_open: int,
+    existing_stems: list[str],
+    chunk_index: int,
+    chunk_count: int,
+) -> str:
+    return f"""Generate exam questions from this source chunk.
+
+Course: {course}
+Source PDF: {source_pdf}
+Chunk: {chunk_index} of {chunk_count}
+
+Question counts:
+- Generate exactly {target_mc} multiple-choice questions.
+- Generate exactly {target_open} open-ended questions.
+- If a count is 0, return an empty array for that section.
+
+Language requirements:
+- Write questions, options, explanations, expected answers, key concepts, and rubrics in German.
+- Preserve established technical terms, model names, formulas, author names, and source quotations in the original language where appropriate.
+
+Multiple-choice requirements:
+- True multiple-choice, not single-choice.
+- Each question has 4 to 6 options.
+- Every option has a hardcoded boolean is_correct.
+- Distractors must be plausible and source-adjacent.
+
+Open-ended requirements:
+- Each open question has expected_answer, key_concepts, grading_rubric, and max_score 100.
+- Make questions precise, difficult, and gradeable.
+
+Avoid duplicating these already generated stems:
+{json.dumps(existing_stems[-80:], ensure_ascii=False, indent=2)}
+
+Return JSON only:
+{{
+  "multiple_choice": [
+    {{
+      "topic": "string",
+      "question": "string",
+      "options": [
+        {{"text": "string", "is_correct": true}},
+        {{"text": "string", "is_correct": false}},
+        {{"text": "string", "is_correct": false}},
+        {{"text": "string", "is_correct": true}}
+      ],
+      "explanation": "string"
+    }}
+  ],
+  "open_ended": [
+    {{
+      "question": "string",
+      "expected_answer": "string",
+      "key_concepts": ["string"],
+      "grading_rubric": {{
+        "90-100": "string",
+        "76-89": "string",
+        "61-75": "string",
+        "41-60": "string",
+        "21-40": "string",
+        "0-20": "string"
+      }},
+      "max_score": 100
+    }}
+  ]
+}}
+
+COVERAGE NOTES:
+<<<COVERAGE
+{json.dumps(coverage_notes, ensure_ascii=False, indent=2)[:18000]}
+COVERAGE>>>
+
+SOURCE CHUNK:
+<<<SOURCE
+{chunk}
+SOURCE>>>"""
+
+
+def generate_full_coverage_exam(
+    course: str,
+    source_pdf: str,
+    text: str,
+    extraction_warning: str | None,
+    word_count: int,
+    args: argparse.Namespace,
+    progress: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    chunks = chunk_text(text)
+    target_mc, target_open = target_counts(word_count, args)
+    mc_targets = distribute_counts(target_mc, len(chunks))
+    open_targets = distribute_counts(target_open, len(chunks))
+    mc_questions: list[dict[str, Any]] = []
+    open_questions: list[dict[str, Any]] = []
+    seen_mc: set[str] = set()
+    seen_open: set[str] = set()
+    failed_chunks = 0
+    processed_chunks = 0
+
+    for index, chunk in enumerate(chunks, start=1):
+        if progress:
+            progress(f"Processing chunk {index}/{len(chunks)}")
+        try:
+            coverage = call_json_with_retries(args, build_chunk_coverage_prompt(course, source_pdf, chunk, index, len(chunks)), f"{source_pdf} coverage chunk {index}", progress)
+            if progress:
+                progress(f"Generating questions batch {index}/{len(chunks)}")
+            data = call_json_with_retries(
+                args,
+                build_chunk_questions_prompt(
+                    course,
+                    source_pdf,
+                    chunk,
+                    coverage,
+                    mc_targets[index - 1],
+                    open_targets[index - 1],
+                    [question["question"] for question in mc_questions + open_questions],
+                    index,
+                    len(chunks),
+                ),
+                f"{source_pdf} questions chunk {index}",
+                progress,
+            )
+            mc_questions.extend(normalize_mc_items(first_list(data, ["multiple_choice", "multiple_choice_questions", "mc_questions", "mcq", "mc"]), seen_mc))
+            open_questions.extend(normalize_open_items(first_list(data, ["open_ended", "open_ended_questions", "open_questions", "short_answer", "essay_questions"]), seen_open))
+            processed_chunks += 1
+            if progress:
+                progress(f"Merged {len(mc_questions)} MC / {len(open_questions)} open")
+        except RuntimeError as exc:
+            failed_chunks += 1
+            if progress:
+                progress(f"Chunk {index}/{len(chunks)} failed: {exc}")
+
+    too_many_failed = failed_chunks > len(chunks) // 2
+    if processed_chunks == 0 or too_many_failed or len(mc_questions) < args.min_mc or len(open_questions) < args.min_open:
+        raise RuntimeError(
+            f"Full-coverage generation failed for {source_pdf}: processed {processed_chunks}/{len(chunks)} chunks, "
+            f"generated {len(mc_questions)} MC and {len(open_questions)} open questions."
+        )
+
+    warnings = []
+    if failed_chunks:
+        warnings.append(f"Full coverage processed {processed_chunks}/{len(chunks)} chunks; {failed_chunks} chunk(s) failed.")
+    if len(mc_questions) < target_mc or len(open_questions) < target_open:
+        warnings.append(f"Generated {len(mc_questions)} MC and {len(open_questions)} open questions instead of target {target_mc}/{target_open}.")
+
+    exam = normalize_exam(
+        {"multiple_choice": mc_questions[:target_mc], "open_ended": open_questions[:target_open]},
+        course,
+        source_pdf,
+        extraction_warning,
+        word_count,
+    )
+    return apply_coverage_metadata(exam, "full_coverage", len(chunks), processed_chunks, failed_chunks, " ".join(warnings) if warnings else None)
+
+
 def heuristic_exam(
     course: str,
     source_pdf: str,
@@ -575,44 +934,57 @@ def write_exam_folder(
 
     text, extraction_warning, page_count = extract_pdf_text(pdf_path)
     word_count = count_words(text)
-    prompt_text = chunk_for_prompt(text)
-    if len(text) > len(prompt_text):
-        chunk_note = "Long PDF text was chunked into representative excerpts for LLM generation."
-        extraction_warning = f"{extraction_warning} {chunk_note}".strip() if extraction_warning else chunk_note
+    if progress:
+        pages = page_count if page_count is not None else "unknown"
+        progress(f"Extracted {word_count:,} words from {pages} pages")
 
     base_mc, base_open = target_counts(word_count, args)
     last_error: Exception | None = None
     exam: dict[str, Any] | None = None
     max_attempts = max(0, args.retries) + 1
+    coverage_mode = resolve_coverage_mode(text, args)
 
-    for attempt in range(max_attempts):
-        target_mc, target_open = scaled_retry_counts(base_mc, base_open, attempt, args)
-        prompt = build_generation_prompt(course, pdf_path.name, prompt_text, target_mc, target_open, extraction_warning)
-        if attempt:
-            prompt += (
-                "\n\nIMPORTANT RETRY INSTRUCTION:\n"
-                "Your previous response for this PDF was invalid, incomplete, or failed schema validation. Return one complete, syntactically valid JSON object only. "
-                "Do not include markdown, comments, trailing commas, undefined values, or text outside the JSON object. "
-                f"Include both a multiple_choice array with {target_mc} usable questions and an open_ended array with {target_open} usable questions. "
-                "Use shorter but still substantive question and explanation text if needed."
-            )
-        try:
-            if progress:
-                progress(f"Waiting for Ollama: {pdf_path.name} (attempt {attempt + 1}/{max_attempts}, {target_mc} MC / {target_open} open)")
-            raw = post_ollama(args.endpoint, args.model, prompt, args.timeout)
-            model_exam = load_json_from_model(raw)
-            exam = normalize_exam(model_exam, course, pdf_path.name, extraction_warning, word_count)
-            if progress:
-                progress(f"Ollama returned usable exam JSON for {pdf_path.name}")
-            break
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError, OSError) as exc:
-            last_error = exc
-            if attempt < max_attempts - 1:
-                message = f"RETRY {attempt + 1}/{args.retries} for {pdf_path.name}: {exc}"
-                print(message, flush=True)
+    if coverage_mode == "full_coverage":
+        if progress:
+            progress("Using full-coverage generation")
+        exam = generate_full_coverage_exam(course, pdf_path.name, text, extraction_warning, word_count, args, progress)
+    else:
+        if progress:
+            progress("Using representative generation")
+        prompt_text = chunk_for_prompt(text)
+        if len(text) > len(prompt_text):
+            chunk_note = "Long PDF text was chunked into representative excerpts for LLM generation."
+            extraction_warning = f"{extraction_warning} {chunk_note}".strip() if extraction_warning else chunk_note
+
+        for attempt in range(max_attempts):
+            target_mc, target_open = scaled_retry_counts(base_mc, base_open, attempt, args)
+            prompt = build_generation_prompt(course, pdf_path.name, prompt_text, target_mc, target_open, extraction_warning)
+            if attempt:
+                prompt += (
+                    "\n\nIMPORTANT RETRY INSTRUCTION:\n"
+                    "Your previous response for this PDF was invalid, incomplete, or failed schema validation. Return one complete, syntactically valid JSON object only. "
+                    "Do not include markdown, comments, trailing commas, undefined values, or text outside the JSON object. "
+                    f"Include both a multiple_choice array with {target_mc} usable questions and an open_ended array with {target_open} usable questions. "
+                    "Use shorter but still substantive question and explanation text if needed."
+                )
+            try:
                 if progress:
-                    progress(message)
-                continue
+                    progress(f"Waiting for Ollama: {pdf_path.name} (attempt {attempt + 1}/{max_attempts}, {target_mc} MC / {target_open} open)")
+                raw = post_ollama(args.endpoint, args.model, prompt, args.timeout)
+                model_exam = load_json_from_model(raw)
+                exam = normalize_exam(model_exam, course, pdf_path.name, extraction_warning, word_count)
+                exam = apply_coverage_metadata(exam, "representative", 1, 1, 0, None)
+                if progress:
+                    progress(f"Ollama returned usable exam JSON for {pdf_path.name}")
+                break
+            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError, OSError) as exc:
+                last_error = exc
+                if attempt < max_attempts - 1:
+                    message = f"RETRY {attempt + 1}/{args.retries} for {pdf_path.name}: {exc}"
+                    print(message, flush=True)
+                    if progress:
+                        progress(message)
+                    continue
 
     if exam is None:
         if not args.allow_heuristic_fallback:
@@ -766,12 +1138,22 @@ def main() -> int:
         return 0
 
     generated = []
+    failures = []
     for pdf in pdfs:
-        result = write_exam_folder(pdf, root, args, template_dir)
-        if result:
-            generated.append(result)
+        try:
+            result = write_exam_folder(pdf, root, args, template_dir)
+            if result:
+                generated.append(result)
+        except Exception as exc:
+            failures.append((pdf.name, str(exc)))
+            print(f"FAILED {pdf.name}: {exc}", file=sys.stderr, flush=True)
+            continue
 
     write_index_pages(root)
+    if failures:
+        print(f"Completed with {len(failures)} failed PDF(s).", file=sys.stderr, flush=True)
+        if len(failures) == len(pdfs):
+            return 1
     print(f"Done. Generated {len(generated)} exam(s). Index: {root / 'exam_index.html'}", flush=True)
     return 0
 

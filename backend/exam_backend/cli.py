@@ -212,11 +212,12 @@ def materialize_input(input_path: str, output_path: str, overwrite: bool = False
 def generator_args(root: Path, overwrite: bool = False, example: bool = False) -> argparse.Namespace:
     min_mc, max_mc = (12, 20) if example else (40, 60)
     min_open, max_open = (4, 8) if example else (10, 20)
+    coverage_mode = "representative" if example else "auto"
     return argparse.Namespace(
         root=str(root), overwrite=overwrite, only_folder=None, limit=None,
         min_mc=min_mc, max_mc=max_mc, min_open=min_open, max_open=max_open,
         endpoint="http://localhost:11434/api/chat", model=DEFAULT_MODEL,
-        timeout=600, retries=3, allow_heuristic_fallback=True,
+        timeout=600, retries=3, allow_heuristic_fallback=True, coverage_mode=coverage_mode,
     )
 
 
@@ -253,19 +254,31 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
             if mode == "example":
                 pdfs = pdfs[:1]
             total = max(1, len(pdfs))
+            failures = []
             for index, pdf in enumerate(pdfs, start=1):
                 job.message = f"Generating {pdf.name}"
                 job.progress = int((index - 1) / total * 90)
                 job_log(job, f"Starting {index}/{total}: {pdf.name}")
-                result = generate_exams.write_exam_folder(
-                    pdf,
-                    project_root,
-                    args,
-                    PACKAGE_DIR / "templates",
-                    progress=lambda message: job_log(job, message),
-                )
-                if result:
-                    job_log(job, f"Wrote {result['source_pdf']} ({result['mc_count']} MC, {result['open_count']} open)")
+                try:
+                    result = generate_exams.write_exam_folder(
+                        pdf,
+                        project_root,
+                        args,
+                        PACKAGE_DIR / "templates",
+                        progress=lambda message: job_log(job, message),
+                    )
+                    if result:
+                        job_log(job, f"Wrote {result['source_pdf']} ({result['mc_count']} MC, {result['open_count']} open)")
+                except Exception as exc:
+                    if mode == "example":
+                        raise
+                    failures.append(pdf.name)
+                    job_log(job, f"FAILED {pdf.name}: {exc}")
+                    continue
+            if failures and len(failures) == len(pdfs):
+                raise RuntimeError(f"All PDFs failed: {', '.join(failures)}")
+            if failures:
+                job_log(job, f"Completed with {len(failures)} failed PDF(s)")
             job.message = "Writing index pages"
             job_log(job, "Writing index pages")
             generate_exams.write_index_pages(project_root)
