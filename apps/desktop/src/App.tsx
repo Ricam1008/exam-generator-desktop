@@ -11,7 +11,18 @@ declare global {
 
 type Check = { id: string; label: string; ok: boolean; detail: string };
 type ScanResult = { input_path: string; pdf_count: number; courses: Record<string, number> };
-type Job = { id: string; kind: string; status: string; message: string; progress: number; result?: { project_root: string; index_url: string }; error?: string; logs: string[] };
+type Job = {
+  id: string;
+  kind: string;
+  status: string;
+  message: string;
+  progress: number;
+  started_at?: string;
+  updated_at?: string;
+  result?: { project_root: string; index_url: string };
+  error?: string;
+  logs: string[];
+};
 
 const API = "http://127.0.0.1:8766";
 
@@ -25,6 +36,27 @@ function sleep(ms: number) {
 
 function isTauri() {
   return typeof window !== "undefined" && Boolean(window.__TAURI_INTERNALS__);
+}
+
+function secondsSince(value: string | undefined, now: number) {
+  if (!value) return null;
+  const then = new Date(value).getTime();
+  if (!Number.isFinite(then)) return null;
+  return Math.max(0, Math.round((now - then) / 1000));
+}
+
+function formatDuration(seconds: number | null) {
+  if (seconds === null) return "Unknown";
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  return `${minutes}:${String(rest).padStart(2, "0")}`;
+}
+
+function formatClock(value: string | undefined) {
+  if (!value) return "Unknown";
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "Unknown";
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
 async function post<T>(path: string, body: unknown): Promise<T> {
@@ -47,6 +79,7 @@ export default function App() {
   const [error, setError] = useState("");
   const [backendReady, setBackendReady] = useState(false);
   const [backendStarting, setBackendStarting] = useState(false);
+  const [now, setNow] = useState(Date.now());
 
   const allRequiredOk = useMemo(() => checks.filter((item) => item.id !== "port").every((item) => item.ok), [checks]);
 
@@ -102,7 +135,8 @@ export default function App() {
     setJob(null);
     try {
       const started = await post<{ job_id: string }>("/api/generate", { input_path: inputPath, output_path: outputPath, mode, overwrite: false });
-      setJob({ id: started.job_id, kind: mode, status: "running", message: "Starting", progress: 0, logs: [] });
+      const timestamp = new Date().toISOString();
+      setJob({ id: started.job_id, kind: mode, status: "running", message: "Starting", progress: 0, started_at: timestamp, updated_at: timestamp, logs: [] });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -120,16 +154,28 @@ export default function App() {
 
   useEffect(() => {
     if (!job || job.status !== "running") return;
+    setNow(Date.now());
     const timer = window.setInterval(async () => {
       try {
         const next = await fetch(`${API}/api/jobs/${job.id}`).then((res) => res.json());
         setJob(next);
+        setNow(Date.now());
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
       }
     }, 1500);
     return () => window.clearInterval(timer);
   }, [job?.id, job?.status]);
+
+  useEffect(() => {
+    if (!job || job.status !== "running") return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [job?.id, job?.status]);
+
+  const elapsed = job ? secondsSince(job.started_at, now) : null;
+  const quietFor = job ? secondsSince(job.updated_at, now) : null;
+  const latestLog = job && job.logs.length ? job.logs[job.logs.length - 1] : "";
 
   return (
     <main className="shell">
@@ -210,6 +256,24 @@ export default function App() {
             <strong>{job.progress}%</strong>
           </div>
           <progress value={job.progress} max={100} />
+          <div className="progress-meta">
+            <div>
+              <span>Elapsed</span>
+              <strong>{formatDuration(elapsed)}</strong>
+            </div>
+            <div>
+              <span>Last backend activity</span>
+              <strong>{formatClock(job.updated_at)}</strong>
+            </div>
+            <div>
+              <span>No update for</span>
+              <strong>{formatDuration(quietFor)}</strong>
+            </div>
+          </div>
+          {job.status === "running" && quietFor !== null && quietFor >= 180 && (
+            <p className="muted">Long Ollama call in progress. If this stays unchanged for more than 10 minutes on an example exam, restart the app and try another PDF.</p>
+          )}
+          {latestLog && <p className="latest-log">{latestLog}</p>}
           {job.status === "error" && <p className="error-text">{job.error}</p>}
           {job.status === "done" && <button onClick={openPreview}>Open exam index</button>}
           <pre>{job.logs.slice(-12).join("\n")}</pre>

@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "backend"))
 
 from exam_backend import generate_exams  # noqa: E402
-from exam_backend.cli import backup_existing_project, ensure_separate_output, generator_args, materialize_input, scan_folder  # noqa: E402
+from exam_backend.cli import Job, backup_existing_project, ensure_separate_output, generator_args, job_log, materialize_input, scan_folder  # noqa: E402
 
 
 class BackendSafetyTests(unittest.TestCase):
@@ -111,6 +111,15 @@ class BackendSafetyTests(unittest.TestCase):
         self.assertEqual((args.min_mc, args.max_mc), (12, 20))
         self.assertEqual((args.min_open, args.max_open), (4, 8))
         self.assertTrue(args.allow_heuristic_fallback)
+
+    def test_job_log_updates_activity_timestamp(self) -> None:
+        job = Job(id="test", kind="example")
+        before = job.updated_at
+
+        job_log(job, "Waiting for Ollama")
+
+        self.assertGreaterEqual(job.updated_at, before)
+        self.assertTrue(job.logs[-1].endswith("Waiting for Ollama"))
 
 
 if __name__ == "__main__":

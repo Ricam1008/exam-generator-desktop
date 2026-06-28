@@ -30,6 +30,10 @@ DEFAULT_OLLAMA = "http://localhost:11434"
 DEFAULT_OUTPUT_DIR = Path.home() / "Documents" / "Exam Generator Output"
 
 
+def now_iso() -> str:
+    return dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
 @dataclass
 class Job:
     id: str
@@ -37,6 +41,8 @@ class Job:
     status: str = "running"
     message: str = "Starting"
     progress: int = 0
+    started_at: str = field(default_factory=now_iso)
+    updated_at: str = field(default_factory=now_iso)
     result: dict[str, Any] | None = None
     error: str | None = None
     logs: list[str] = field(default_factory=list)
@@ -54,6 +60,12 @@ STATE = State()
 
 def slugify(value: str) -> str:
     return generate_exams.slugify(value, max_length=80)
+
+
+def job_log(job: Job, message: str) -> None:
+    job.updated_at = now_iso()
+    stamp = dt.datetime.now().strftime("%H:%M:%S")
+    job.logs.append(f"{stamp} {message}")
 
 
 def json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
@@ -225,12 +237,14 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
         overwrite = bool(payload.get("overwrite", False))
         if not input_path:
             raise ValueError("Input folder is required.")
+        job.message = "Preparing output workspace"
+        job_log(job, "Preparing output workspace")
         ensure_separate_output(input_path, output_path)
         backup_path = backup_existing_project(input_path, output_path, overwrite=overwrite)
         if backup_path:
-            job.logs.append(f"Backup created: {backup_path}")
+            job_log(job, f"Backup created: {backup_path}")
         project_root = materialize_input(input_path, output_path, overwrite=overwrite)
-        job.logs.append(f"Output workspace: {project_root}")
+        job_log(job, f"Output workspace: {project_root}")
         STATE.preview_root = project_root
 
         if mode in {"example", "all"}:
@@ -242,9 +256,18 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
             for index, pdf in enumerate(pdfs, start=1):
                 job.message = f"Generating {pdf.name}"
                 job.progress = int((index - 1) / total * 90)
-                result = generate_exams.write_exam_folder(pdf, project_root, args, PACKAGE_DIR / "templates")
+                job_log(job, f"Starting {index}/{total}: {pdf.name}")
+                result = generate_exams.write_exam_folder(
+                    pdf,
+                    project_root,
+                    args,
+                    PACKAGE_DIR / "templates",
+                    progress=lambda message: job_log(job, message),
+                )
                 if result:
-                    job.logs.append(f"Wrote {result['source_pdf']}")
+                    job_log(job, f"Wrote {result['source_pdf']} ({result['mc_count']} MC, {result['open_count']} open)")
+            job.message = "Writing index pages"
+            job_log(job, "Writing index pages")
             generate_exams.write_index_pages(project_root)
         elif mode == "finals":
             args = final_args(project_root, overwrite=overwrite)
@@ -253,9 +276,12 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
             for index, course in enumerate(courses, start=1):
                 job.message = f"Generating final exam for {course.name}"
                 job.progress = int((index - 1) / total * 90)
+                job_log(job, f"Starting final exam {index}/{total}: {course.name}")
                 result = generate_final_exams.write_final_exam(args, course)
                 if result:
-                    job.logs.append(f"Final {result['course']}: {result['mc']} MC, {result['open']} open")
+                    job_log(job, f"Final {result['course']}: {result['mc']} MC, {result['open']} open")
+            job.message = "Writing index pages"
+            job_log(job, "Writing index pages")
             generate_exams.write_index_pages(project_root)
         else:
             raise ValueError(f"Unknown generation mode: {mode}")
@@ -263,11 +289,13 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
         job.status = "done"
         job.progress = 100
         job.message = "Done"
+        job_log(job, "Done")
         job.result = {"project_root": str(project_root), "index_url": "/preview/exam_index.html"}
     except Exception as exc:
         job.status = "error"
         job.error = str(exc)
         job.message = "Failed"
+        job_log(job, f"Failed: {exc}")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -310,6 +338,7 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed_path.path == "/api/generate":
                 job = Job(id=str(uuid.uuid4()), kind=str(payload.get("mode", "example")))
                 STATE.jobs[job.id] = job
+                job_log(job, f"Queued {job.kind} generation")
                 threading.Thread(target=run_generation, args=(job, payload), daemon=True).start()
                 json_response(self, 200, {"job_id": job.id})
             elif parsed_path.path == "/api/set-preview-root":

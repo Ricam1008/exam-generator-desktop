@@ -16,7 +16,7 @@ import unicodedata
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 DEFAULT_ENDPOINT = "http://localhost:11434/api/chat"
@@ -562,6 +562,7 @@ def write_exam_folder(
     root: Path,
     args: argparse.Namespace,
     template_dir: Path,
+    progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any] | None:
     course_dir = pdf_path.parent
     course = course_dir.name
@@ -582,8 +583,9 @@ def write_exam_folder(
     base_mc, base_open = target_counts(word_count, args)
     last_error: Exception | None = None
     exam: dict[str, Any] | None = None
+    max_attempts = max(0, args.retries) + 1
 
-    for attempt in range(max(0, args.retries) + 1):
+    for attempt in range(max_attempts):
         target_mc, target_open = scaled_retry_counts(base_mc, base_open, attempt, args)
         prompt = build_generation_prompt(course, pdf_path.name, prompt_text, target_mc, target_open, extraction_warning)
         if attempt:
@@ -595,20 +597,29 @@ def write_exam_folder(
                 "Use shorter but still substantive question and explanation text if needed."
             )
         try:
+            if progress:
+                progress(f"Waiting for Ollama: {pdf_path.name} (attempt {attempt + 1}/{max_attempts}, {target_mc} MC / {target_open} open)")
             raw = post_ollama(args.endpoint, args.model, prompt, args.timeout)
             model_exam = load_json_from_model(raw)
             exam = normalize_exam(model_exam, course, pdf_path.name, extraction_warning, word_count)
+            if progress:
+                progress(f"Ollama returned usable exam JSON for {pdf_path.name}")
             break
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError, OSError) as exc:
             last_error = exc
-            if attempt < max(0, args.retries):
-                print(f"RETRY {attempt + 1}/{args.retries} for {pdf_path.name}: {exc}", flush=True)
+            if attempt < max_attempts - 1:
+                message = f"RETRY {attempt + 1}/{args.retries} for {pdf_path.name}: {exc}"
+                print(message, flush=True)
+                if progress:
+                    progress(message)
                 continue
 
     if exam is None:
         if not args.allow_heuristic_fallback:
             raise RuntimeError(f"Could not generate questions for {pdf_path.name}: {last_error}") from last_error
         print(f"LLM unavailable for {pdf_path.name}; writing heuristic inspection exam.", flush=True)
+        if progress:
+            progress(f"Using fallback inspection exam for {pdf_path.name}")
         exam = heuristic_exam(course, pdf_path.name, text, extraction_warning, word_count)
 
     if exam_dir.exists() and args.overwrite:
