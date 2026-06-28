@@ -9,10 +9,8 @@ import json
 import os
 import re
 import shutil
-import site
 import subprocess
 import sys
-import sysconfig
 import tempfile
 import textwrap
 import unicodedata
@@ -255,32 +253,11 @@ def run_command(args: list[str], timeout: int = 120) -> subprocess.CompletedProc
 
 
 def marker_cli_path() -> str | None:
-    executable = "marker_single.exe" if os.name == "nt" else "marker_single"
-    configured = os.environ.get("MARKER_SINGLE_PATH") or os.environ.get("MARKER_PATH")
-    candidates = []
-    if configured:
-        candidates.append(Path(configured).expanduser())
-    found = shutil.which(executable) or shutil.which("marker_single")
-    if found:
-        candidates.append(Path(found))
-    candidates.extend(
-        [
-            Path("/opt/homebrew/bin") / executable,
-            Path("/usr/local/bin") / executable,
-            Path.home() / ".local" / "bin" / executable,
-            Path(sysconfig.get_path("scripts") or "") / executable,
-            Path(site.USER_BASE) / ("Scripts" if os.name == "nt" else "bin") / executable,
-            Path(sys.prefix) / ("Scripts" if os.name == "nt" else "bin") / executable,
-        ]
-    )
-    for candidate in candidates:
-        if candidate and candidate.exists() and os.access(candidate, os.X_OK):
-            return str(candidate)
-    return None
+    return shutil.which("marker_single")
 
 
 def marker_install_hint() -> str:
-    return "Marker is required. Install it with: python3 -m pip install marker-pdf. If it is already installed, set MARKER_SINGLE_PATH to the marker_single executable."
+    return "Marker is required. Install it with: python3 -m pip install marker-pdf"
 
 
 def clean_marker_markdown(text: str) -> str:
