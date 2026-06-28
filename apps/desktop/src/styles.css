@@ -14,11 +14,13 @@
 
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--ink); }
-button, input { font: inherit; }
+button, input, select { font: inherit; }
 button { min-height: 40px; border: 1px solid var(--accent); border-radius: 8px; background: var(--accent); color: white; font-weight: 750; padding: 0 14px; cursor: pointer; }
 button.secondary { background: white; color: var(--accent-dark); }
 button:disabled { opacity: .5; cursor: not-allowed; }
 input { width: 100%; min-height: 42px; border: 1px solid var(--line); border-radius: 8px; padding: 0 12px; color: var(--ink); background: white; }
+select { width: 100%; min-height: 42px; border: 1px solid var(--line); border-radius: 8px; padding: 0 34px 0 12px; color: var(--ink); background: white; }
+select:disabled { opacity: .65; cursor: not-allowed; }
 label { display: grid; gap: 8px; color: var(--muted); font-weight: 650; }
 
 .shell { width: min(1120px, calc(100% - 32px)); margin: 0 auto; padding: 32px 0 48px; }
@@ -35,6 +37,12 @@ p { margin: 0; }
 .checks { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
 .check { display: flex; gap: 10px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; }
 .check p { color: var(--muted); font-size: .9rem; margin-top: 3px; }
+.model-picker { display: grid; grid-template-columns: minmax(260px, 360px) minmax(0, 1fr); gap: 12px; align-items: end; margin: 10px 0 14px; }
+.model-status { border: 1px solid var(--line); border-radius: 8px; background: #f8faf9; padding: 10px 12px; }
+.model-status strong { color: var(--bad); }
+.model-status.ok strong { color: var(--good); }
+.model-status.neutral strong { color: var(--accent-dark); }
+.model-status p { color: var(--muted); font-size: .9rem; margin-top: 3px; }
 .dot { width: 10px; height: 10px; border-radius: 999px; margin-top: 6px; background: var(--bad); flex: none; }
 .dot.ok { background: var(--good); }
 .actions-panel { display: flex; justify-content: space-between; gap: 16px; align-items: center; }
@@ -54,6 +62,7 @@ pre { white-space: pre-wrap; background: #f4f6f5; border: 1px solid var(--line);
 @media (max-width: 800px) {
   .topbar, .actions-panel { display: grid; }
   .grid-two { grid-template-columns: 1fr; }
+  .model-picker { grid-template-columns: 1fr; }
   .progress-meta { grid-template-columns: 1fr; }
   .actions { justify-content: start; }
 }

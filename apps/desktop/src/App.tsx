@@ -10,6 +10,14 @@ declare global {
 }
 
 type Check = { id: string; label: string; ok: boolean; detail: string };
+type CheckResponse = {
+  checks: Check[];
+  default_output: string;
+  available_models: string[];
+  default_model: string;
+  selected_model: string;
+};
+type ModelTest = { ok: boolean; model: string; detail: string };
 type ScanResult = { input_path: string; pdf_count: number; courses: Record<string, number> };
 type Job = {
   id: string;
@@ -25,9 +33,19 @@ type Job = {
 };
 
 const API = "http://127.0.0.1:8766";
+const FALLBACK_MODEL = "gemma4:31b-cloud";
+const MODEL_STORAGE_KEY = "exam-generator:selected-model";
 
 function defaultOutputPath() {
   return "~/Documents/Exam Generator Output";
+}
+
+function savedModel() {
+  try {
+    return window.localStorage.getItem(MODEL_STORAGE_KEY) || FALLBACK_MODEL;
+  } catch {
+    return FALLBACK_MODEL;
+  }
 }
 
 function sleep(ms: number) {
@@ -74,6 +92,10 @@ export default function App() {
   const [inputPath, setInputPath] = useState("");
   const [outputPath, setOutputPath] = useState(defaultOutputPath());
   const [checks, setChecks] = useState<Check[]>([]);
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [selectedModel, setSelectedModel] = useState(savedModel());
+  const [modelTest, setModelTest] = useState<ModelTest | null>(null);
+  const [modelTesting, setModelTesting] = useState(false);
   const [scan, setScan] = useState<ScanResult | null>(null);
   const [job, setJob] = useState<Job | null>(null);
   const [error, setError] = useState("");
@@ -81,7 +103,19 @@ export default function App() {
   const [backendStarting, setBackendStarting] = useState(false);
   const [now, setNow] = useState(Date.now());
 
-  const allRequiredOk = useMemo(() => checks.filter((item) => item.id !== "port").every((item) => item.ok), [checks]);
+  const coreChecksOk = useMemo(() => checks.filter((item) => item.id !== "port" && item.id !== "model").every((item) => item.ok), [checks]);
+  const ollamaReachable = checks.find((item) => item.id === "ollama")?.ok ?? false;
+  const selectedModelAvailable = useMemo(
+    () => availableModels.includes(selectedModel) || availableModels.some((name) => name.startsWith(`${selectedModel}:`)),
+    [availableModels, selectedModel],
+  );
+  const modelReady = Boolean(modelTest?.ok && modelTest.model === selectedModel && selectedModelAvailable);
+  const canGenerate = Boolean(backendReady && coreChecksOk && modelReady && inputPath);
+  const modelOptions = useMemo(() => {
+    const options = [...availableModels];
+    if (selectedModel && !options.includes(selectedModel)) options.unshift(selectedModel);
+    return options;
+  }, [availableModels, selectedModel]);
 
   async function checkBackend() {
     setError("");
@@ -98,8 +132,10 @@ export default function App() {
       }
       if (!response?.ok) throw new Error("Backend unavailable");
       setBackendReady(true);
-      const data = await post<{ checks: Check[]; default_output: string }>("/api/check", { output_path: outputPath });
+      const data = await post<CheckResponse>("/api/check", { output_path: outputPath, model: selectedModel });
       setChecks(data.checks);
+      setAvailableModels(data.available_models || []);
+      if (!selectedModel && data.default_model) setSelectedModel(data.default_model);
       if (outputPath === defaultOutputPath()) setOutputPath(data.default_output);
     } catch (err) {
       setBackendReady(false);
@@ -107,6 +143,29 @@ export default function App() {
       setError(isTauri() ? `Could not start the local backend automatically: ${detail}` : "Backend is not running. For browser development, run scripts/dev-backend.sh first.");
     } finally {
       setBackendStarting(false);
+    }
+  }
+
+  async function testSelectedModel(model: string) {
+    setModelTesting(true);
+    setModelTest({ ok: false, model, detail: "Testing..." });
+    try {
+      const result = await post<ModelTest>("/api/test-model", { model });
+      setModelTest(result);
+    } catch (err) {
+      setModelTest({ ok: false, model, detail: err instanceof Error ? err.message : String(err) });
+    } finally {
+      setModelTesting(false);
+    }
+  }
+
+  function chooseModel(model: string) {
+    setSelectedModel(model);
+    setModelTest(null);
+    try {
+      window.localStorage.setItem(MODEL_STORAGE_KEY, model);
+    } catch {
+      // Local storage is a convenience only.
     }
   }
 
@@ -134,7 +193,7 @@ export default function App() {
     setError("");
     setJob(null);
     try {
-      const started = await post<{ job_id: string }>("/api/generate", { input_path: inputPath, output_path: outputPath, mode, overwrite: false });
+      const started = await post<{ job_id: string }>("/api/generate", { input_path: inputPath, output_path: outputPath, mode, overwrite: false, model: selectedModel });
       const timestamp = new Date().toISOString();
       setJob({ id: started.job_id, kind: mode, status: "running", message: "Starting", progress: 0, started_at: timestamp, updated_at: timestamp, logs: [] });
     } catch (err) {
@@ -151,6 +210,23 @@ export default function App() {
   useEffect(() => {
     void checkBackend();
   }, []);
+
+  useEffect(() => {
+    if (!backendReady || !selectedModel) return;
+    if (!ollamaReachable) {
+      setModelTest({ ok: false, model: selectedModel, detail: "Could not reach Ollama" });
+      return;
+    }
+    if (availableModels.length === 0) {
+      setModelTest({ ok: false, model: selectedModel, detail: `No models installed. Run: ollama pull ${FALLBACK_MODEL}` });
+      return;
+    }
+    if (!selectedModelAvailable) {
+      setModelTest({ ok: false, model: selectedModel, detail: `Model not installed. Run: ollama pull ${selectedModel}` });
+      return;
+    }
+    void testSelectedModel(selectedModel);
+  }, [backendReady, ollamaReachable, selectedModel, selectedModelAvailable, availableModels.join("|")]);
 
   useEffect(() => {
     if (!job || job.status !== "running") return;
@@ -192,9 +268,22 @@ export default function App() {
 
       <section className="panel">
         <h2>Status</h2>
+        <div className="model-picker">
+          <label>
+            Ollama model
+            <select value={selectedModel} onChange={(event) => chooseModel(event.target.value)} disabled={!backendReady || modelOptions.length === 0}>
+              {modelOptions.length === 0 && <option value={selectedModel}>{selectedModel}</option>}
+              {modelOptions.map((model) => <option value={model} key={model}>{model}</option>)}
+            </select>
+          </label>
+          <div className={`model-status ${modelReady ? "ok" : modelTesting ? "neutral" : "bad"}`}>
+            <strong>{modelTesting ? "Testing..." : modelReady ? "Model responded" : "Model not ready"}</strong>
+            <p>{modelTest?.detail || (availableModels.length === 0 ? `No models installed. Run: ollama pull ${FALLBACK_MODEL}` : "Choose an installed Ollama model.")}</p>
+          </div>
+        </div>
         <div className="checks">
           {checks.length === 0 && <p className="muted">Backend status will appear here.</p>}
-          {checks.map((check) => (
+          {checks.filter((check) => check.id !== "model").map((check) => (
             <article className="check" key={check.id}>
               <span className={check.ok ? "dot ok" : "dot bad"} />
               <div>
@@ -230,9 +319,9 @@ export default function App() {
         </div>
         <div className="actions">
           <button onClick={scanInput} disabled={!inputPath}>Scan folder</button>
-          <button onClick={() => generate("example")} disabled={!backendReady || !allRequiredOk || !inputPath}>Generate example</button>
-          <button onClick={() => generate("all")} disabled={!backendReady || !allRequiredOk || !inputPath}>Generate all</button>
-          <button onClick={() => generate("finals")} disabled={!backendReady || !allRequiredOk || !inputPath}>Generate finals</button>
+          <button onClick={() => generate("example")} disabled={!canGenerate}>Generate example</button>
+          <button onClick={() => generate("all")} disabled={!canGenerate}>Generate all</button>
+          <button onClick={() => generate("finals")} disabled={!canGenerate}>Generate finals</button>
         </div>
       </section>
 

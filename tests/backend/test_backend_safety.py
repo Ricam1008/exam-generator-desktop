@@ -7,8 +7,9 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "backend"))
 
+from exam_backend import cli  # noqa: E402
 from exam_backend import generate_exams  # noqa: E402
-from exam_backend.cli import Job, backup_existing_project, ensure_separate_output, generator_args, job_log, materialize_input, scan_folder  # noqa: E402
+from exam_backend.cli import Job, backup_existing_project, ensure_separate_output, final_args, generator_args, job_log, materialize_input, scan_folder  # noqa: E402
 
 
 class BackendSafetyTests(unittest.TestCase):
@@ -106,17 +107,104 @@ class BackendSafetyTests(unittest.TestCase):
         self.assertEqual(len(exam["open_ended"]), 1)
 
     def test_desktop_example_uses_smaller_ai_request_and_fallback(self) -> None:
-        args = generator_args(Path("/tmp/example"), example=True)
+        args = generator_args(Path("/tmp/example"), example=True, model="llama3.1:8b")
 
         self.assertEqual((args.min_mc, args.max_mc), (12, 20))
         self.assertEqual((args.min_open, args.max_open), (4, 8))
         self.assertTrue(args.allow_heuristic_fallback)
         self.assertEqual(args.coverage_mode, "representative")
+        self.assertEqual(args.model, "llama3.1:8b")
 
     def test_desktop_all_uses_auto_coverage(self) -> None:
-        args = generator_args(Path("/tmp/example"), example=False)
+        args = generator_args(Path("/tmp/example"), example=False, model="qwen2.5:14b")
 
         self.assertEqual(args.coverage_mode, "auto")
+        self.assertEqual(args.model, "qwen2.5:14b")
+
+    def test_final_args_uses_selected_model(self) -> None:
+        args = final_args(Path("/tmp/example"), model="mistral-small:latest")
+
+        self.assertEqual(args.model, "mistral-small:latest")
+
+    def test_check_dependencies_returns_available_models(self) -> None:
+        class FakeResponse:
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b"Ollama is running"
+
+        original_urlopen = cli.request.urlopen
+        original_ollama_json = cli.ollama_json
+
+        try:
+            cli.request.urlopen = lambda *args, **kwargs: FakeResponse()  # type: ignore[assignment]
+            cli.ollama_json = lambda *args, **kwargs: {"models": [{"name": "gemma4:31b-cloud"}, {"name": "qwen2.5:14b"}]}  # type: ignore[assignment]
+            with tempfile.TemporaryDirectory() as temp:
+                result = cli.check_dependencies(temp, "qwen2.5:14b")
+        finally:
+            cli.request.urlopen = original_urlopen  # type: ignore[assignment]
+            cli.ollama_json = original_ollama_json  # type: ignore[assignment]
+
+        self.assertEqual(result["available_models"], ["gemma4:31b-cloud", "qwen2.5:14b"])
+        self.assertEqual(result["default_model"], "gemma4:31b-cloud")
+        self.assertTrue(next(item for item in result["checks"] if item["id"] == "model")["ok"])
+
+    def test_check_dependencies_reports_missing_model_guidance(self) -> None:
+        class FakeResponse:
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b"Ollama is running"
+
+        original_urlopen = cli.request.urlopen
+        original_ollama_json = cli.ollama_json
+
+        try:
+            cli.request.urlopen = lambda *args, **kwargs: FakeResponse()  # type: ignore[assignment]
+            cli.ollama_json = lambda *args, **kwargs: {"models": [{"name": "gemma4:31b-cloud"}]}  # type: ignore[assignment]
+            with tempfile.TemporaryDirectory() as temp:
+                result = cli.check_dependencies(temp, "missing:model")
+        finally:
+            cli.request.urlopen = original_urlopen  # type: ignore[assignment]
+            cli.ollama_json = original_ollama_json  # type: ignore[assignment]
+
+        model_check = next(item for item in result["checks"] if item["id"] == "model")
+        self.assertFalse(model_check["ok"])
+        self.assertIn("ollama pull missing:model", model_check["detail"])
+
+    def test_test_model_success_updates_selected_model(self) -> None:
+        original_ollama_json = cli.ollama_json
+        original_model = cli.STATE.selected_model
+
+        try:
+            cli.ollama_json = lambda *args, **kwargs: {"message": {"content": "OK"}}  # type: ignore[assignment]
+            result = cli.test_model("qwen2.5:14b")
+        finally:
+            cli.ollama_json = original_ollama_json  # type: ignore[assignment]
+            cli.STATE.selected_model = original_model
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["model"], "qwen2.5:14b")
+
+    def test_test_model_handles_malformed_response(self) -> None:
+        original_ollama_json = cli.ollama_json
+
+        try:
+            cli.ollama_json = lambda *args, **kwargs: {"message": {"content": ""}}  # type: ignore[assignment]
+            result = cli.test_model("qwen2.5:14b")
+        finally:
+            cli.ollama_json = original_ollama_json  # type: ignore[assignment]
+
+        self.assertFalse(result["ok"])
+        self.assertIn("no message", result["detail"])
 
     def test_chunk_text_keeps_all_content(self) -> None:
         text = "alpha " * 900 + "\n\n" + "beta " * 900 + "\n\n" + "gamma " * 900

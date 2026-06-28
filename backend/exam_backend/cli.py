@@ -52,6 +52,7 @@ class State:
     def __init__(self) -> None:
         self.jobs: dict[str, Job] = {}
         self.preview_root: Path | None = None
+        self.selected_model = DEFAULT_MODEL
         self.lock = threading.Lock()
 
 
@@ -97,9 +98,26 @@ def ollama_json(path: str, payload: dict[str, Any] | None = None, timeout: int =
     return json.loads(raw) if raw.strip().startswith(("{", "[")) else raw
 
 
+def available_ollama_models() -> list[str]:
+    tags = ollama_json("/api/tags")
+    if not isinstance(tags, dict):
+        return []
+    names = []
+    for item in tags.get("models", []):
+        if isinstance(item, dict) and isinstance(item.get("name"), str) and item["name"].strip():
+            names.append(item["name"].strip())
+    return sorted(set(names), key=str.casefold)
+
+
+def model_is_available(model: str, names: list[str]) -> bool:
+    return model in names or any(name.startswith(model + ":") for name in names)
+
+
 def check_dependencies(output_path: str | None = None, model: str = DEFAULT_MODEL) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
     ok = True
+    selected_model = (model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    available_models: list[str] = []
 
     try:
         root_response = request.urlopen(DEFAULT_OLLAMA, timeout=3).read().decode("utf-8", errors="replace")
@@ -111,16 +129,20 @@ def check_dependencies(output_path: str | None = None, model: str = DEFAULT_MODE
     ok = ok and reachable
 
     model_ok = False
-    model_detail = f"Run: ollama pull {model}"
+    model_detail = f"Run: ollama pull {selected_model}"
     if reachable:
         try:
-            tags = ollama_json("/api/tags")
-            names = [item.get("name", "") for item in tags.get("models", [])]
-            model_ok = any(name == model or name.startswith(model + ":") for name in names)
-            model_detail = "Model found" if model_ok else model_detail
+            available_models = available_ollama_models()
+            model_ok = model_is_available(selected_model, available_models)
+            if model_ok:
+                model_detail = "Model found"
+            elif available_models:
+                model_detail = f"Model not installed. Run: ollama pull {selected_model}"
+            else:
+                model_detail = f"No Ollama models found. Run: ollama pull {DEFAULT_MODEL}"
         except Exception as exc:
             model_detail = str(exc)
-    checks.append({"id": "model", "label": f"Model {model}", "ok": model_ok, "detail": model_detail})
+    checks.append({"id": "model", "label": f"Model {selected_model}", "ok": model_ok, "detail": model_detail})
     ok = ok and model_ok
 
     templates_ok = all((PACKAGE_DIR / "templates" / name).exists() for name in ["index_template.html", "app.js", "styles.css"])
@@ -152,7 +174,45 @@ def check_dependencies(output_path: str | None = None, model: str = DEFAULT_MODE
 
     checks.append({"id": "port", "label": "Preview route", "ok": True, "detail": "Preview is served through the backend; no separate preview port is required."})
 
-    return {"ok": ok, "checks": checks, "default_output": str(DEFAULT_OUTPUT_DIR)}
+    return {
+        "ok": ok,
+        "checks": checks,
+        "default_output": str(DEFAULT_OUTPUT_DIR),
+        "available_models": available_models,
+        "default_model": DEFAULT_MODEL,
+        "selected_model": selected_model,
+    }
+
+
+def test_model(model: str) -> dict[str, Any]:
+    selected_model = (model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    payload = {
+        "model": selected_model,
+        "stream": False,
+        "messages": [{"role": "user", "content": "Reply with OK."}],
+        "options": {"temperature": 0},
+    }
+    try:
+        result = ollama_json("/api/chat", payload, timeout=30)
+        content = ""
+        if isinstance(result, dict):
+            message = result.get("message")
+            if isinstance(message, dict):
+                content = str(message.get("content") or "").strip()
+            content = content or str(result.get("response") or "").strip()
+        if not content:
+            return {"ok": False, "model": selected_model, "detail": "Ollama responded, but the model returned no message."}
+        STATE.selected_model = selected_model
+        return {"ok": True, "model": selected_model, "detail": "Model responded"}
+    except error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace") if exc.fp else str(exc)
+        return {"ok": False, "model": selected_model, "detail": detail or str(exc)}
+    except error.URLError as exc:
+        return {"ok": False, "model": selected_model, "detail": f"Could not reach Ollama: {exc}"}
+    except TimeoutError:
+        return {"ok": False, "model": selected_model, "detail": "Model test timed out."}
+    except Exception as exc:
+        return {"ok": False, "model": selected_model, "detail": str(exc)}
 
 
 def scan_folder(input_path: str) -> dict[str, Any]:
@@ -209,23 +269,23 @@ def materialize_input(input_path: str, output_path: str, overwrite: bool = False
     return out_root
 
 
-def generator_args(root: Path, overwrite: bool = False, example: bool = False) -> argparse.Namespace:
+def generator_args(root: Path, overwrite: bool = False, example: bool = False, model: str = DEFAULT_MODEL) -> argparse.Namespace:
     min_mc, max_mc = (12, 20) if example else (40, 60)
     min_open, max_open = (4, 8) if example else (10, 20)
     coverage_mode = "representative" if example else "auto"
     return argparse.Namespace(
         root=str(root), overwrite=overwrite, only_folder=None, limit=None,
         min_mc=min_mc, max_mc=max_mc, min_open=min_open, max_open=max_open,
-        endpoint="http://localhost:11434/api/chat", model=DEFAULT_MODEL,
+        endpoint="http://localhost:11434/api/chat", model=(model or DEFAULT_MODEL).strip() or DEFAULT_MODEL,
         timeout=600, retries=3, allow_heuristic_fallback=True, coverage_mode=coverage_mode,
     )
 
 
-def final_args(root: Path, overwrite: bool = False) -> argparse.Namespace:
+def final_args(root: Path, overwrite: bool = False, model: str = DEFAULT_MODEL) -> argparse.Namespace:
     return argparse.Namespace(
         root=str(root), overwrite=overwrite, only_folder=None,
         target_mc=120, target_open=30, mc_batch_size=15, open_batch_size=5,
-        endpoint="http://localhost:11434/api/chat", model=DEFAULT_MODEL,
+        endpoint="http://localhost:11434/api/chat", model=(model or DEFAULT_MODEL).strip() or DEFAULT_MODEL,
         timeout=900, retries=2,
     )
 
@@ -236,6 +296,8 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
         output_path = payload.get("output_path") or str(DEFAULT_OUTPUT_DIR)
         mode = payload.get("mode", "example")
         overwrite = bool(payload.get("overwrite", False))
+        model = str(payload.get("model") or STATE.selected_model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+        STATE.selected_model = model
         if not input_path:
             raise ValueError("Input folder is required.")
         job.message = "Preparing output workspace"
@@ -249,7 +311,7 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
         STATE.preview_root = project_root
 
         if mode in {"example", "all"}:
-            args = generator_args(project_root, overwrite=overwrite, example=mode == "example")
+            args = generator_args(project_root, overwrite=overwrite, example=mode == "example", model=model)
             pdfs = generate_exams.find_pdfs(project_root, args.only_folder)
             if mode == "example":
                 pdfs = pdfs[:1]
@@ -283,7 +345,7 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
             job_log(job, "Writing index pages")
             generate_exams.write_index_pages(project_root)
         elif mode == "finals":
-            args = final_args(project_root, overwrite=overwrite)
+            args = final_args(project_root, overwrite=overwrite, model=model)
             courses = generate_final_exams.course_dirs(project_root, None)
             total = max(1, len(courses))
             for index, course in enumerate(courses, start=1):
@@ -346,6 +408,8 @@ class Handler(BaseHTTPRequestHandler):
             payload = read_json(self)
             if parsed_path.path == "/api/check":
                 json_response(self, 200, check_dependencies(payload.get("output_path"), payload.get("model", DEFAULT_MODEL)))
+            elif parsed_path.path == "/api/test-model":
+                json_response(self, 200, test_model(str(payload.get("model") or DEFAULT_MODEL)))
             elif parsed_path.path == "/api/scan":
                 json_response(self, 200, scan_folder(payload.get("input_path", "")))
             elif parsed_path.path == "/api/generate":
@@ -361,7 +425,7 @@ class Handler(BaseHTTPRequestHandler):
                 STATE.preview_root = root
                 json_response(self, 200, {"ok": True, "index_url": "/preview/exam_index.html"})
             elif parsed_path.path == "/grade-open-answer":
-                result = local_server.call_ollama(payload, "http://localhost:11434/api/chat", DEFAULT_MODEL, 180)
+                result = local_server.call_ollama(payload, "http://localhost:11434/api/chat", STATE.selected_model or DEFAULT_MODEL, 180)
                 json_response(self, 200, result)
             else:
                 json_response(self, 404, {"error": "Not found"})
