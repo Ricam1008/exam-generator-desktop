@@ -15,6 +15,16 @@ This repository is separate from the production exam workspace. Do not commit PD
 - Keeps input folders read-only.
 - Shows a rough generation-time estimate after scanning a folder.
 
+## Screenshots
+
+Startup/status view:
+
+![Exam Generator status screen](docs/screenshots/status.png)
+
+Folder review after scanning PDFs:
+
+![Exam Generator folder review](docs/screenshots/folder-review.png)
+
 ## Current Install Status
 
 This is currently a developer-style install from GitHub, not yet a polished one-click installer.
