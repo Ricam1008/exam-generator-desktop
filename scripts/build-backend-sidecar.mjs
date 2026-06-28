@@ -5,7 +5,7 @@ import { dirname, resolve } from "node:path";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const script = resolve(root, "scripts", "build-backend-sidecar.py");
 const candidates = process.platform === "win32"
-  ? [["py", ["-3"]], ["python", []], ["python3", []]]
+  ? [["python", []], ["python3", []], ["py", ["-3"]]]
   : [["python3", []], ["python", []]];
 
 for (const [bin, prefixArgs] of candidates) {
