@@ -1,0 +1,22 @@
+# dependencies
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+
+# builds
+dist/
+build/
+target/
+*.spec
+
+# generated content
+**/Exam Generator Output/
+**/exams/
+**/*.pdf
+*.log
+.DS_Store
+
+# local env
+.env
+.env.*

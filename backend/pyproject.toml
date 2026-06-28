@@ -1,0 +1,12 @@
+[project]
+name = "exam-generator-backend"
+version = "0.1.0"
+description = "Python sidecar backend for Exam Generator Desktop"
+requires-python = ">=3.9"
+dependencies = ["pypdf>=4"]
+
+[project.optional-dependencies]
+build = ["pyinstaller>=6"]
+
+[project.scripts]
+exam-generator-backend = "exam_backend.cli:main"
