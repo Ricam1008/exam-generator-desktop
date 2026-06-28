@@ -18,7 +18,20 @@ type CheckResponse = {
   selected_model: string;
 };
 type ModelTest = { ok: boolean; model: string; detail: string };
-type ScanResult = { input_path: string; pdf_count: number; courses: Record<string, number> };
+type ScanEstimate = {
+  generate_all_minutes_low: number;
+  generate_all_minutes_high: number;
+  generate_finals_minutes_low: number;
+  generate_finals_minutes_high: number;
+  total_pdf_mb: number;
+  estimated_source_chars: number;
+  size_buckets: Record<string, number>;
+  basis: { generate_all: string; generate_finals: string };
+  history_runs_used: number;
+  model: string;
+  note: string;
+};
+type ScanResult = { input_path: string; pdf_count: number; courses: Record<string, number>; estimate?: ScanEstimate };
 type Job = {
   id: string;
   kind: string;
@@ -75,6 +88,17 @@ function formatClock(value: string | undefined) {
   const date = new Date(value);
   if (!Number.isFinite(date.getTime())) return "Unknown";
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function formatMinutesRange(low: number | undefined, high: number | undefined) {
+  if (low === undefined || high === undefined) return "Unknown";
+  const formatOne = (minutes: number) => {
+    if (minutes < 60) return `${minutes} min`;
+    const hours = Math.floor(minutes / 60);
+    const rest = minutes % 60;
+    return rest ? `${hours} h ${rest} min` : `${hours} h`;
+  };
+  return `${formatOne(low)} - ${formatOne(high)}`;
 }
 
 async function post<T>(path: string, body: unknown): Promise<T> {
@@ -182,7 +206,7 @@ export default function App() {
   async function scanInput() {
     setError("");
     try {
-      const result = await post<ScanResult>("/api/scan", { input_path: inputPath });
+      const result = await post<ScanResult>("/api/scan", { input_path: inputPath, model: selectedModel });
       setScan(result);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -329,9 +353,34 @@ export default function App() {
         <section className="panel">
           <h2>Folder review</h2>
           <p>{scan.pdf_count} PDFs found in {Object.keys(scan.courses).length} course folders.</p>
+          {scan.estimate && (
+            <div className="estimate-grid">
+              <div className="estimate-card">
+                <span>Generate all estimate</span>
+                <strong>{formatMinutesRange(scan.estimate.generate_all_minutes_low, scan.estimate.generate_all_minutes_high)}</strong>
+              </div>
+              <div className="estimate-card">
+                <span>Generate finals estimate</span>
+                <strong>{formatMinutesRange(scan.estimate.generate_finals_minutes_low, scan.estimate.generate_finals_minutes_high)}</strong>
+              </div>
+              <div className="estimate-card">
+                <span>PDF data</span>
+                <strong>{scan.estimate.total_pdf_mb} MB</strong>
+              </div>
+              <div className="estimate-card">
+                <span>Estimated source text</span>
+                <strong>{scan.estimate.estimated_source_chars.toLocaleString()} chars</strong>
+              </div>
+            </div>
+          )}
           <div className="course-list">
             {Object.entries(scan.courses).map(([course, count]) => <span key={course}>{course}: {count}</span>)}
           </div>
+          {scan.estimate && (
+            <p className="estimate-note">
+              {scan.estimate.note} Basis: all = {scan.estimate.basis.generate_all}; finals = {scan.estimate.basis.generate_finals}.
+            </p>
+          )}
         </section>
       )}
 

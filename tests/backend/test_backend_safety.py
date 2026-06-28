@@ -34,15 +34,59 @@ class BackendSafetyTests(unittest.TestCase):
 
     def test_scan_ignores_existing_exams(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
+            original_metrics_path = cli.metrics_path
+            cli.metrics_path = lambda: Path(temp) / "metrics.json"  # type: ignore[assignment]
             root = Path(temp) / "root"
             (root / "Course" / "exams").mkdir(parents=True)
             (root / "Course" / "a.pdf").write_bytes(b"%PDF-1.4\n")
             (root / "Course" / "exams" / "b.pdf").write_bytes(b"%PDF-1.4\n")
 
-            result = scan_folder(str(root))
+            try:
+                result = scan_folder(str(root))
+            finally:
+                cli.metrics_path = original_metrics_path  # type: ignore[assignment]
 
             self.assertEqual(result["pdf_count"], 1)
             self.assertEqual(result["courses"], {"Course": 1})
+            self.assertEqual(result["estimate"]["size_buckets"]["small"], 1)
+            self.assertGreater(result["estimate"]["generate_all_minutes_high"], 0)
+            self.assertIn("file size", result["estimate"]["note"])
+            self.assertEqual(result["estimate"]["basis"]["generate_all"], "file-size heuristic")
+
+    def test_scan_estimate_uses_history_for_selected_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            original_metrics_path = cli.metrics_path
+            cli.metrics_path = lambda: Path(temp) / "metrics.json"  # type: ignore[assignment]
+            root = Path(temp) / "root"
+            (root / "Course").mkdir(parents=True)
+            (root / "Course" / "a.pdf").write_bytes(b"x" * 1_000_000)
+
+            try:
+                cli.record_generation_metric("fast-model", "all", 500_000, 80_000, 600)
+                result = scan_folder(str(root), "fast-model")
+            finally:
+                cli.metrics_path = original_metrics_path  # type: ignore[assignment]
+
+            estimate = result["estimate"]
+            self.assertEqual(estimate["basis"]["generate_all"], "previous runs with fast-model")
+            self.assertEqual(estimate["history_runs_used"], 1)
+            self.assertGreaterEqual(estimate["generate_all_minutes_high"], estimate["generate_all_minutes_low"])
+
+    def test_scan_estimate_ignores_other_model_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            original_metrics_path = cli.metrics_path
+            cli.metrics_path = lambda: Path(temp) / "metrics.json"  # type: ignore[assignment]
+            root = Path(temp) / "root"
+            (root / "Course").mkdir(parents=True)
+            (root / "Course" / "a.pdf").write_bytes(b"x" * 1_000_000)
+
+            try:
+                cli.record_generation_metric("other-model", "all", 500_000, 80_000, 600)
+                result = scan_folder(str(root), "selected-model")
+            finally:
+                cli.metrics_path = original_metrics_path  # type: ignore[assignment]
+
+            self.assertEqual(result["estimate"]["basis"]["generate_all"], "file-size heuristic")
 
     def test_output_inside_input_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import math
 import shutil
 import sys
 import threading
@@ -28,10 +29,15 @@ import local_server  # type: ignore  # noqa: E402
 DEFAULT_MODEL = "gemma4:31b-cloud"
 DEFAULT_OLLAMA = "http://localhost:11434"
 DEFAULT_OUTPUT_DIR = Path.home() / "Documents" / "Exam Generator Output"
+METRICS_LIMIT = 80
 
 
 def now_iso() -> str:
     return dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def metrics_path() -> Path:
+    return Path.home() / ".exam-generator-desktop" / "generation_metrics.json"
 
 
 @dataclass
@@ -84,6 +90,61 @@ def read_json(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
     if length <= 0:
         return {}
     return json.loads(handler.rfile.read(length).decode("utf-8"))
+
+
+def load_metrics() -> dict[str, Any]:
+    path = metrics_path()
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"runs": []}
+
+
+def save_metrics(data: dict[str, Any]) -> None:
+    path = metrics_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def record_generation_metric(model: str, mode: str, source_chars: int, source_words: int, duration_seconds: float) -> None:
+    if source_chars <= 0 or duration_seconds <= 0:
+        return
+    data = load_metrics()
+    runs = data.get("runs")
+    if not isinstance(runs, list):
+        runs = []
+    runs.append({
+        "model": (model or DEFAULT_MODEL).strip() or DEFAULT_MODEL,
+        "mode": mode,
+        "source_chars": source_chars,
+        "source_words": source_words,
+        "duration_seconds": round(duration_seconds, 1),
+        "seconds_per_100k_chars": round(duration_seconds / max(1, source_chars) * 100_000, 3),
+        "created_at": now_iso(),
+    })
+    data["runs"] = runs[-METRICS_LIMIT:]
+    save_metrics(data)
+
+
+def historical_estimate_minutes(model: str, mode: str, source_chars: int) -> tuple[int, int, int] | None:
+    if source_chars <= 0:
+        return None
+    selected = (model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    runs = [
+        item for item in load_metrics().get("runs", [])
+        if isinstance(item, dict)
+        and item.get("model") == selected
+        and item.get("mode") == mode
+        and float(item.get("source_chars") or 0) > 0
+        and float(item.get("duration_seconds") or 0) > 0
+    ][-10:]
+    if not runs:
+        return None
+    rates = [float(item["duration_seconds"]) / float(item["source_chars"]) for item in runs]
+    average_seconds = (sum(rates) / len(rates)) * source_chars
+    low = max(1, math.ceil(average_seconds * 0.75 / 60))
+    high = max(low, math.ceil(average_seconds * 1.35 / 60))
+    return low, high, len(runs)
 
 
 def ollama_json(path: str, payload: dict[str, Any] | None = None, timeout: int = 5) -> Any:
@@ -215,12 +276,16 @@ def test_model(model: str) -> dict[str, Any]:
         return {"ok": False, "model": selected_model, "detail": str(exc)}
 
 
-def scan_folder(input_path: str) -> dict[str, Any]:
+def scan_folder(input_path: str, model: str = DEFAULT_MODEL) -> dict[str, Any]:
     root = Path(input_path).expanduser().resolve()
     if not root.is_dir():
         raise ValueError("Input folder does not exist.")
     pdfs = [p for p in sorted(root.rglob("*.pdf")) if "exams" not in [part.lower() for part in p.parts]]
     courses: dict[str, int] = {}
+    total_bytes = 0
+    size_buckets = {"small": 0, "medium": 0, "large": 0, "huge": 0}
+    low_minutes = 0
+    high_minutes = 0
     for pdf in pdfs:
         try:
             rel = pdf.relative_to(root)
@@ -228,7 +293,62 @@ def scan_folder(input_path: str) -> dict[str, Any]:
         except ValueError:
             course = pdf.parent.name
         courses[course] = courses.get(course, 0) + 1
-    return {"input_path": str(root), "pdf_count": len(pdfs), "courses": courses}
+        try:
+            size = pdf.stat().st_size
+        except OSError:
+            size = 0
+        total_bytes += size
+        if size < 250_000:
+            size_buckets["small"] += 1
+            low_minutes += 3
+            high_minutes += 6
+        elif size < 1_000_000:
+            size_buckets["medium"] += 1
+            low_minutes += 5
+            high_minutes += 10
+        elif size < 5_000_000:
+            size_buckets["large"] += 1
+            low_minutes += 8
+            high_minutes += 18
+        else:
+            size_buckets["huge"] += 1
+            low_minutes += 14
+            high_minutes += 35
+
+    final_low = len(courses) * 35
+    final_high = len(courses) * 90
+    estimated_source_chars = total_bytes
+    selected_model = (model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    all_basis = "file-size heuristic"
+    finals_basis = "course-count heuristic"
+    history_runs_used = 0
+    all_history = historical_estimate_minutes(selected_model, "all", estimated_source_chars)
+    if all_history:
+        low_minutes, high_minutes, history_runs_used = all_history
+        all_basis = f"previous runs with {selected_model}"
+    finals_history = historical_estimate_minutes(selected_model, "finals", estimated_source_chars)
+    if finals_history:
+        final_low, final_high, finals_runs = finals_history
+        history_runs_used = max(history_runs_used, finals_runs)
+        finals_basis = f"previous final runs with {selected_model}"
+    return {
+        "input_path": str(root),
+        "pdf_count": len(pdfs),
+        "courses": courses,
+        "estimate": {
+            "generate_all_minutes_low": low_minutes,
+            "generate_all_minutes_high": high_minutes,
+            "generate_finals_minutes_low": final_low,
+            "generate_finals_minutes_high": final_high,
+            "total_pdf_mb": round(total_bytes / 1_000_000, 1),
+            "estimated_source_chars": estimated_source_chars,
+            "size_buckets": size_buckets,
+            "basis": {"generate_all": all_basis, "generate_finals": finals_basis},
+            "history_runs_used": history_runs_used,
+            "model": selected_model,
+            "note": "Estimate uses previous runs for the selected model when available; otherwise it falls back to file size. It improves after each completed generation.",
+        },
+    }
 
 
 def ensure_separate_output(input_path: str, output_path: str) -> None:
@@ -291,6 +411,9 @@ def final_args(root: Path, overwrite: bool = False, model: str = DEFAULT_MODEL) 
 
 
 def run_generation(job: Job, payload: dict[str, Any]) -> None:
+    started = dt.datetime.now().astimezone()
+    metric_chars = 0
+    metric_words = 0
     try:
         input_path = payload.get("input_path")
         output_path = payload.get("output_path") or str(DEFAULT_OUTPUT_DIR)
@@ -331,6 +454,13 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
                     )
                     if result:
                         job_log(job, f"Wrote {result['source_pdf']} ({result['mc_count']} MC, {result['open_count']} open)")
+                        source_file = Path(result["exam_dir"]) / "source.txt"
+                        try:
+                            source_text = source_file.read_text(encoding="utf-8", errors="replace")
+                            metric_chars += len(source_text)
+                            metric_words += len(source_text.split())
+                        except OSError:
+                            pass
                 except Exception as exc:
                     if mode == "example":
                         raise
@@ -355,6 +485,13 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
                 result = generate_final_exams.write_final_exam(args, course)
                 if result:
                     job_log(job, f"Final {result['course']}: {result['mc']} MC, {result['open']} open")
+                    source_file = course / "exams" / "final-exam" / "source.txt"
+                    try:
+                        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+                        metric_chars += len(source_text)
+                        metric_words += len(source_text.split())
+                    except OSError:
+                        metric_words += int(result.get("words") or 0)
             job.message = "Writing index pages"
             job_log(job, "Writing index pages")
             generate_exams.write_index_pages(project_root)
@@ -364,6 +501,10 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
         job.status = "done"
         job.progress = 100
         job.message = "Done"
+        duration = (dt.datetime.now().astimezone() - started).total_seconds()
+        if mode in {"all", "finals"} and metric_chars > 0:
+            record_generation_metric(model, mode, metric_chars, metric_words, duration)
+            job_log(job, f"Saved estimate sample for {model}: {metric_words:,} words in {int(duration // 60)} min")
         job_log(job, "Done")
         job.result = {"project_root": str(project_root), "index_url": "/preview/exam_index.html"}
     except Exception as exc:
@@ -411,7 +552,7 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed_path.path == "/api/test-model":
                 json_response(self, 200, test_model(str(payload.get("model") or DEFAULT_MODEL)))
             elif parsed_path.path == "/api/scan":
-                json_response(self, 200, scan_folder(payload.get("input_path", "")))
+                json_response(self, 200, scan_folder(payload.get("input_path", ""), payload.get("model", DEFAULT_MODEL)))
             elif parsed_path.path == "/api/generate":
                 job = Job(id=str(uuid.uuid4()), kind=str(payload.get("mode", "example")))
                 STATE.jobs[job.id] = job
