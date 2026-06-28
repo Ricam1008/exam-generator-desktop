@@ -1,7 +1,6 @@
 from pathlib import Path
 from types import SimpleNamespace
 import sys
-import subprocess
 import tempfile
 import unittest
 
@@ -107,123 +106,6 @@ class BackendSafetyTests(unittest.TestCase):
         self.assertEqual(len(exam["multiple_choice"]), 1)
         self.assertEqual(len(exam["open_ended"]), 1)
 
-    def test_extract_pdf_text_uses_marker_first(self) -> None:
-        original_marker = generate_exams.marker_cli_path
-        original_run = generate_exams.run_command
-
-        def fake_run(args: list[str], timeout: int = 120) -> subprocess.CompletedProcess[str]:
-            output_dir = Path(args[args.index("--output_dir") + 1])
-            (output_dir / "fake.md").write_text("# Heading\n\n" + ("marker content " * 900), encoding="utf-8")
-            return subprocess.CompletedProcess(args, 0, "", "")
-
-        try:
-            generate_exams.marker_cli_path = lambda: "/fake/marker_single"  # type: ignore[assignment]
-            generate_exams.run_command = fake_run  # type: ignore[assignment]
-            result = generate_exams.extract_pdf_text(Path("/tmp/fake.pdf"))
-        finally:
-            generate_exams.marker_cli_path = original_marker  # type: ignore[assignment]
-            generate_exams.run_command = original_run  # type: ignore[assignment]
-
-        self.assertEqual(result.parser, "marker")
-        self.assertTrue(result.marker_used)
-        self.assertFalse(result.fallback_used)
-        self.assertIn("# Heading", result.text)
-
-    def test_missing_marker_blocks_generation_when_required(self) -> None:
-        original_marker = generate_exams.marker_cli_path
-
-        try:
-            generate_exams.marker_cli_path = lambda: None  # type: ignore[assignment]
-            with self.assertRaises(RuntimeError):
-                generate_exams.extract_pdf_text(Path("/tmp/fake.pdf"))
-        finally:
-            generate_exams.marker_cli_path = original_marker  # type: ignore[assignment]
-
-    def test_marker_failure_falls_back_to_legacy_parser(self) -> None:
-        original_marker = generate_exams.marker_cli_path
-        original_run = generate_exams.run_command
-        original_pypdf = generate_exams.extract_with_pypdf
-
-        def fake_run(args: list[str], timeout: int = 120) -> subprocess.CompletedProcess[str]:
-            return subprocess.CompletedProcess(args, 1, "", "marker exploded")
-
-        try:
-            generate_exams.marker_cli_path = lambda: "/fake/marker_single"  # type: ignore[assignment]
-            generate_exams.run_command = fake_run  # type: ignore[assignment]
-            generate_exams.extract_with_pypdf = lambda path: ("legacy content " * 900, 12)  # type: ignore[assignment]
-            result = generate_exams.extract_pdf_text(Path("/tmp/fake.pdf"))
-        finally:
-            generate_exams.marker_cli_path = original_marker  # type: ignore[assignment]
-            generate_exams.run_command = original_run  # type: ignore[assignment]
-            generate_exams.extract_with_pypdf = original_pypdf  # type: ignore[assignment]
-
-        self.assertEqual(result.parser, "pypdf")
-        self.assertFalse(result.marker_used)
-        self.assertTrue(result.fallback_used)
-        self.assertIn("Marker failed; used pypdf", result.parser_warning or "")
-
-    def test_marker_empty_output_falls_back_to_legacy_parser(self) -> None:
-        original_marker = generate_exams.marker_cli_path
-        original_run = generate_exams.run_command
-        original_pypdf = generate_exams.extract_with_pypdf
-
-        def fake_run(args: list[str], timeout: int = 120) -> subprocess.CompletedProcess[str]:
-            return subprocess.CompletedProcess(args, 0, "", "")
-
-        try:
-            generate_exams.marker_cli_path = lambda: "/fake/marker_single"  # type: ignore[assignment]
-            generate_exams.run_command = fake_run  # type: ignore[assignment]
-            generate_exams.extract_with_pypdf = lambda path: ("legacy content " * 900, 12)  # type: ignore[assignment]
-            result = generate_exams.extract_pdf_text(Path("/tmp/fake.pdf"))
-        finally:
-            generate_exams.marker_cli_path = original_marker  # type: ignore[assignment]
-            generate_exams.run_command = original_run  # type: ignore[assignment]
-            generate_exams.extract_with_pypdf = original_pypdf  # type: ignore[assignment]
-
-        self.assertEqual(result.parser, "pypdf")
-        self.assertTrue(result.fallback_used)
-        self.assertIn("did not produce a Markdown file", result.parser_warning or "")
-
-    def test_exam_metadata_records_parser_result(self) -> None:
-        model_exam = {
-            "multiple_choice": [
-                {
-                    "question": "Welche Aussagen stimmen?",
-                    "options": [
-                        {"text": "A", "is_correct": True},
-                        {"text": "B", "is_correct": False},
-                        {"text": "C", "is_correct": False},
-                        {"text": "D", "is_correct": True},
-                    ],
-                    "explanation": "A und D sind durch die Quelle gestützt.",
-                }
-            ],
-            "open_ended": [
-                {
-                    "question": "Erkläre den zentralen Befund.",
-                    "expected_answer": "Der zentrale Befund wird erklärt.",
-                    "key_concepts": ["Befund"],
-                    "grading_rubric": {"90-100": "Vollständig."},
-                }
-            ],
-        }
-        parser = generate_exams.ParserResult(
-            text="content",
-            warning="Marker failed; used pypdf.",
-            page_count=3,
-            parser="pypdf",
-            parser_warning="Marker failed; used pypdf.",
-            marker_used=False,
-            fallback_used=True,
-        )
-
-        exam = generate_exams.normalize_exam(model_exam, "Course", "source.pdf", parser.warning, 2000, parser)
-
-        self.assertEqual(exam["metadata"]["parser"], "pypdf")
-        self.assertEqual(exam["metadata"]["parser_warning"], "Marker failed; used pypdf.")
-        self.assertFalse(exam["metadata"]["marker_used"])
-        self.assertTrue(exam["metadata"]["fallback_used"])
-
     def test_desktop_example_uses_smaller_ai_request_and_fallback(self) -> None:
         args = generator_args(Path("/tmp/example"), example=True, model="llama3.1:8b")
 
@@ -297,37 +179,6 @@ class BackendSafetyTests(unittest.TestCase):
         model_check = next(item for item in result["checks"] if item["id"] == "model")
         self.assertFalse(model_check["ok"])
         self.assertIn("ollama pull missing:model", model_check["detail"])
-
-    def test_check_dependencies_requires_marker(self) -> None:
-        class FakeResponse:
-            def __enter__(self) -> "FakeResponse":
-                return self
-
-            def __exit__(self, *args: object) -> None:
-                return None
-
-            def read(self) -> bytes:
-                return b"Ollama is running"
-
-        original_urlopen = cli.request.urlopen
-        original_ollama_json = cli.ollama_json
-        original_marker = cli.generate_exams.marker_cli_path
-
-        try:
-            cli.request.urlopen = lambda *args, **kwargs: FakeResponse()  # type: ignore[assignment]
-            cli.ollama_json = lambda *args, **kwargs: {"models": [{"name": "gemma4:31b-cloud"}]}  # type: ignore[assignment]
-            cli.generate_exams.marker_cli_path = lambda: None  # type: ignore[assignment]
-            with tempfile.TemporaryDirectory() as temp:
-                result = cli.check_dependencies(temp, "gemma4:31b-cloud")
-        finally:
-            cli.request.urlopen = original_urlopen  # type: ignore[assignment]
-            cli.ollama_json = original_ollama_json  # type: ignore[assignment]
-            cli.generate_exams.marker_cli_path = original_marker  # type: ignore[assignment]
-
-        marker_check = next(item for item in result["checks"] if item["id"] == "marker")
-        self.assertFalse(marker_check["ok"])
-        self.assertIn("marker-pdf", marker_check["detail"])
-        self.assertFalse(result["ok"])
 
     def test_test_model_success_updates_selected_model(self) -> None:
         original_ollama_json = cli.ollama_json

@@ -145,24 +145,18 @@ def check_dependencies(output_path: str | None = None, model: str = DEFAULT_MODE
     checks.append({"id": "model", "label": f"Model {selected_model}", "ok": model_ok, "detail": model_detail})
     ok = ok and model_ok
 
-    marker = generate_exams.marker_cli_path()
-    marker_ok = bool(marker)
-    marker_detail = marker or generate_exams.marker_install_hint()
-    checks.append({"id": "marker", "label": "Marker PDF parser", "ok": marker_ok, "detail": marker_detail})
-    ok = ok and marker_ok
-
     templates_ok = all((PACKAGE_DIR / "templates" / name).exists() for name in ["index_template.html", "app.js", "styles.css"])
     checks.append({"id": "backend", "label": "Python backend resources", "ok": templates_ok, "detail": str(PACKAGE_DIR)})
     ok = ok and templates_ok
 
     pypdf_ok = importlib.util.find_spec("pypdf") is not None
-    fallback_ok = pypdf_ok or shutil.which("pdftotext") is not None or shutil.which("strings") is not None
     checks.append({
-        "id": "fallback_parser",
-        "label": "Fallback PDF parser",
-        "ok": fallback_ok,
-        "detail": "pypdf available" if pypdf_ok else "Legacy fallback available" if fallback_ok else "Optional fallback missing: python3 -m pip install pypdf",
+        "id": "pypdf",
+        "label": "PDF text extractor",
+        "ok": pypdf_ok,
+        "detail": "pypdf available" if pypdf_ok else "Run: python3 -m pip install --user pypdf",
     })
+    ok = ok and pypdf_ok
 
     out = Path(output_path).expanduser() if output_path else DEFAULT_OUTPUT_DIR
     try:
@@ -306,8 +300,6 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
         STATE.selected_model = model
         if not input_path:
             raise ValueError("Input folder is required.")
-        if generate_exams.MARKER_REQUIRED and not generate_exams.marker_cli_path():
-            raise RuntimeError(generate_exams.marker_install_hint())
         job.message = "Preparing output workspace"
         job_log(job, "Preparing output workspace")
         ensure_separate_output(input_path, output_path)

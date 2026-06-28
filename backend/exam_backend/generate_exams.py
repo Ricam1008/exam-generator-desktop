@@ -11,12 +11,10 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import textwrap
 import unicodedata
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -27,22 +25,6 @@ MIN_WORDS_FOR_FULL_EXAM = 3000
 LOW_TEXT_WORD_THRESHOLD = 800
 MAX_PROMPT_TEXT_CHARS = 52000
 FULL_COVERAGE_TEXT_CHARS = 22000
-MARKER_REQUIRED = True
-USE_MARKER_FIRST = True
-MARKER_TIMEOUT_SECONDS = 1800
-MARKER_MIN_WORDS_FOR_SUCCESS = 80
-
-
-@dataclass
-class ParserResult:
-    text: str
-    warning: str | None
-    page_count: int | None
-    parser: str
-    parser_warning: str | None = None
-    marker_used: bool = False
-    fallback_used: bool = False
-    diagnostics: str | None = None
 
 
 EXAM_JSON_SCHEMA: dict[str, Any] = {
@@ -65,10 +47,6 @@ EXAM_JSON_SCHEMA: dict[str, Any] = {
                 "text_extraction_warning": {"type": ["string", "null"]},
                 "generator": {"type": "string"},
                 "source_word_count": {"type": "integer"},
-                "parser": {"type": "string"},
-                "parser_warning": {"type": ["string", "null"]},
-                "marker_used": {"type": "boolean"},
-                "fallback_used": {"type": "boolean"},
                 "coverage_mode": {"type": "string"},
                 "source_chunk_count": {"type": "integer"},
                 "processed_chunk_count": {"type": "integer"},
@@ -252,69 +230,6 @@ def run_command(args: list[str], timeout: int = 120) -> subprocess.CompletedProc
     return subprocess.run(args, check=False, capture_output=True, text=True, timeout=timeout)
 
 
-def marker_cli_path() -> str | None:
-    return shutil.which("marker_single")
-
-
-def marker_install_hint() -> str:
-    return "Marker is required. Install it with: python3 -m pip install marker-pdf"
-
-
-def clean_marker_markdown(text: str) -> str:
-    text = text.replace("\x00", " ")
-    text = re.sub(r"\n{6,}", "\n\n\n", text)
-    return text.strip()
-
-
-def marker_markdown_candidates(output_dir: Path) -> list[Path]:
-    return sorted(output_dir.rglob("*.md")) + sorted(output_dir.rglob("*.markdown"))
-
-
-def extract_with_marker(pdf_path: Path) -> ParserResult:
-    marker = marker_cli_path()
-    if not marker:
-        raise RuntimeError(marker_install_hint())
-
-    with tempfile.TemporaryDirectory(prefix="exam-marker-") as temp:
-        output_dir = Path(temp)
-        result = run_command(
-            [
-                marker,
-                str(pdf_path),
-                "--output_format",
-                "markdown",
-                "--output_dir",
-                str(output_dir),
-                "--disable_tqdm",
-            ],
-            timeout=MARKER_TIMEOUT_SECONDS,
-        )
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout or "Marker exited with an error.").strip()
-            raise RuntimeError(detail[:1200])
-
-        candidates = marker_markdown_candidates(output_dir)
-        if not candidates:
-            raise RuntimeError("Marker completed but did not produce a Markdown file.")
-        output_file = max(candidates, key=lambda path: path.stat().st_size)
-        markdown = clean_marker_markdown(output_file.read_text(encoding="utf-8", errors="replace"))
-        if count_words(markdown) < MARKER_MIN_WORDS_FOR_SUCCESS:
-            raise RuntimeError(f"Marker produced only {count_words(markdown)} words.")
-        warning = None
-        if count_words(markdown) < LOW_TEXT_WORD_THRESHOLD:
-            warning = f"Only {count_words(markdown)} words were extracted; this PDF may contain scanned slides, images, or little text."
-
-        return ParserResult(
-            text=markdown,
-            warning=warning,
-            page_count=None,
-            parser="marker",
-            marker_used=True,
-            fallback_used=False,
-            diagnostics=f"Marker output: {output_file.name}",
-        )
-
-
 def extract_with_pypdf(pdf_path: Path) -> tuple[str, int | None] | None:
     try:
         from pypdf import PdfReader  # type: ignore
@@ -371,7 +286,7 @@ def clean_extracted_text(text: str) -> str:
     return text.strip()
 
 
-def extract_with_legacy_parsers(pdf_path: Path, fallback_reason: str | None = None) -> ParserResult:
+def extract_pdf_text(pdf_path: Path) -> tuple[str, str | None, int | None]:
     attempts = [
         ("pypdf", extract_with_pypdf),
         ("pdfplumber", extract_with_pdfplumber),
@@ -396,44 +311,10 @@ def extract_with_legacy_parsers(pdf_path: Path, fallback_reason: str | None = No
                 warning = "Text extraction used a rough fallback; question quality may be weak. Install pypdf or Poppler/pdftotext for better extraction."
             elif words < LOW_TEXT_WORD_THRESHOLD:
                 warning = f"Only {words} words were extracted; this PDF may contain scanned slides, images, or little text."
-            parser_warning = f"Marker failed; used {name}. Reason: {fallback_reason}" if fallback_reason else None
-            combined_warning = " ".join(part for part in [warning, parser_warning] if part).strip() or None
-            return ParserResult(
-                text=text,
-                warning=combined_warning,
-                page_count=page_count,
-                parser=name,
-                parser_warning=parser_warning,
-                marker_used=False,
-                fallback_used=bool(fallback_reason),
-                diagnostics=last_error,
-            )
+            return text, warning, page_count
 
     message = last_error or "No PDF text extractor was available."
-    parser_warning = f"Marker failed and legacy extraction failed. Marker reason: {fallback_reason}. Legacy reason: {message}" if fallback_reason else message
-    return ParserResult(
-        text="",
-        warning=f"Could not extract usable text. {parser_warning}",
-        page_count=None,
-        parser="none",
-        parser_warning=parser_warning,
-        marker_used=False,
-        fallback_used=bool(fallback_reason),
-        diagnostics=message,
-    )
-
-
-def extract_pdf_text(pdf_path: Path) -> ParserResult:
-    if USE_MARKER_FIRST:
-        if not marker_cli_path():
-            if MARKER_REQUIRED:
-                raise RuntimeError(marker_install_hint())
-            return extract_with_legacy_parsers(pdf_path, "Marker is not installed.")
-        try:
-            return extract_with_marker(pdf_path)
-        except Exception as exc:
-            return extract_with_legacy_parsers(pdf_path, str(exc))
-    return extract_with_legacy_parsers(pdf_path)
+    return "", f"Could not extract usable text. {message}", None
 
 
 def count_words(text: str) -> int:
@@ -680,7 +561,6 @@ def normalize_exam(
     source_pdf: str,
     extraction_warning: str | None,
     source_word_count: int,
-    parser_result: ParserResult | None = None,
 ) -> dict[str, Any]:
     mc_questions = []
     mc_source = first_list(model_exam, ["multiple_choice", "multiple_choice_questions", "mc_questions", "mcq", "mc"])
@@ -752,10 +632,6 @@ def normalize_exam(
             "text_extraction_warning": extraction_warning,
             "generator": "generate_exams.py",
             "source_word_count": source_word_count,
-            "parser": parser_result.parser if parser_result else "unknown",
-            "parser_warning": parser_result.parser_warning if parser_result else None,
-            "marker_used": parser_result.marker_used if parser_result else False,
-            "fallback_used": parser_result.fallback_used if parser_result else False,
             "question_count": {
                 "multiple_choice": len(mc_questions),
                 "open_ended": len(open_questions),
@@ -904,7 +780,6 @@ def generate_full_coverage_exam(
     extraction_warning: str | None,
     word_count: int,
     args: argparse.Namespace,
-    parser_result: ParserResult | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     chunks = chunk_text(text)
@@ -970,7 +845,6 @@ def generate_full_coverage_exam(
         source_pdf,
         extraction_warning,
         word_count,
-        parser_result,
     )
     return apply_coverage_metadata(exam, "full_coverage", len(chunks), processed_chunks, failed_chunks, " ".join(warnings) if warnings else None)
 
@@ -981,7 +855,6 @@ def heuristic_exam(
     text: str,
     extraction_warning: str | None,
     source_word_count: int,
-    parser_result: ParserResult | None = None,
 ) -> dict[str, Any]:
     sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", text) if len(s.strip()) > 55]
     seeds = sentences[:16] or [Path(source_pdf).stem]
@@ -1028,7 +901,6 @@ def heuristic_exam(
         source_pdf,
         warning.strip(),
         source_word_count,
-        parser_result,
     )
 
 
@@ -1060,16 +932,11 @@ def write_exam_folder(
         print(f"SKIP existing: {exam_dir}", flush=True)
         return None
 
-    parser_result = extract_pdf_text(pdf_path)
-    text = parser_result.text
-    extraction_warning = parser_result.warning
-    page_count = parser_result.page_count
+    text, extraction_warning, page_count = extract_pdf_text(pdf_path)
     word_count = count_words(text)
     if progress:
         pages = page_count if page_count is not None else "unknown"
-        progress(f"Extracted {word_count:,} words from {pages} pages using {parser_result.parser}")
-        if parser_result.fallback_used and parser_result.parser_warning:
-            progress(parser_result.parser_warning)
+        progress(f"Extracted {word_count:,} words from {pages} pages")
 
     base_mc, base_open = target_counts(word_count, args)
     last_error: Exception | None = None
@@ -1080,7 +947,7 @@ def write_exam_folder(
     if coverage_mode == "full_coverage":
         if progress:
             progress("Using full-coverage generation")
-        exam = generate_full_coverage_exam(course, pdf_path.name, text, extraction_warning, word_count, args, parser_result, progress)
+        exam = generate_full_coverage_exam(course, pdf_path.name, text, extraction_warning, word_count, args, progress)
     else:
         if progress:
             progress("Using representative generation")
@@ -1105,7 +972,7 @@ def write_exam_folder(
                     progress(f"Waiting for Ollama: {pdf_path.name} (attempt {attempt + 1}/{max_attempts}, {target_mc} MC / {target_open} open)")
                 raw = post_ollama(args.endpoint, args.model, prompt, args.timeout)
                 model_exam = load_json_from_model(raw)
-                exam = normalize_exam(model_exam, course, pdf_path.name, extraction_warning, word_count, parser_result)
+                exam = normalize_exam(model_exam, course, pdf_path.name, extraction_warning, word_count)
                 exam = apply_coverage_metadata(exam, "representative", 1, 1, 0, None)
                 if progress:
                     progress(f"Ollama returned usable exam JSON for {pdf_path.name}")
@@ -1125,7 +992,7 @@ def write_exam_folder(
         print(f"LLM unavailable for {pdf_path.name}; writing heuristic inspection exam.", flush=True)
         if progress:
             progress(f"Using fallback inspection exam for {pdf_path.name}")
-        exam = heuristic_exam(course, pdf_path.name, text, extraction_warning, word_count, parser_result)
+        exam = heuristic_exam(course, pdf_path.name, text, extraction_warning, word_count)
 
     if exam_dir.exists() and args.overwrite:
         shutil.rmtree(exam_dir)
