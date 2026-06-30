@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -12,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import time
 import unicodedata
 import urllib.error
 import urllib.request
@@ -22,11 +25,62 @@ from typing import Any, Callable
 DEFAULT_ENDPOINT = "http://localhost:11434/api/chat"
 DEFAULT_MODEL = "gemma4:31b-cloud"
 GENERATOR_VERSION = "0.1.0"
+PROMPT_VERSION = "merged-chunk-v1"
 MIN_WORDS_FOR_FULL_EXAM = 3000
 LOW_TEXT_WORD_THRESHOLD = 800
 MAX_PROMPT_TEXT_CHARS = 52000
 FULL_COVERAGE_TEXT_CHARS = 22000
+DEFAULT_MAX_PARALLEL_CHUNKS = 2
+ALLOWED_MAX_PARALLEL_CHUNKS = {1, 2, 3, 5}
 DebugLogger = Callable[[str, str], None]
+
+RUBRIC_TEMPLATES: dict[str, dict[str, Any]] = {
+    "standard_concept_explanation": {
+        "description": "Use for conceptual explanation questions.",
+        "criteria": [
+            "Correctly explains the main concept",
+            "Uses relevant terminology",
+            "Mentions key implications or common traps",
+            "Provides a coherent answer structure",
+        ],
+    },
+    "calculation_with_reasoning": {
+        "description": "Use for calculation questions with explanation.",
+        "criteria": [
+            "Uses the correct formula",
+            "Shows the correct calculation path",
+            "Interprets the result correctly",
+            "Avoids common formula or sign errors",
+        ],
+    },
+    "compare_and_contrast": {
+        "description": "Use for comparison questions.",
+        "criteria": [
+            "Defines both concepts",
+            "Explains the key difference",
+            "Gives an example or implication",
+            "Avoids mixing up similar terms",
+        ],
+    },
+    "diagram_interpretation": {
+        "description": "Use for questions requiring graph or diagram interpretation.",
+        "criteria": [
+            "Identifies axes or relevant elements",
+            "Interprets the visual relationship correctly",
+            "Connects the diagram to the underlying concept",
+            "Avoids common graph-reading mistakes",
+        ],
+    },
+}
+
+DEFAULT_RUBRIC_TEMPLATE = "standard_concept_explanation"
+DEFAULT_GRADING_RUBRIC = {
+    "90-100": "Precise, complete answer covering all key concepts.",
+    "61-89": "Mostly correct answer with minor to noticeable gaps.",
+    "41-60": "On topic but incomplete or imprecise.",
+    "21-40": "Partially relevant with major conceptual gaps.",
+    "0-20": "Mostly wrong, vague, or empty.",
+}
 
 
 EXAM_JSON_SCHEMA: dict[str, Any] = {
@@ -92,15 +146,17 @@ EXAM_JSON_SCHEMA: dict[str, Any] = {
                     "question",
                     "expected_answer",
                     "key_concepts",
-                    "grading_rubric",
                     "max_score",
                 ],
                 "properties": {
                     "id": {"type": "string"},
+                    "topic": {"type": "string"},
+                    "question_type": {"type": "string"},
                     "question": {"type": "string"},
                     "expected_answer": {"type": "string"},
                     "key_concepts": {"type": "array", "items": {"type": "string"}},
                     "grading_rubric": {"type": "object"},
+                    "rubric_template": {"type": "string"},
                     "max_score": {"type": "integer", "const": 100},
                 },
             },
@@ -120,7 +176,8 @@ Avoid duplicate, trivial, or overly easy questions.
 Distractors must be plausible and based on common misconceptions or nearby concepts from the source material.
 Formula and JSON safety: prefer plain-text formula notation over LaTeX commands. If a JSON string must contain a backslash, emit it as a doubled JSON backslash.
 
-Return valid JSON only. No markdown. No prose outside JSON."""
+Return only valid JSON. Do not use markdown. Do not include commentary outside JSON.
+The first character must be {. The final character must be }. Do not wrap JSON in code fences."""
 
 
 def build_generation_prompt(
@@ -132,6 +189,7 @@ def build_generation_prompt(
     extraction_warning: str | None,
 ) -> str:
     schema = json.dumps(EXAM_JSON_SCHEMA, ensure_ascii=False, indent=2)
+    rubric_templates = json.dumps(RUBRIC_TEMPLATES, ensure_ascii=False, indent=2)
     warning_note = extraction_warning or "None"
     return f"""Create one standalone exam JSON object for this lecture PDF.
 
@@ -160,8 +218,17 @@ Multiple-choice requirements:
 
 Open-ended requirements:
 - Each open question has max_score 100.
-- Include expected_answer, key_concepts, and a grading_rubric object.
-- Rubrics must be strict and useful for grading from 0 to 100 points.
+- Include expected_answer, key_concepts, and rubric_template.
+- Use one of these reusable rubric templates instead of generating per-question score bands:
+{rubric_templates}
+
+Strict JSON output:
+- Return only valid JSON.
+- Do not use markdown.
+- Do not include commentary outside JSON.
+- The first character must be {{.
+- The final character must be }}.
+- Do not wrap JSON in code fences.
 
 Required JSON schema:
 {schema}
@@ -186,6 +253,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--timeout", type=int, default=600, help="LLM request timeout in seconds.")
     parser.add_argument("--retries", type=int, default=2, help="Retries per PDF when the model returns malformed JSON.")
+    parser.add_argument(
+        "--max-parallel-chunks",
+        type=int,
+        choices=sorted(ALLOWED_MAX_PARALLEL_CHUNKS),
+        default=DEFAULT_MAX_PARALLEL_CHUNKS,
+        help="Internal full-coverage chunk parallelism. Not shown in the student UI.",
+    )
     parser.add_argument(
         "--coverage-mode",
         choices=["representative", "full_coverage", "auto"],
@@ -456,6 +530,183 @@ def resolve_coverage_mode(text: str, args: argparse.Namespace) -> str:
     return mode
 
 
+def normalize_max_parallel_chunks(args: argparse.Namespace) -> int:
+    value = int(getattr(args, "max_parallel_chunks", DEFAULT_MAX_PARALLEL_CHUNKS) or DEFAULT_MAX_PARALLEL_CHUNKS)
+    return value if value in ALLOWED_MAX_PARALLEL_CHUNKS else DEFAULT_MAX_PARALLEL_CHUNKS
+
+
+def new_timing() -> dict[str, Any]:
+    return {
+        "total_seconds": 0.0,
+        "extraction_seconds": 0.0,
+        "chunking_seconds": 0.0,
+        "model_seconds": 0.0,
+        "validation_seconds": 0.0,
+        "repair_seconds": 0.0,
+        "write_seconds": 0.0,
+        "model_calls": 0,
+        "parallelism_used": 1,
+    }
+
+
+def add_seconds(timing: dict[str, Any] | None, key: str, started: float) -> None:
+    if timing is not None:
+        timing[key] = round(float(timing.get(key) or 0.0) + (time.perf_counter() - started), 4)
+
+
+def format_seconds(value: Any) -> str:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        seconds = 0.0
+    if seconds >= 10:
+        return f"{seconds:.0f}s"
+    return f"{seconds:.2f}s"
+
+
+def format_timing_summary(timing: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "=" * 50,
+            "TIMING SUMMARY",
+            "=" * 50,
+            "",
+            f"Total duration: {format_seconds(timing.get('total_seconds'))}",
+            f"Extraction: {format_seconds(timing.get('extraction_seconds'))}",
+            f"Chunking: {format_seconds(timing.get('chunking_seconds'))}",
+            f"Model calls: {format_seconds(timing.get('model_seconds'))}",
+            f"Validation: {format_seconds(timing.get('validation_seconds'))}",
+            f"Repair: {format_seconds(timing.get('repair_seconds'))}",
+            f"Writing: {format_seconds(timing.get('write_seconds'))}",
+            f"Model calls made: {int(timing.get('model_calls') or 0)}",
+            f"Parallelism used: {int(timing.get('parallelism_used') or 1)}",
+            "",
+            "=" * 50,
+        ]
+    )
+
+
+def pdf_file_hash(pdf_path: Path) -> str:
+    digest = hashlib.sha256()
+    with pdf_path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def preprocessing_cache_key(pdf_path: Path, args: argparse.Namespace, source_hash: str) -> dict[str, str]:
+    return {
+        "source_file_hash": source_hash,
+        "generator_version": GENERATOR_VERSION,
+        "extraction_mode": str(getattr(args, "extraction_mode", "auto")),
+        "model_name": str(getattr(args, "model", DEFAULT_MODEL)),
+        "prompt_version": PROMPT_VERSION,
+    }
+
+
+def preprocessing_cache_path(root: Path, cache_key: dict[str, str]) -> Path:
+    encoded = json.dumps(cache_key, sort_keys=True).encode("utf-8")
+    name = hashlib.sha256(encoded).hexdigest() + ".json"
+    return root / ".exam-generator-cache" / name
+
+
+def visual_markers_from_text(text: str) -> dict[str, Any]:
+    table_pages = sorted(
+        {
+            int(page)
+            for page in re.findall(r"\[TABLE\s+page=(\d+)\b", text, flags=re.IGNORECASE)
+            if str(page).isdigit()
+        }
+    )
+    visual_terms = re.findall(
+        r"\b(abbildung|diagramm|grafik|graph|kurve|chart|figure|plot|axis|achsen)\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return {
+        "tables": len(table_pages),
+        "table_pages": table_pages,
+        "visual_term_count": len(visual_terms),
+    }
+
+
+def chunk_map_from_chunks(chunks: list[str]) -> list[dict[str, Any]]:
+    return [
+        {
+            "chunk_id": f"chunk-{index:03d}",
+            "chunk_page_range": source_pages_from_text(chunk),
+            "characters": len(chunk),
+        }
+        for index, chunk in enumerate(chunks, start=1)
+    ]
+
+
+def load_preprocessing_cache(
+    root: Path,
+    pdf_path: Path,
+    args: argparse.Namespace,
+    debug: DebugLogger | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, str], Path]:
+    source_hash = pdf_file_hash(pdf_path)
+    cache_key = preprocessing_cache_key(pdf_path, args, source_hash)
+    path = preprocessing_cache_path(root, cache_key)
+    if not path.exists():
+        if progress:
+            progress(f"Preprocessing cache miss: {pdf_path.name}")
+        if debug:
+            debug("Preprocessing cache miss", json.dumps({"source_pdf": pdf_path.name, "path": str(path)}, ensure_ascii=False, indent=2))
+        return None, cache_key, path
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        if debug:
+            debug("Preprocessing cache invalid", f"{pdf_path.name}: {type(exc).__name__}: {exc}")
+        return None, cache_key, path
+    if payload.get("cache_key") != cache_key:
+        if debug:
+            debug("Preprocessing cache invalid", f"{pdf_path.name}: cache key mismatch")
+        return None, cache_key, path
+    if "coverage_notes" in payload:
+        if debug:
+            debug("Preprocessing cache invalid", f"{pdf_path.name}: model-generated coverage_notes are not cached in phase 1")
+        return None, cache_key, path
+    if progress:
+        progress(f"Preprocessing cache hit: {pdf_path.name}")
+    if debug:
+        debug("Preprocessing cache hit", json.dumps({"source_pdf": pdf_path.name, "path": str(path)}, ensure_ascii=False, indent=2))
+    return payload, cache_key, path
+
+
+def write_preprocessing_cache(
+    path: Path,
+    cache_key: dict[str, str],
+    text: str,
+    extraction_warning: str | None,
+    page_count: int | None,
+    chunks: list[str],
+    debug: DebugLogger | None = None,
+) -> None:
+    payload = {
+        "cache_key": cache_key,
+        "extracted_text": text,
+        "extraction_warning": extraction_warning,
+        "page_count": page_count,
+        "page_map": source_pages_from_text(text),
+        "chunk_map": chunk_map_from_chunks(chunks),
+        "visual_markers": visual_markers_from_text(text),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        if debug:
+            debug("Preprocessing cache write failed", f"{path}: {type(exc).__name__}: {exc}")
+        return
+    if debug:
+        debug("Preprocessing cache written", json.dumps({"path": str(path), "source_pages": payload["page_map"]}, ensure_ascii=False, indent=2))
+
+
 def distribute_counts(total: int, buckets: int) -> list[int]:
     if buckets <= 0:
         return []
@@ -529,18 +780,38 @@ def source_type_from_text(text: str) -> str:
 
 def question_source_meta(source_text: str, chunk_id: str) -> dict[str, Any]:
     source_type = source_type_from_text(source_text)
+    pages = source_pages_from_text(source_text)
     return {
-        "source_pages": source_pages_from_text(source_text),
-        "source_type": source_type,
         "chunk_id": chunk_id,
-        "visual_required": source_type in {"diagram", "table", "mixed"},
+        "chunk_page_range": pages,
+        "evidence_pages": [],
+        "source_excerpt": None,
+        "source_type": source_type,
+        "visual_required": False,
+        "source_pages": [],
     }
 
 
 def attach_question_metadata(questions: list[dict[str, Any]], source_text: str, chunk_id: str) -> None:
     meta = question_source_meta(source_text, chunk_id)
     for question in questions:
-        question.setdefault("_meta", dict(meta))
+        existing = question.get("_meta") if isinstance(question.get("_meta"), dict) else {}
+        merged = dict(meta)
+        if existing:
+            evidence_pages = [
+                int(page)
+                for page in ensure_list(existing.get("evidence_pages", existing.get("source_pages")))
+                if isinstance(page, int) or (isinstance(page, str) and page.isdigit())
+            ]
+            merged["evidence_pages"] = sorted({page for page in evidence_pages if page > 0})
+            merged["source_pages"] = list(merged["evidence_pages"])
+            excerpt = existing.get("source_excerpt")
+            merged["source_excerpt"] = str(excerpt).strip()[:500] if excerpt else None
+            source_type = str(existing.get("source_type") or merged["source_type"]).strip()
+            if source_type in {"text", "formula", "table", "diagram", "mixed", "unknown"}:
+                merged["source_type"] = source_type
+            merged["visual_required"] = bool(existing.get("visual_required", False))
+        question["_meta"] = merged
 
 
 def exam_questions(exam: dict[str, Any]) -> list[dict[str, Any]]:
@@ -649,40 +920,55 @@ def apply_exam_audit(
     chunks_failed: int,
     warnings: list[str] | None = None,
     visuals_detected: int | None = None,
+    timing: dict[str, Any] | None = None,
+    repair_generation: dict[str, Any] | None = None,
+    pages_covered_by_chunks: list[int] | None = None,
 ) -> dict[str, Any]:
     inferred_pages = source_pages_from_text(source_text)
     total_pages = int(pages_total or 0)
     if total_pages <= 0 and inferred_pages:
         total_pages = max(inferred_pages)
 
-    pages_used = sorted(
+    derived_chunk_pages = sorted(
         {
             int(page)
             for question in exam_questions(exam)
-            for page in ensure_list((question.get("_meta") or {}).get("source_pages") if isinstance(question.get("_meta"), dict) else [])
+            for page in ensure_list((question.get("_meta") or {}).get("chunk_page_range") if isinstance(question.get("_meta"), dict) else [])
+            if isinstance(page, int) or (isinstance(page, str) and page.isdigit())
+        }
+    )
+    pages_covered = sorted(set(pages_covered_by_chunks or derived_chunk_pages))
+    pages_with_evidence = sorted(
+        {
+            int(page)
+            for question in exam_questions(exam)
+            for page in ensure_list((question.get("_meta") or {}).get("evidence_pages") if isinstance(question.get("_meta"), dict) else [])
             if isinstance(page, int) or (isinstance(page, str) and page.isdigit())
         }
     )
     if total_pages > 0:
-        pages_used = [page for page in pages_used if 1 <= page <= total_pages]
-        pages_without_questions = [page for page in range(1, total_pages + 1) if page not in set(pages_used)]
-        coverage_ratio = round(len(pages_used) / total_pages, 4)
+        pages_covered = [page for page in pages_covered if 1 <= page <= total_pages]
+        pages_with_evidence = [page for page in pages_with_evidence if 1 <= page <= total_pages]
+        pages_without_questions = [page for page in range(1, total_pages + 1) if page not in set(pages_with_evidence)]
+        coverage_ratio_chunks = round(len(pages_covered) / total_pages, 4)
+        coverage_ratio_evidence = round(len(pages_with_evidence) / total_pages, 4)
     else:
         pages_without_questions = []
-        coverage_ratio = 0.0
+        coverage_ratio_chunks = 0.0
+        coverage_ratio_evidence = 0.0
 
     detected = detected_visual_count(source_text) if visuals_detected is None else max(0, int(visuals_detected))
     visual_questions = sum(
         1
         for question in exam_questions(exam)
         if isinstance(question.get("_meta"), dict)
-        and question["_meta"].get("source_type") in {"diagram", "table", "mixed"}
+        and question["_meta"].get("visual_required")
     )
     visuals_used = min(detected, visual_questions) if detected else 0
 
     audit_warnings = [warning for warning in (warnings or []) if warning]
     if pages_without_questions:
-        audit_warnings.append(f"Pages without generated questions: {format_number_list(pages_without_questions)}")
+        audit_warnings.append(f"Pages without exact question evidence: {format_number_list(pages_without_questions)}")
     if chunks_failed:
         audit_warnings.append(f"{chunks_failed} chunk(s) failed during generation.")
     if detected and visuals_used < detected:
@@ -692,9 +978,13 @@ def apply_exam_audit(
         "generator_version": GENERATOR_VERSION,
         "source_file": source_pdf,
         "pages_total": total_pages,
-        "pages_used": pages_used,
+        "pages_used": pages_with_evidence,
         "pages_without_questions": pages_without_questions,
-        "coverage_ratio": coverage_ratio,
+        "coverage_ratio": coverage_ratio_evidence,
+        "pages_covered_by_chunks": pages_covered,
+        "pages_with_evidence": pages_with_evidence,
+        "coverage_ratio_chunks": coverage_ratio_chunks,
+        "coverage_ratio_evidence": coverage_ratio_evidence,
         "visuals_detected": detected,
         "visuals_used": visuals_used,
         "chunks_total": max(0, int(chunks_total)),
@@ -702,6 +992,15 @@ def apply_exam_audit(
         "chunks_failed": max(0, int(chunks_failed)),
         "question_distribution": question_distribution(exam),
         "topic_distribution": topic_distribution(exam),
+        "repair_generation": repair_generation
+        or {
+            "attempted": False,
+            "missing_multiple_choice": 0,
+            "missing_open_ended": 0,
+            "successful": False,
+            "attempts": 0,
+        },
+        "timing": timing or new_timing(),
         "warnings": audit_warnings,
     }
     return exam
@@ -720,13 +1019,14 @@ def format_audit_summary(audit: dict[str, Any]) -> str:
         f"Source file: {audit.get('source_file') or 'unknown'}",
         "",
         f"Pages total: {audit.get('pages_total', 0)}",
-        f"Pages used: {len(ensure_list(audit.get('pages_used')))}",
+        f"Pages covered by chunks: {len(ensure_list(audit.get('pages_covered_by_chunks')))}",
+        f"Pages with exact evidence: {len(ensure_list(audit.get('pages_with_evidence')))}",
         "",
-        "Pages without questions:",
+        "Pages without exact evidence:",
         format_number_list([int(page) for page in ensure_list(audit.get("pages_without_questions")) if isinstance(page, int)]),
         "",
-        "Coverage ratio:",
-        f"{float(audit.get('coverage_ratio') or 0.0):.2f}",
+        "Coverage ratios:",
+        f"chunks={float(audit.get('coverage_ratio_chunks') or 0.0):.2f} evidence={float(audit.get('coverage_ratio_evidence') or 0.0):.2f}",
         "",
         "Chunks:",
         f"{audit.get('chunks_processed', 0)} / {audit.get('chunks_total', 0)} processed",
@@ -859,6 +1159,7 @@ def call_json_with_retries(
     progress: Callable[[str], None] | None = None,
     debug: DebugLogger | None = None,
     audit_warnings: list[str] | None = None,
+    timing: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     last_error: Exception | None = None
     for attempt in range(max(0, args.retries) + 1):
@@ -878,8 +1179,18 @@ def call_json_with_retries(
                     f"Ollama request: {context} attempt {attempt + 1}",
                     f"endpoint={args.endpoint}\nmodel={args.model}\ntimeout={args.timeout}\n\nPROMPT:\n{retry_prompt}",
                 )
+            model_started = time.perf_counter()
+            if timing is not None:
+                timing["model_calls"] = int(timing.get("model_calls") or 0) + 1
             raw = post_ollama(args.endpoint, args.model, retry_prompt, args.timeout)
+            model_elapsed = time.perf_counter() - model_started
+            if timing is not None:
+                timing["model_seconds"] = round(float(timing.get("model_seconds") or 0.0) + model_elapsed, 4)
             if debug:
+                debug(
+                    f"Ollama call finished: {context} attempt {attempt + 1}",
+                    f"duration_seconds={model_elapsed:.4f}",
+                )
                 debug(f"Ollama raw response: {context} attempt {attempt + 1}", raw)
             return load_json_from_model(raw, debug=debug, context=f"{context} attempt {attempt + 1}", audit_warnings=audit_warnings)
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError, OSError) as exc:
@@ -971,24 +1282,25 @@ def normalize_open_items(raw_questions: Any, existing: set[str]) -> list[dict[st
         if signature in existing:
             continue
         rubric = raw.get("grading_rubric")
-        if not isinstance(rubric, dict):
-            rubric = {
-                "90-100": "Präzise, vollständige Antwort.",
-                "76-89": "Gute Antwort mit kleineren Lücken.",
-                "61-75": "Solide Antwort mit merklichen Lücken.",
-                "41-60": "Grundsätzlich thematisch, aber unvollständig.",
-                "21-40": "Teilweise relevant mit großen Lücken.",
-                "0-20": "Falsch, leer oder sehr allgemein.",
-            }
+        rubric_template = str(raw.get("rubric_template") or DEFAULT_RUBRIC_TEMPLATE).strip()
+        if rubric_template not in RUBRIC_TEMPLATES:
+            rubric_template = DEFAULT_RUBRIC_TEMPLATE
+        normalized = {
+            "id": "",
+            "topic": str(raw.get("topic") or "").strip(),
+            "question_type": "open_ended",
+            "question": question_text,
+            "expected_answer": expected,
+            "key_concepts": [str(item) for item in ensure_list(raw.get("key_concepts")) if str(item).strip()],
+            "rubric_template": rubric_template,
+            "max_score": 100,
+        }
+        if isinstance(rubric, dict):
+            normalized["grading_rubric"] = rubric
+        if isinstance(raw.get("_meta"), dict):
+            normalized["_meta"] = raw["_meta"]
         questions.append(
-            {
-                "id": "",
-                "question": question_text,
-                "expected_answer": expected,
-                "key_concepts": [str(item) for item in ensure_list(raw.get("key_concepts")) if str(item).strip()],
-                "grading_rubric": rubric,
-                "max_score": 100,
-            }
+            normalized
         )
         existing.add(signature)
     return questions
@@ -1033,22 +1345,21 @@ def normalize_exam(
         if not isinstance(question, dict):
             continue
         rubric = question.get("grading_rubric")
-        if not isinstance(rubric, dict):
-            rubric = {
-                "90-100": "Precise, complete answer covering all key concepts.",
-                "61-89": "Mostly correct answer with minor to noticeable gaps.",
-                "41-60": "On topic but incomplete or imprecise.",
-                "21-40": "Partially relevant with major conceptual gaps.",
-                "0-20": "Mostly wrong, vague, or empty.",
-            }
+        rubric_template = str(question.get("rubric_template") or DEFAULT_RUBRIC_TEMPLATE).strip()
+        if rubric_template not in RUBRIC_TEMPLATES:
+            rubric_template = DEFAULT_RUBRIC_TEMPLATE
         normalized_open = {
             "id": str(question.get("id") or f"open-{index:03d}"),
+            "topic": str(question.get("topic") or ""),
+            "question_type": "open_ended",
             "question": str(question.get("question") or "").strip(),
             "expected_answer": str(question.get("expected_answer") or "").strip(),
             "key_concepts": [str(item) for item in ensure_list(question.get("key_concepts")) if str(item).strip()],
-            "grading_rubric": rubric,
+            "rubric_template": rubric_template,
             "max_score": 100,
         }
+        if isinstance(rubric, dict):
+            normalized_open["grading_rubric"] = rubric
         if isinstance(question.get("_meta"), dict):
             normalized_open["_meta"] = question["_meta"]
         open_questions.append(normalized_open)
@@ -1078,6 +1389,7 @@ def normalize_exam(
                 "open_ended": len(open_questions),
             },
         },
+        "rubric_templates": dict(RUBRIC_TEMPLATES),
         "multiple_choice": mc_questions,
         "open_ended": open_questions,
     }
@@ -1103,51 +1415,26 @@ def apply_coverage_metadata(
     return exam
 
 
-def build_chunk_coverage_prompt(course: str, source_pdf: str, chunk: str, chunk_index: int, chunk_count: int) -> str:
-    return f"""Create compact coverage notes for one source chunk from a university lecture PDF.
-
-Course: {course}
-Source PDF: {source_pdf}
-Chunk: {chunk_index} of {chunk_count}
-
-Write notes in German, preserving established technical terms, study names, formulas, and author names where useful.
-Focus on exam-relevant definitions, theories, models, findings, distinctions, examples, applications, and conceptual traps.
-Treat [TABLE ...] blocks as structured source evidence. Do not invent details from charts or graphics that are not present in the extracted text or table blocks.
-
-Return JSON only:
-{{
-  "coverage_notes": [
-    {{
-      "topic": "string",
-      "exam_targets": ["string"],
-      "common_traps": ["string"],
-      "source_area": "string"
-    }}
-  ]
-}}
-
-SOURCE CHUNK:
-<<<SOURCE
-{chunk}
-SOURCE>>>"""
-
-
-def build_chunk_questions_prompt(
+def build_merged_chunk_prompt(
     course: str,
     source_pdf: str,
     chunk: str,
-    coverage_notes: dict[str, Any],
     target_mc: int,
     target_open: int,
-    existing_stems: list[str],
     chunk_index: int,
     chunk_count: int,
 ) -> str:
-    return f"""Generate exam questions from this source chunk.
+    rubric_templates = json.dumps(RUBRIC_TEMPLATES, ensure_ascii=False, indent=2)
+    return f"""Generate coverage notes and exam questions from this source chunk in one JSON object.
 
 Course: {course}
 Source PDF: {source_pdf}
 Chunk: {chunk_index} of {chunk_count}
+
+Internal analysis:
+- First analyze the chunk internally for exam-relevant concepts, formulas, traps, diagrams, tables, examples, and likely exam targets.
+- Do not output your analysis process.
+- Return only the final JSON object.
 
 Question counts:
 - Generate exactly {target_mc} multiple-choice questions.
@@ -1161,6 +1448,10 @@ Language requirements:
 Source handling:
 - Treat [TABLE ...] blocks as structured source evidence; preserve row/column relationships when creating questions.
 - If a chart, curve, or graphic is only visible visually and not described in the extracted text or table blocks, do not invent its details.
+- coverage_notes must summarize the exam-relevant coverage behind the generated questions.
+- If you generate any question, coverage_notes must contain at least one note.
+- evidence_pages in per-question _meta should include only pages that directly support the question. If exact evidence pages are unknown, use an empty array.
+- chunk_page_range is broad provenance, not exact evidence.
 
 Multiple-choice requirements:
 - True multiple-choice, not single-choice.
@@ -1169,14 +1460,30 @@ Multiple-choice requirements:
 - Distractors must be plausible and source-adjacent.
 
 Open-ended requirements:
-- Each open question has expected_answer, key_concepts, grading_rubric, and max_score 100.
+- Each open question has topic, question_type "open_ended", expected_answer, key_concepts, rubric_template, and max_score 100.
+- Use exactly one rubric_template key from this object:
+{rubric_templates}
+- Do not generate full score-band grading_rubric objects for open-ended questions.
 - Make questions precise, difficult, and gradeable.
 
-Avoid duplicating these already generated stems:
-{json.dumps(existing_stems[-80:], ensure_ascii=False, indent=2)}
+Strict JSON output:
+- Return only valid JSON.
+- Do not use markdown.
+- Do not include commentary outside JSON.
+- The first character must be {{.
+- The final character must be }}.
+- Do not wrap JSON in code fences.
 
-Return JSON only:
+Return exactly this JSON shape:
 {{
+  "coverage_notes": [
+    {{
+      "topic": "string",
+      "exam_targets": ["string"],
+      "common_traps": ["string"],
+      "source_area": "string"
+    }}
+  ],
   "multiple_choice": [
     {{
       "topic": "string",
@@ -1187,36 +1494,432 @@ Return JSON only:
         {{"text": "string", "is_correct": false}},
         {{"text": "string", "is_correct": true}}
       ],
-      "explanation": "string"
+      "explanation": "string",
+      "_meta": {{
+        "evidence_pages": [],
+        "source_excerpt": null,
+        "source_type": "text",
+        "visual_required": false
+      }}
     }}
   ],
   "open_ended": [
     {{
+      "topic": "string",
+      "question_type": "open_ended",
       "question": "string",
       "expected_answer": "string",
       "key_concepts": ["string"],
-      "grading_rubric": {{
-        "90-100": "string",
-        "76-89": "string",
-        "61-75": "string",
-        "41-60": "string",
-        "21-40": "string",
-        "0-20": "string"
-      }},
-      "max_score": 100
+      "rubric_template": "standard_concept_explanation",
+      "max_score": 100,
+      "_meta": {{
+        "evidence_pages": [],
+        "source_excerpt": null,
+        "source_type": "text",
+        "visual_required": false
+      }}
     }}
-  ]
+  ],
+  "audit_hints": {{
+    "source_pages_used": [],
+    "visuals_used": [],
+    "topics": []
+  }}
 }}
-
-COVERAGE NOTES:
-<<<COVERAGE
-{json.dumps(coverage_notes, ensure_ascii=False, indent=2)[:18000]}
-COVERAGE>>>
 
 SOURCE CHUNK:
 <<<SOURCE
 {chunk}
 SOURCE>>>"""
+
+
+def build_refill_prompt(
+    course: str,
+    source_pdf: str,
+    source_text: str,
+    coverage_notes: list[dict[str, Any]],
+    missing_mc: int,
+    missing_open: int,
+    existing_stems: list[str],
+    underrepresented_topics: list[str],
+) -> str:
+    rubric_templates = json.dumps(RUBRIC_TEMPLATES, ensure_ascii=False, indent=2)
+    return f"""Generate only the missing exam questions needed to refill an exam.
+
+Course: {course}
+Source PDF: {source_pdf}
+
+Missing counts:
+- Generate exactly {missing_mc} multiple-choice questions.
+- Generate exactly {missing_open} open-ended questions.
+- If a count is 0, return an empty array for that section.
+
+Prefer these underrepresented topics when the source supports them:
+{json.dumps(underrepresented_topics[:20], ensure_ascii=False, indent=2)}
+
+Avoid duplicating these already generated stems:
+{json.dumps(existing_stems[-120:], ensure_ascii=False, indent=2)}
+
+Use the coverage notes as planning context, but rely only on the source text for facts:
+{json.dumps(coverage_notes[:80], ensure_ascii=False, indent=2)[:18000]}
+
+Open-ended questions must use one rubric_template key from:
+{rubric_templates}
+
+Strict JSON output:
+- Return only valid JSON.
+- Do not use markdown.
+- Do not include commentary outside JSON.
+- The first character must be {{.
+- The final character must be }}.
+- Do not wrap JSON in code fences.
+
+Return exactly this JSON shape:
+{{
+  "multiple_choice": [],
+  "open_ended": [],
+  "audit_hints": {{
+    "source_pages_used": [],
+    "visuals_used": [],
+    "topics": []
+  }}
+}}
+
+SOURCE TEXT:
+<<<SOURCE
+{source_text[:MAX_PROMPT_TEXT_CHARS]}
+SOURCE>>>"""
+
+
+def validate_merged_chunk_response(data: dict[str, Any], chunk_id: str) -> None:
+    if not isinstance(data, dict):
+        raise ValueError(f"{chunk_id} did not return a JSON object.")
+    for key in ["coverage_notes", "multiple_choice", "open_ended", "audit_hints"]:
+        if key not in data:
+            raise ValueError(f"{chunk_id} response is missing {key}.")
+    if not isinstance(data.get("coverage_notes"), list):
+        raise ValueError(f"{chunk_id} coverage_notes must be an array.")
+    if not isinstance(data.get("multiple_choice"), list):
+        raise ValueError(f"{chunk_id} multiple_choice must be an array.")
+    if not isinstance(data.get("open_ended"), list):
+        raise ValueError(f"{chunk_id} open_ended must be an array.")
+    if not isinstance(data.get("audit_hints"), dict):
+        raise ValueError(f"{chunk_id} audit_hints must be an object.")
+
+
+def normalized_coverage_notes(data: dict[str, Any]) -> list[dict[str, Any]]:
+    notes = []
+    for raw in ensure_list(data.get("coverage_notes")):
+        if not isinstance(raw, dict):
+            continue
+        topic = str(raw.get("topic") or "").strip()
+        if not topic:
+            continue
+        notes.append(
+            {
+                "topic": topic,
+                "exam_targets": [str(item) for item in ensure_list(raw.get("exam_targets")) if str(item).strip()],
+                "common_traps": [str(item) for item in ensure_list(raw.get("common_traps")) if str(item).strip()],
+                "source_area": str(raw.get("source_area") or "").strip(),
+            }
+        )
+    return notes
+
+
+def merge_model_timing(timing: dict[str, Any], partial: dict[str, Any] | None) -> None:
+    if not partial:
+        return
+    timing["model_calls"] = int(timing.get("model_calls") or 0) + int(partial.get("model_calls") or 0)
+    timing["model_seconds"] = round(float(timing.get("model_seconds") or 0.0) + float(partial.get("model_seconds") or 0.0), 4)
+
+
+class ChunkGenerationError(RuntimeError):
+    def __init__(self, message: str, timing: dict[str, Any], warnings: list[str]) -> None:
+        super().__init__(message)
+        self.timing = timing
+        self.warnings = warnings
+
+
+def generate_chunk_data(
+    course: str,
+    source_pdf: str,
+    chunk: str,
+    target_mc: int,
+    target_open: int,
+    index: int,
+    chunk_count: int,
+    args: argparse.Namespace,
+    progress: Callable[[str], None] | None = None,
+    debug: DebugLogger | None = None,
+    fallback: bool = False,
+) -> dict[str, Any]:
+    chunk_id = f"chunk-{index:03d}"
+    local_warnings: list[str] = []
+    local_timing = new_timing()
+    label = "sequential fallback" if fallback else "merged"
+    if progress:
+        progress(f"Processing chunk {index}/{chunk_count}" + (" fallback" if fallback else ""))
+    if debug:
+        debug(
+            f"Chunk generation start: {chunk_id}",
+            f"mode={label}\nmc_target={target_mc}\nopen_target={target_open}",
+        )
+    try:
+        data = call_json_with_retries(
+            args,
+            build_merged_chunk_prompt(course, source_pdf, chunk, target_mc, target_open, index, chunk_count),
+            f"{source_pdf} {label} chunk {index}",
+            progress,
+            debug,
+            local_warnings,
+            local_timing,
+        )
+        validate_merged_chunk_response(data, chunk_id)
+    except Exception as exc:
+        raise ChunkGenerationError(f"{type(exc).__name__}: {exc}", local_timing, local_warnings) from exc
+    if debug:
+        debug(
+            f"Chunk generation end: {chunk_id}",
+            json.dumps(
+                {
+                    "coverage_notes": len(ensure_list(data.get("coverage_notes"))),
+                    "multiple_choice": len(ensure_list(data.get("multiple_choice"))),
+                    "open_ended": len(ensure_list(data.get("open_ended"))),
+                    "warnings": local_warnings,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+    return {
+        "index": index,
+        "chunk_id": chunk_id,
+        "chunk": chunk,
+        "data": data,
+        "warnings": local_warnings,
+        "timing": local_timing,
+    }
+
+
+def chunk_results_parallel(
+    course: str,
+    source_pdf: str,
+    chunks: list[str],
+    mc_targets: list[int],
+    open_targets: list[int],
+    args: argparse.Namespace,
+    max_parallel_chunks: int,
+    progress: Callable[[str], None] | None,
+    debug: DebugLogger | None,
+    timing: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    warnings: list[str] = []
+    results: list[dict[str, Any]] = []
+    failures: list[tuple[int, str, Exception]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_parallel_chunks) as executor:
+        futures = {
+            executor.submit(
+                generate_chunk_data,
+                course,
+                source_pdf,
+                chunk,
+                mc_targets[index - 1],
+                open_targets[index - 1],
+                index,
+                len(chunks),
+                args,
+                progress,
+                debug,
+            ): (index, chunk)
+            for index, chunk in enumerate(chunks, start=1)
+        }
+        for future in concurrent.futures.as_completed(futures):
+            index, chunk = futures[future]
+            chunk_id = f"chunk-{index:03d}"
+            try:
+                results.append(future.result())
+            except Exception as exc:
+                if isinstance(exc, ChunkGenerationError):
+                    merge_model_timing(timing, exc.timing)
+                    warnings.extend(str(warning) for warning in exc.warnings if str(warning).strip())
+                message = f"{chunk_id} parallel generation failed: {type(exc).__name__}: {exc}"
+                warnings.append(message)
+                if progress:
+                    progress(message)
+                if debug:
+                    debug(f"Parallel chunk failed: {chunk_id}", f"{type(exc).__name__}: {exc}")
+                failures.append((index, chunk, exc))
+
+    for index, chunk, original_error in failures:
+        chunk_id = f"chunk-{index:03d}"
+        if progress:
+            progress(f"Retrying {chunk_id} sequentially after parallel failure")
+        if debug:
+            debug(
+                f"Sequential fallback start: {chunk_id}",
+                f"Original parallel failure: {type(original_error).__name__}: {original_error}",
+            )
+        try:
+            results.append(
+                generate_chunk_data(
+                    course,
+                    source_pdf,
+                    chunk,
+                    mc_targets[index - 1],
+                    open_targets[index - 1],
+                    index,
+                    len(chunks),
+                    args,
+                    progress,
+                    debug,
+                    fallback=True,
+                )
+            )
+        except Exception as exc:
+            if isinstance(exc, ChunkGenerationError):
+                merge_model_timing(timing, exc.timing)
+                warnings.extend(str(warning) for warning in exc.warnings if str(warning).strip())
+            message = f"{chunk_id} failed after sequential fallback: {type(exc).__name__}: {exc}"
+            warnings.append(message)
+            if progress:
+                progress(message)
+            if debug:
+                debug(f"Sequential fallback failed: {chunk_id}", f"{type(exc).__name__}: {exc}")
+
+    return sorted(results, key=lambda item: int(item["index"])), warnings
+
+
+def chunk_results_sequential(
+    course: str,
+    source_pdf: str,
+    chunks: list[str],
+    mc_targets: list[int],
+    open_targets: list[int],
+    args: argparse.Namespace,
+    progress: Callable[[str], None] | None,
+    debug: DebugLogger | None,
+    timing: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    results: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    for index, chunk in enumerate(chunks, start=1):
+        chunk_id = f"chunk-{index:03d}"
+        try:
+            results.append(
+                generate_chunk_data(
+                    course,
+                    source_pdf,
+                    chunk,
+                    mc_targets[index - 1],
+                    open_targets[index - 1],
+                    index,
+                    len(chunks),
+                    args,
+                    progress,
+                    debug,
+                )
+            )
+        except Exception as exc:
+            if isinstance(exc, ChunkGenerationError):
+                merge_model_timing(timing, exc.timing)
+                warnings.extend(str(warning) for warning in exc.warnings if str(warning).strip())
+            message = f"{chunk_id} failed: {type(exc).__name__}: {exc}"
+            warnings.append(message)
+            if progress:
+                progress(f"Chunk {index}/{len(chunks)} failed: {exc}")
+            if debug:
+                debug(f"Chunk failed: {chunk_id}", f"{type(exc).__name__}: {exc}")
+    return results, warnings
+
+
+def assign_question_ids(mc_questions: list[dict[str, Any]], open_questions: list[dict[str, Any]]) -> None:
+    for index, question in enumerate(mc_questions, start=1):
+        question["id"] = f"mc-{index:03d}"
+    for index, question in enumerate(open_questions, start=1):
+        question["id"] = f"open-{index:03d}"
+
+
+def underrepresented_topics(coverage_notes: list[dict[str, Any]], exam: dict[str, Any]) -> list[str]:
+    existing = topic_distribution(exam)
+    topics = [str(note.get("topic") or "").strip() for note in coverage_notes if str(note.get("topic") or "").strip()]
+    return sorted(set(topics), key=lambda topic: (existing.get(topic, 0), topic))[:20]
+
+
+def refill_missing_questions(
+    course: str,
+    source_pdf: str,
+    text: str,
+    coverage_notes: list[dict[str, Any]],
+    mc_questions: list[dict[str, Any]],
+    open_questions: list[dict[str, Any]],
+    target_mc: int,
+    target_open: int,
+    args: argparse.Namespace,
+    progress: Callable[[str], None] | None,
+    debug: DebugLogger | None,
+    audit_warnings: list[str],
+    timing: dict[str, Any],
+) -> dict[str, Any]:
+    missing_mc = max(0, target_mc - len(mc_questions))
+    missing_open = max(0, target_open - len(open_questions))
+    repair = {
+        "attempted": bool(missing_mc or missing_open),
+        "missing_multiple_choice": missing_mc,
+        "missing_open_ended": missing_open,
+        "successful": False,
+        "attempts": 0,
+    }
+    if not missing_mc and not missing_open:
+        return repair
+
+    repair_started = time.perf_counter()
+    repair["attempts"] = 1
+    if progress:
+        progress(f"Refilling missing questions: {missing_mc} MC / {missing_open} open")
+    try:
+        seed_exam = {"multiple_choice": mc_questions, "open_ended": open_questions}
+        data = call_json_with_retries(
+            args,
+            build_refill_prompt(
+                course,
+                source_pdf,
+                text,
+                coverage_notes,
+                missing_mc,
+                missing_open,
+                [question["question"] for question in mc_questions + open_questions],
+                underrepresented_topics(coverage_notes, seed_exam),
+            ),
+            f"{source_pdf} refill",
+            progress,
+            debug,
+            audit_warnings,
+            timing,
+        )
+        validation_started = time.perf_counter()
+        new_mc = normalize_mc_items(first_list(data, ["multiple_choice", "multiple_choice_questions", "mc_questions", "mcq", "mc"]), {question_signature(q["question"]) for q in mc_questions})
+        new_open = normalize_open_items(first_list(data, ["open_ended", "open_ended_questions", "open_questions", "short_answer", "essay_questions"]), {question_signature(q["question"]) for q in open_questions})
+        attach_question_metadata(new_mc, text, "repair-001")
+        attach_question_metadata(new_open, text, "repair-001")
+        mc_questions.extend(new_mc[:missing_mc])
+        open_questions.extend(new_open[:missing_open])
+        add_seconds(timing, "validation_seconds", validation_started)
+        repair["successful"] = len(mc_questions) >= target_mc and len(open_questions) >= target_open
+        audit_warnings.append(
+            f"Repair generation produced {len(new_mc[:missing_mc])} MC and {len(new_open[:missing_open])} open question(s)."
+        )
+    except Exception as exc:
+        audit_warnings.append(f"Repair generation failed: {type(exc).__name__}: {exc}")
+        if debug:
+            debug("Repair generation failed", f"{type(exc).__name__}: {exc}")
+    finally:
+        add_seconds(timing, "repair_seconds", repair_started)
+
+    if not repair["successful"]:
+        audit_warnings.append(
+            f"Repair generation did not fully reach targets; keeping {len(mc_questions)} MC and {len(open_questions)} open question(s)."
+        )
+    return repair
 
 
 def generate_full_coverage_exam(
@@ -1229,75 +1932,105 @@ def generate_full_coverage_exam(
     progress: Callable[[str], None] | None = None,
     debug: DebugLogger | None = None,
     pages_total: int | None = None,
+    timing: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    timing = timing if timing is not None else new_timing()
+    chunking_started = time.perf_counter()
     chunks = chunk_text(text)
+    add_seconds(timing, "chunking_seconds", chunking_started)
     target_mc, target_open = target_counts(word_count, args)
     mc_targets = distribute_counts(target_mc, len(chunks))
     open_targets = distribute_counts(target_open, len(chunks))
+    max_parallel_chunks = min(normalize_max_parallel_chunks(args), max(1, len(chunks)))
+    timing["parallelism_used"] = max_parallel_chunks
     mc_questions: list[dict[str, Any]] = []
     open_questions: list[dict[str, Any]] = []
+    coverage_notes: list[dict[str, Any]] = []
+    pages_covered_by_chunks: set[int] = set()
     seen_mc: set[str] = set()
     seen_open: set[str] = set()
-    failed_chunks = 0
-    processed_chunks = 0
     audit_warnings: list[str] = []
     if extraction_warning:
         audit_warnings.append(f"Extraction warning: {extraction_warning}")
 
-    for index, chunk in enumerate(chunks, start=1):
-        chunk_id = f"chunk-{index:03d}"
+    if max_parallel_chunks > 1:
+        results, execution_warnings = chunk_results_parallel(
+            course,
+            source_pdf,
+            chunks,
+            mc_targets,
+            open_targets,
+            args,
+            max_parallel_chunks,
+            progress,
+            debug,
+            timing,
+        )
+    else:
+        results, execution_warnings = chunk_results_sequential(
+            course,
+            source_pdf,
+            chunks,
+            mc_targets,
+            open_targets,
+            args,
+            progress,
+            debug,
+            timing,
+        )
+    audit_warnings.extend(execution_warnings)
+
+    validation_started = time.perf_counter()
+    for result in sorted(results, key=lambda item: int(item["index"])):
+        index = int(result["index"])
+        chunk_id = str(result["chunk_id"])
+        chunk = str(result["chunk"])
+        data = result["data"]
+        merge_model_timing(timing, result.get("timing"))
+        audit_warnings.extend(str(warning) for warning in ensure_list(result.get("warnings")) if str(warning).strip())
+        raw_mc = first_list(data, ["multiple_choice", "multiple_choice_questions", "mc_questions", "mcq", "mc"])
+        raw_open = first_list(data, ["open_ended", "open_ended_questions", "open_questions", "short_answer", "essay_questions"])
+        new_mc = normalize_mc_items(raw_mc, seen_mc)
+        new_open = normalize_open_items(raw_open, seen_open)
+        attach_question_metadata(new_mc, chunk, chunk_id)
+        attach_question_metadata(new_open, chunk, chunk_id)
+        notes = normalized_coverage_notes(data)
+        coverage_notes.extend(notes)
+        pages_covered_by_chunks.update(source_pages_from_text(chunk))
+        if (new_mc or new_open) and not notes:
+            message = f"{chunk_id} produced usable questions but no coverage_notes."
+            audit_warnings.append(message)
+            if debug:
+                debug(f"Coverage notes missing: {chunk_id}", message)
+        mc_questions.extend(new_mc)
+        open_questions.extend(new_open)
+        discarded = max(0, len(raw_mc) - len(new_mc)) + max(0, len(raw_open) - len(new_open))
+        if discarded:
+            audit_warnings.append(f"Discarded {discarded} duplicate or invalid generation(s) in {chunk_id}.")
+        if not new_mc and not new_open:
+            audit_warnings.append(f"{chunk_id} produced no usable questions.")
         if progress:
-            progress(f"Processing chunk {index}/{len(chunks)}")
-        try:
-            coverage = call_json_with_retries(
-                args,
-                build_chunk_coverage_prompt(course, source_pdf, chunk, index, len(chunks)),
-                f"{source_pdf} coverage chunk {index}",
-                progress,
-                debug,
-                audit_warnings,
-            )
-            if progress:
-                progress(f"Generating questions batch {index}/{len(chunks)}")
-            data = call_json_with_retries(
-                args,
-                build_chunk_questions_prompt(
-                    course,
-                    source_pdf,
-                    chunk,
-                    coverage,
-                    mc_targets[index - 1],
-                    open_targets[index - 1],
-                    [question["question"] for question in mc_questions + open_questions],
-                    index,
-                    len(chunks),
-                ),
-                f"{source_pdf} questions chunk {index}",
-                progress,
-                debug,
-                audit_warnings,
-            )
-            raw_mc = first_list(data, ["multiple_choice", "multiple_choice_questions", "mc_questions", "mcq", "mc"])
-            raw_open = first_list(data, ["open_ended", "open_ended_questions", "open_questions", "short_answer", "essay_questions"])
-            new_mc = normalize_mc_items(raw_mc, seen_mc)
-            new_open = normalize_open_items(raw_open, seen_open)
-            attach_question_metadata(new_mc, chunk, chunk_id)
-            attach_question_metadata(new_open, chunk, chunk_id)
-            mc_questions.extend(new_mc)
-            open_questions.extend(new_open)
-            processed_chunks += 1
-            discarded = max(0, len(raw_mc) - len(new_mc)) + max(0, len(raw_open) - len(new_open))
-            if discarded:
-                audit_warnings.append(f"Discarded {discarded} duplicate or invalid generation(s) in {chunk_id}.")
-            if not new_mc and not new_open:
-                audit_warnings.append(f"{chunk_id} produced no usable questions.")
-            if progress:
-                progress(f"Merged {len(mc_questions)} MC / {len(open_questions)} open")
-        except RuntimeError as exc:
-            failed_chunks += 1
-            audit_warnings.append(f"{chunk_id} failed: {exc}")
-            if progress:
-                progress(f"Chunk {index}/{len(chunks)} failed: {exc}")
+            progress(f"Merged {len(mc_questions)} MC / {len(open_questions)} open")
+    add_seconds(timing, "validation_seconds", validation_started)
+
+    processed_chunks = len(results)
+    failed_chunks = max(0, len(chunks) - processed_chunks)
+
+    repair_generation = refill_missing_questions(
+        course,
+        source_pdf,
+        text,
+        coverage_notes,
+        mc_questions,
+        open_questions,
+        target_mc,
+        target_open,
+        args,
+        progress,
+        debug,
+        audit_warnings,
+        timing,
+    )
 
     too_many_failed = failed_chunks > len(chunks) // 2
     if processed_chunks == 0 or too_many_failed or len(mc_questions) < args.min_mc or len(open_questions) < args.min_open:
@@ -1320,8 +2053,21 @@ def generate_full_coverage_exam(
         extraction_warning,
         word_count,
     )
+    exam["coverage_notes"] = coverage_notes
     exam = apply_coverage_metadata(exam, "full_coverage", len(chunks), processed_chunks, failed_chunks, " ".join(warnings) if warnings else None)
-    return apply_exam_audit(exam, source_pdf, text, pages_total, len(chunks), processed_chunks, failed_chunks, audit_warnings)
+    return apply_exam_audit(
+        exam,
+        source_pdf,
+        text,
+        pages_total,
+        len(chunks),
+        processed_chunks,
+        failed_chunks,
+        audit_warnings,
+        timing=timing,
+        repair_generation=repair_generation,
+        pages_covered_by_chunks=sorted(pages_covered_by_chunks),
+    )
 
 
 def heuristic_exam(
@@ -1399,6 +2145,8 @@ def write_exam_folder(
     progress: Callable[[str], None] | None = None,
     debug: DebugLogger | None = None,
 ) -> dict[str, Any] | None:
+    overall_started = time.perf_counter()
+    timing = new_timing()
     course_dir = pdf_path.parent
     course = course_dir.name
     exams_dir = course_dir / "exams"
@@ -1408,7 +2156,19 @@ def write_exam_folder(
         print(f"SKIP existing: {exam_dir}", flush=True)
         return None
 
-    text, extraction_warning, page_count = extract_pdf_text(pdf_path, debug=debug)
+    cache_payload, cache_key, cache_path = load_preprocessing_cache(root, pdf_path, args, debug=debug, progress=progress)
+    if cache_payload:
+        text = str(cache_payload.get("extracted_text") or "")
+        extraction_warning = cache_payload.get("extraction_warning")
+        if extraction_warning is not None:
+            extraction_warning = str(extraction_warning)
+        page_count_value = cache_payload.get("page_count")
+        page_count = int(page_count_value) if isinstance(page_count_value, int) else None
+    else:
+        extraction_started = time.perf_counter()
+        text, extraction_warning, page_count = extract_pdf_text(pdf_path, debug=debug)
+        add_seconds(timing, "extraction_seconds", extraction_started)
+        write_preprocessing_cache(cache_path, cache_key, text, extraction_warning, page_count, chunk_text(text), debug=debug)
     word_count = count_words(text)
     if progress:
         pages = page_count if page_count is not None else "unknown"
@@ -1426,7 +2186,7 @@ def write_exam_folder(
     if coverage_mode == "full_coverage":
         if progress:
             progress("Using full-coverage generation")
-        exam = generate_full_coverage_exam(course, pdf_path.name, text, extraction_warning, word_count, args, progress, debug, page_count)
+        exam = generate_full_coverage_exam(course, pdf_path.name, text, extraction_warning, word_count, args, progress, debug, page_count, timing)
     else:
         if progress:
             progress("Using representative generation")
@@ -1455,9 +2215,13 @@ def write_exam_folder(
                         f"Ollama request: {pdf_path.name} representative attempt {attempt + 1}",
                         f"endpoint={args.endpoint}\nmodel={args.model}\ntimeout={args.timeout}\n\nPROMPT:\n{prompt}",
                     )
+                model_started = time.perf_counter()
+                timing["model_calls"] = int(timing.get("model_calls") or 0) + 1
                 raw = post_ollama(args.endpoint, args.model, prompt, args.timeout)
+                timing["model_seconds"] = round(float(timing.get("model_seconds") or 0.0) + (time.perf_counter() - model_started), 4)
                 if debug:
                     debug(f"Ollama raw response: {pdf_path.name} representative attempt {attempt + 1}", raw)
+                validation_started = time.perf_counter()
                 model_exam = load_json_from_model(
                     raw,
                     debug=debug,
@@ -1468,7 +2232,8 @@ def write_exam_folder(
                 attach_question_metadata(exam["multiple_choice"], prompt_text, "representative-001")
                 attach_question_metadata(exam["open_ended"], prompt_text, "representative-001")
                 exam = apply_coverage_metadata(exam, "representative", 1, 1, 0, None)
-                exam = apply_exam_audit(exam, pdf_path.name, text, page_count, 1, 1, 0, audit_warnings)
+                add_seconds(timing, "validation_seconds", validation_started)
+                exam = apply_exam_audit(exam, pdf_path.name, text, page_count, 1, 1, 0, audit_warnings, timing=timing)
                 if progress:
                     progress(f"Ollama returned usable exam JSON for {pdf_path.name}")
                 break
@@ -1495,7 +2260,7 @@ def write_exam_folder(
         attach_question_metadata(exam["open_ended"], text, "heuristic-001")
         audit_warnings.append("Heuristic fallback exam generated after model output could not be used.")
         exam = apply_coverage_metadata(exam, "heuristic", 1, 1, 0, None)
-        exam = apply_exam_audit(exam, pdf_path.name, text, page_count, 1, 1, 0, audit_warnings)
+        exam = apply_exam_audit(exam, pdf_path.name, text, page_count, 1, 1, 0, audit_warnings, timing=timing)
 
     if "audit" not in exam:
         metadata = exam.get("metadata", {})
@@ -1508,16 +2273,26 @@ def write_exam_folder(
             int(metadata.get("processed_chunk_count") or 1),
             int(metadata.get("failed_chunk_count") or 0),
             audit_warnings,
+            timing=timing,
         )
-    if debug:
-        debug(f"AUDIT SUMMARY: {pdf_path.name}", format_audit_summary(exam["audit"]))
 
     if exam_dir.exists() and args.overwrite:
         shutil.rmtree(exam_dir)
     exam_dir.mkdir(parents=True, exist_ok=True)
+    write_started = time.perf_counter()
+    timing["total_seconds"] = round(time.perf_counter() - overall_started, 4)
     (exam_dir / "index.html").write_text(render_exam_html(template_dir, exam), encoding="utf-8")
     (exam_dir / "exam.json").write_text(json.dumps(exam, ensure_ascii=False, indent=2), encoding="utf-8")
     (exam_dir / "source.txt").write_text(text, encoding="utf-8")
+    add_seconds(timing, "write_seconds", write_started)
+    timing["total_seconds"] = round(time.perf_counter() - overall_started, 4)
+    if isinstance(exam.get("audit"), dict):
+        exam["audit"]["timing"] = timing
+    (exam_dir / "index.html").write_text(render_exam_html(template_dir, exam), encoding="utf-8")
+    (exam_dir / "exam.json").write_text(json.dumps(exam, ensure_ascii=False, indent=2), encoding="utf-8")
+    if debug:
+        debug(f"AUDIT SUMMARY: {pdf_path.name}", format_audit_summary(exam["audit"]))
+        debug(f"TIMING SUMMARY: {pdf_path.name}", format_timing_summary(timing))
     print(f"WROTE {exam_dir}", flush=True)
 
     return {

@@ -486,7 +486,7 @@ def generator_args(root: Path, overwrite: bool = False, example: bool = False, m
         root=str(root), overwrite=overwrite, only_folder=None, limit=None,
         min_mc=min_mc, max_mc=max_mc, min_open=min_open, max_open=max_open,
         endpoint="http://localhost:11434/api/chat", model=(model or DEFAULT_MODEL).strip() or DEFAULT_MODEL,
-        timeout=600, retries=3, allow_heuristic_fallback=True, coverage_mode=coverage_mode,
+        timeout=600, retries=3, allow_heuristic_fallback=True, coverage_mode=coverage_mode, max_parallel_chunks=2,
     )
 
 

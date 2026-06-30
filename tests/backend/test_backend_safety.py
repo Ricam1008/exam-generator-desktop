@@ -198,12 +198,14 @@ class BackendSafetyTests(unittest.TestCase):
         self.assertTrue(args.allow_heuristic_fallback)
         self.assertEqual(args.coverage_mode, "representative")
         self.assertEqual(args.model, "llama3.1:8b")
+        self.assertEqual(args.max_parallel_chunks, 2)
 
     def test_desktop_all_uses_auto_coverage(self) -> None:
         args = generator_args(Path("/tmp/example"), example=False, model="qwen2.5:14b")
 
         self.assertEqual(args.coverage_mode, "auto")
         self.assertEqual(args.model, "qwen2.5:14b")
+        self.assertEqual(args.max_parallel_chunks, 2)
 
     def test_final_args_uses_selected_model(self) -> None:
         args = final_args(Path("/tmp/example"), model="mistral-small:latest")
@@ -361,21 +363,26 @@ class BackendSafetyTests(unittest.TestCase):
         audit = exam["audit"]
         self.assertEqual(audit["generator_version"], generate_exams.GENERATOR_VERSION)
         self.assertEqual(audit["pages_total"], 3)
-        self.assertEqual(audit["pages_used"], [1, 3])
-        self.assertEqual(audit["pages_without_questions"], [2])
-        self.assertAlmostEqual(audit["coverage_ratio"], 2 / 3, places=3)
+        self.assertEqual(audit["pages_covered_by_chunks"], [1, 3])
+        self.assertEqual(audit["pages_with_evidence"], [])
+        self.assertEqual(audit["pages_used"], [])
+        self.assertEqual(audit["pages_without_questions"], [1, 2, 3])
+        self.assertAlmostEqual(audit["coverage_ratio_chunks"], 2 / 3, places=3)
+        self.assertAlmostEqual(audit["coverage_ratio_evidence"], 0.0, places=3)
         self.assertEqual(audit["chunks_total"], 2)
         self.assertEqual(audit["chunks_processed"], 2)
         self.assertEqual(audit["question_distribution"]["multiple_choice"], 1)
         self.assertEqual(audit["question_distribution"]["open_ended"], 1)
         self.assertIn("validation warning", audit["warnings"])
-        self.assertEqual(exam["multiple_choice"][0]["_meta"]["source_pages"], [1])
+        self.assertEqual(exam["multiple_choice"][0]["_meta"]["chunk_page_range"], [1])
+        self.assertEqual(exam["multiple_choice"][0]["_meta"]["evidence_pages"], [])
         self.assertEqual(exam["multiple_choice"][0]["_meta"]["chunk_id"], "chunk-001")
 
         summary = generate_exams.format_audit_summary(audit)
         self.assertIn("AUDIT SUMMARY", summary)
         self.assertIn("Pages total: 3", summary)
-        self.assertIn("Pages used: 2", summary)
+        self.assertIn("Pages covered by chunks: 2", summary)
+        self.assertIn("Pages with exact evidence: 0", summary)
         self.assertIn("validation warning", summary)
 
     def test_write_exam_folder_writes_audit_json_and_log_summary(self) -> None:
@@ -450,10 +457,91 @@ class BackendSafetyTests(unittest.TestCase):
             assert result is not None
             exam = json.loads((Path(result["exam_dir"]) / "exam.json").read_text(encoding="utf-8"))
             self.assertEqual(exam["audit"]["pages_total"], 2)
-            self.assertEqual(exam["audit"]["pages_used"], [1, 2])
+            self.assertEqual(exam["audit"]["pages_used"], [])
+            self.assertEqual(exam["audit"]["pages_covered_by_chunks"], [1, 2])
+            self.assertEqual(exam["audit"]["pages_with_evidence"], [])
             self.assertEqual(exam["audit"]["chunks_processed"], 1)
             self.assertEqual(exam["multiple_choice"][0]["_meta"]["chunk_id"], "representative-001")
             self.assertTrue(any(title == "AUDIT SUMMARY: source.pdf" and "AUDIT SUMMARY" in content for title, content in events))
+            self.assertTrue(any(title == "TIMING SUMMARY: source.pdf" and "TIMING SUMMARY" in content for title, content in events))
+
+    def test_preprocessing_cache_hits_and_excludes_coverage_notes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            course = root / "Course"
+            course.mkdir()
+            pdf = course / "source.pdf"
+            pdf.write_bytes(b"%PDF-1.4\ncache-test\n")
+            args = SimpleNamespace(
+                overwrite=True,
+                min_mc=1,
+                max_mc=1,
+                min_open=1,
+                max_open=1,
+                endpoint="http://example.invalid",
+                model="fake",
+                timeout=1,
+                retries=0,
+                coverage_mode="representative",
+                allow_heuristic_fallback=False,
+                max_parallel_chunks=1,
+            )
+            source_text = "--- Page 1 ---\n[PAGE 1 TEXT]\nNachfrage und Angebot."
+            events: list[tuple[str, str]] = []
+            calls = {"extract": 0}
+            original_extract_pdf_text = generate_exams.extract_pdf_text
+            original_post_ollama = generate_exams.post_ollama
+
+            def fake_extract_pdf_text(pdf_path: Path, debug=None):
+                calls["extract"] += 1
+                return source_text, None, 1
+
+            def fake_post_ollama(endpoint: str, model: str, prompt: str, timeout: int) -> str:
+                return """{
+                  "multiple_choice": [{
+                    "topic": "Nachfrage",
+                    "question": "Welche Aussage stimmt im Cache-Test?",
+                    "options": [
+                      {"text": "A", "is_correct": true},
+                      {"text": "B", "is_correct": false},
+                      {"text": "C", "is_correct": false},
+                      {"text": "D", "is_correct": true}
+                    ],
+                    "explanation": "A und D sind korrekt."
+                  }],
+                  "open_ended": [{
+                    "question": "Erkläre den Cache-Test.",
+                    "expected_answer": "Der Cache-Test wird erklärt.",
+                    "key_concepts": ["Cache"],
+                    "rubric_template": "standard_concept_explanation",
+                    "max_score": 100
+                  }]
+                }"""
+
+            try:
+                generate_exams.extract_pdf_text = fake_extract_pdf_text  # type: ignore[assignment]
+                generate_exams.post_ollama = fake_post_ollama
+                for _ in range(2):
+                    generate_exams.write_exam_folder(
+                        pdf,
+                        root,
+                        args,
+                        ROOT / "backend" / "exam_backend" / "templates",
+                        debug=lambda title, content: events.append((title, content)),
+                    )
+            finally:
+                generate_exams.extract_pdf_text = original_extract_pdf_text  # type: ignore[assignment]
+                generate_exams.post_ollama = original_post_ollama
+
+            self.assertEqual(calls["extract"], 1)
+            self.assertTrue(any(title == "Preprocessing cache miss" for title, _ in events))
+            self.assertTrue(any(title == "Preprocessing cache hit" for title, _ in events))
+            cache_files = list((root / ".exam-generator-cache").glob("*.json"))
+            self.assertEqual(len(cache_files), 1)
+            cache_text = cache_files[0].read_text(encoding="utf-8")
+            self.assertIn("extracted_text", cache_text)
+            self.assertIn("chunk_map", cache_text)
+            self.assertNotIn("coverage_notes", cache_text)
 
     def test_full_coverage_generation_processes_every_chunk(self) -> None:
         args = SimpleNamespace(
@@ -467,17 +555,17 @@ class BackendSafetyTests(unittest.TestCase):
             retries=0,
             coverage_mode="full_coverage",
             allow_heuristic_fallback=False,
+            max_parallel_chunks=1,
         )
         text = "--- Page 1 ---\n[PAGE 1 TEXT]\n" + "alpha " * 3000 + "\n\n--- Page 2 ---\n[PAGE 2 TEXT]\n" + "beta " * 3000
-        calls = {"questions": 0}
+        calls = {"merged": 0}
         original_post_ollama = generate_exams.post_ollama
 
         def fake_post_ollama(endpoint: str, model: str, prompt: str, timeout: int) -> str:
-            if "Create compact coverage notes" in prompt:
-                return '{"coverage_notes":[{"topic":"Thema","exam_targets":["Ziel"],"common_traps":["Falle"],"source_area":"Chunk"}]}'
-            calls["questions"] += 1
-            number = calls["questions"]
+            calls["merged"] += 1
+            number = calls["merged"]
             return f"""{{
+              "coverage_notes": [{{"topic":"Thema {number}","exam_targets":["Ziel"],"common_traps":["Falle"],"source_area":"Chunk {number}"}}],
               "multiple_choice": [{{
                 "topic": "Thema {number}",
                 "question": "Welche Aussagen stimmen zu Chunk {number}?",
@@ -493,9 +581,10 @@ class BackendSafetyTests(unittest.TestCase):
                 "question": "Erkläre Chunk {number}.",
                 "expected_answer": "Chunk {number} wird konzeptuell erklärt.",
                 "key_concepts": ["Konzept {number}"],
-                "grading_rubric": {{"90-100": "Vollständig."}},
+                "rubric_template": "standard_concept_explanation",
                 "max_score": 100
-              }}]
+              }}],
+              "audit_hints": {{"source_pages_used": [], "visuals_used": [], "topics": ["Thema {number}"]}}
             }}"""
 
         try:
@@ -520,8 +609,11 @@ class BackendSafetyTests(unittest.TestCase):
         self.assertIsNone(metadata["coverage_warning"])
         self.assertEqual(len(exam["multiple_choice"]), 2)
         self.assertEqual(len(exam["open_ended"]), 2)
+        self.assertEqual(calls["merged"], 2)
+        self.assertEqual(exam["coverage_notes"][0]["topic"], "Thema 1")
         self.assertEqual(exam["audit"]["pages_total"], 2)
-        self.assertEqual(exam["audit"]["pages_used"], [1, 2])
+        self.assertEqual(exam["audit"]["pages_used"], [])
+        self.assertEqual(exam["audit"]["pages_covered_by_chunks"], [1, 2])
         self.assertEqual(exam["audit"]["chunks_processed"], 2)
         self.assertEqual(exam["multiple_choice"][0]["_meta"]["chunk_id"], "chunk-001")
 
@@ -537,20 +629,19 @@ class BackendSafetyTests(unittest.TestCase):
             retries=0,
             coverage_mode="full_coverage",
             allow_heuristic_fallback=False,
+            max_parallel_chunks=1,
         )
         text = "alpha " * 3000 + "\n\n" + "beta " * 3000 + "\n\n" + "gamma " * 3000
-        calls = {"coverage": 0, "questions": 0}
+        calls = {"merged": 0}
         original_post_ollama = generate_exams.post_ollama
 
         def fake_post_ollama(endpoint: str, model: str, prompt: str, timeout: int) -> str:
-            if "Create compact coverage notes" in prompt:
-                calls["coverage"] += 1
-                if calls["coverage"] == 1:
-                    return "not json"
-                return '{"coverage_notes":[{"topic":"Thema","exam_targets":["Ziel"],"common_traps":["Falle"],"source_area":"Chunk"}]}'
-            calls["questions"] += 1
-            number = calls["questions"]
+            calls["merged"] += 1
+            if "Chunk: 1 of 3" in prompt:
+                return "not json"
+            number = calls["merged"]
             return f"""{{
+              "coverage_notes": [{{"topic":"Thema {number}","exam_targets":["Ziel"],"common_traps":["Falle"],"source_area":"Chunk"}}],
               "multiple_choice": [{{
                 "topic": "Thema {number}",
                 "question": "Welche Aussagen stimmen nach Ausfalltest {number}?",
@@ -566,9 +657,10 @@ class BackendSafetyTests(unittest.TestCase):
                 "question": "Erkläre Ausfalltest {number}.",
                 "expected_answer": "Der Chunk wird erklärt.",
                 "key_concepts": ["Konzept"],
-                "grading_rubric": {{"90-100": "Vollständig."}},
+                "rubric_template": "standard_concept_explanation",
                 "max_score": 100
-              }}]
+              }}],
+              "audit_hints": {{"source_pages_used": [], "visuals_used": [], "topics": ["Thema"]}}
             }}"""
 
         try:
@@ -591,6 +683,257 @@ class BackendSafetyTests(unittest.TestCase):
         self.assertIn("Full coverage processed 2/3 chunks", metadata["coverage_warning"])
         self.assertEqual(exam["audit"]["chunks_failed"], 1)
         self.assertTrue(any("chunk-001 failed" in warning for warning in exam["audit"]["warnings"]))
+
+    def test_parallel_chunk_failure_retries_sequentially(self) -> None:
+        args = SimpleNamespace(
+            min_mc=2,
+            max_mc=2,
+            min_open=2,
+            max_open=2,
+            endpoint="http://example.invalid",
+            model="fake",
+            timeout=1,
+            retries=0,
+            coverage_mode="full_coverage",
+            allow_heuristic_fallback=False,
+            max_parallel_chunks=2,
+        )
+        text = "--- Page 1 ---\n[PAGE 1 TEXT]\n" + "alpha " * 3000 + "\n\n--- Page 2 ---\n[PAGE 2 TEXT]\n" + "beta " * 3000
+        calls = {"chunk1": 0, "total": 0}
+        events: list[tuple[str, str]] = []
+        original_post_ollama = generate_exams.post_ollama
+
+        def fake_post_ollama(endpoint: str, model: str, prompt: str, timeout: int) -> str:
+            calls["total"] += 1
+            if "Chunk: 1 of 2" in prompt:
+                calls["chunk1"] += 1
+                if calls["chunk1"] == 1:
+                    return "not json"
+                number = 1
+            else:
+                number = 2
+            return f"""{{
+              "coverage_notes": [{{"topic":"Thema {number}","exam_targets":["Ziel"],"common_traps":["Falle"],"source_area":"Chunk {number}"}}],
+              "multiple_choice": [{{
+                "topic": "Thema {number}",
+                "question": "Welche Aussagen stimmen nach Fallback {number}?",
+                "options": [
+                  {{"text": "A {number}", "is_correct": true}},
+                  {{"text": "B {number}", "is_correct": false}},
+                  {{"text": "C {number}", "is_correct": false}},
+                  {{"text": "D {number}", "is_correct": true}}
+                ],
+                "explanation": "A und D sind richtig."
+              }}],
+              "open_ended": [{{
+                "topic": "Thema {number}",
+                "question_type": "open_ended",
+                "question": "Erkläre Fallback {number}.",
+                "expected_answer": "Fallback {number} wird erklärt.",
+                "key_concepts": ["Konzept {number}"],
+                "rubric_template": "standard_concept_explanation",
+                "max_score": 100
+              }}],
+              "audit_hints": {{"source_pages_used": [], "visuals_used": [], "topics": ["Thema {number}"]}}
+            }}"""
+
+        try:
+            generate_exams.post_ollama = fake_post_ollama
+            exam = generate_exams.generate_full_coverage_exam(
+                "Course",
+                "source.pdf",
+                text,
+                None,
+                generate_exams.count_words(text),
+                args,
+                debug=lambda title, content: events.append((title, content)),
+                pages_total=2,
+            )
+        finally:
+            generate_exams.post_ollama = original_post_ollama
+
+        self.assertEqual(exam["metadata"]["processed_chunk_count"], 2)
+        self.assertEqual(exam["metadata"]["failed_chunk_count"], 0)
+        self.assertEqual([q["question"] for q in exam["multiple_choice"]], ["Welche Aussagen stimmen nach Fallback 1?", "Welche Aussagen stimmen nach Fallback 2?"])
+        self.assertEqual(calls["total"], 3)
+        self.assertTrue(any("Parallel chunk failed: chunk-001" in title for title, _ in events))
+        self.assertTrue(any("Sequential fallback start: chunk-001" in title for title, _ in events))
+
+    def test_missing_coverage_notes_warns_but_keeps_questions(self) -> None:
+        args = SimpleNamespace(
+            min_mc=1,
+            max_mc=1,
+            min_open=1,
+            max_open=1,
+            endpoint="http://example.invalid",
+            model="fake",
+            timeout=1,
+            retries=0,
+            coverage_mode="full_coverage",
+            allow_heuristic_fallback=False,
+            max_parallel_chunks=1,
+        )
+        events: list[tuple[str, str]] = []
+        original_post_ollama = generate_exams.post_ollama
+
+        def fake_post_ollama(endpoint: str, model: str, prompt: str, timeout: int) -> str:
+            return """{
+              "coverage_notes": [],
+              "multiple_choice": [{
+                "topic": "Thema",
+                "question": "Welche Aussage stimmt trotz fehlender Coverage?",
+                "options": [
+                  {"text": "A", "is_correct": true},
+                  {"text": "B", "is_correct": false},
+                  {"text": "C", "is_correct": false},
+                  {"text": "D", "is_correct": true}
+                ],
+                "explanation": "A und D sind richtig."
+              }],
+              "open_ended": [{
+                "topic": "Thema",
+                "question_type": "open_ended",
+                "question": "Erkläre die fehlende Coverage.",
+                "expected_answer": "Die Frage bleibt nutzbar, aber die Warnung wird protokolliert.",
+                "key_concepts": ["Warnung"],
+                "rubric_template": "standard_concept_explanation",
+                "max_score": 100
+              }],
+              "audit_hints": {"source_pages_used": [], "visuals_used": [], "topics": ["Thema"]}
+            }"""
+
+        try:
+            generate_exams.post_ollama = fake_post_ollama
+            exam = generate_exams.generate_full_coverage_exam(
+                "Course",
+                "source.pdf",
+                "alpha " * 3000,
+                None,
+                3000,
+                args,
+                debug=lambda title, content: events.append((title, content)),
+            )
+        finally:
+            generate_exams.post_ollama = original_post_ollama
+
+        self.assertEqual(len(exam["multiple_choice"]), 1)
+        self.assertTrue(any("produced usable questions but no coverage_notes" in warning for warning in exam["audit"]["warnings"]))
+        self.assertTrue(any("Coverage notes missing: chunk-001" in title for title, _ in events))
+
+    def test_refill_generation_adds_missing_questions(self) -> None:
+        args = SimpleNamespace(
+            min_mc=1,
+            max_mc=2,
+            min_open=1,
+            max_open=2,
+            endpoint="http://example.invalid",
+            model="fake",
+            timeout=1,
+            retries=0,
+            coverage_mode="full_coverage",
+            allow_heuristic_fallback=False,
+            max_parallel_chunks=1,
+        )
+        calls = {"refill": 0, "chunk": 0}
+        original_post_ollama = generate_exams.post_ollama
+
+        def fake_post_ollama(endpoint: str, model: str, prompt: str, timeout: int) -> str:
+            if "Generate only the missing exam questions" in prompt:
+                calls["refill"] += 1
+                number = 2
+            else:
+                calls["chunk"] += 1
+                number = 1
+            return f"""{{
+              "coverage_notes": [{{"topic":"Thema","exam_targets":["Ziel"],"common_traps":["Falle"],"source_area":"Chunk"}}],
+              "multiple_choice": [{{
+                "topic": "Thema",
+                "question": "Welche Aussage stimmt bei Refill {number}?",
+                "options": [
+                  {{"text": "A {number}", "is_correct": true}},
+                  {{"text": "B {number}", "is_correct": false}},
+                  {{"text": "C {number}", "is_correct": false}},
+                  {{"text": "D {number}", "is_correct": true}}
+                ],
+                "explanation": "A und D sind richtig."
+              }}],
+              "open_ended": [{{
+                "topic": "Thema",
+                "question_type": "open_ended",
+                "question": "Erkläre Refill {number}.",
+                "expected_answer": "Refill {number} wird erklärt.",
+                "key_concepts": ["Konzept"],
+                "rubric_template": "standard_concept_explanation",
+                "max_score": 100
+              }}],
+              "audit_hints": {{"source_pages_used": [], "visuals_used": [], "topics": ["Thema"]}}
+            }}"""
+
+        try:
+            generate_exams.post_ollama = fake_post_ollama
+            exam = generate_exams.generate_full_coverage_exam(
+                "Course",
+                "source.pdf",
+                "alpha " * 1000,
+                None,
+                6000,
+                args,
+            )
+        finally:
+            generate_exams.post_ollama = original_post_ollama
+
+        self.assertEqual(len(exam["multiple_choice"]), 2)
+        self.assertEqual(len(exam["open_ended"]), 2)
+        self.assertEqual(calls["refill"], 1)
+        self.assertTrue(exam["audit"]["repair_generation"]["attempted"])
+        self.assertTrue(exam["audit"]["repair_generation"]["successful"])
+
+    def test_rubric_template_output_and_legacy_rubric_compatibility(self) -> None:
+        exam = generate_exams.normalize_exam(
+            {
+                "multiple_choice": [
+                    {
+                        "question": "Welche Aussagen stimmen?",
+                        "options": [
+                            {"text": "A", "is_correct": True},
+                            {"text": "B", "is_correct": False},
+                            {"text": "C", "is_correct": False},
+                            {"text": "D", "is_correct": True},
+                        ],
+                        "explanation": "A und D.",
+                    }
+                ],
+                "open_ended": [
+                    {
+                        "topic": "Vergleich",
+                        "question": "Vergleiche zwei Konzepte.",
+                        "expected_answer": "Beide Konzepte werden verglichen.",
+                        "key_concepts": ["Konzept A", "Konzept B"],
+                        "rubric_template": "compare_and_contrast",
+                    },
+                    {
+                        "question": "Erkläre das alte Format.",
+                        "expected_answer": "Das alte Format wird erklärt.",
+                        "key_concepts": ["Alt"],
+                        "grading_rubric": {"90-100": "Alt vollständig."},
+                    },
+                ],
+            },
+            "Course",
+            "source.pdf",
+            None,
+            120,
+        )
+
+        self.assertIn("rubric_templates", exam)
+        self.assertEqual(exam["open_ended"][0]["rubric_template"], "compare_and_contrast")
+        self.assertNotIn("grading_rubric", exam["open_ended"][0])
+        self.assertEqual(exam["open_ended"][1]["grading_rubric"], {"90-100": "Alt vollständig."})
+
+        app_js = (ROOT / "backend" / "exam_backend" / "templates" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("resolveGradingRubric", app_js)
+        self.assertIn("question.grading_rubric", app_js)
+        self.assertIn("question.rubric_template", app_js)
 
     def test_normalize_mc_items_deduplicates_question_text(self) -> None:
         raw = [

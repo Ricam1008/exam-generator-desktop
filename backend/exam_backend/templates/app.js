@@ -2,6 +2,13 @@ let exam = null;
 let mcChecked = false;
 let openGraded = false;
 const openResults = new Map();
+const DEFAULT_GRADING_RUBRIC = {
+  "90-100": "Precise, complete answer covering all key concepts.",
+  "61-89": "Mostly correct answer with minor to noticeable gaps.",
+  "41-60": "On topic but incomplete or imprecise.",
+  "21-40": "Partially relevant with major conceptual gaps.",
+  "0-20": "Mostly wrong, vague, or empty."
+};
 
 const $ = (selector) => document.querySelector(selector);
 
@@ -16,6 +23,22 @@ function escapeHtml(value) {
 
 function asArray(value) {
   return Array.isArray(value) ? value : [];
+}
+
+function isPlainObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value);
+}
+
+function resolveGradingRubric(question) {
+  if (isPlainObject(question.grading_rubric) && Object.keys(question.grading_rubric).length) {
+    return question.grading_rubric;
+  }
+  const templates = isPlainObject(exam?.rubric_templates) ? exam.rubric_templates : {};
+  const template = templates[question.rubric_template];
+  if (isPlainObject(template) && Object.keys(template).length) {
+    return template;
+  }
+  return DEFAULT_GRADING_RUBRIC;
 }
 
 async function loadExam() {
@@ -166,7 +189,7 @@ async function callGrader(question, answer) {
       student_answer: answer,
       expected_answer: question.expected_answer,
       key_concepts: asArray(question.key_concepts),
-      grading_rubric: question.grading_rubric || {},
+      grading_rubric: resolveGradingRubric(question),
       max_score: Number(question.max_score || 100)
     })
   });
