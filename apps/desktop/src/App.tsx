@@ -43,6 +43,8 @@ type Job = {
   result?: { project_root: string; index_url: string };
   error?: string;
   logs: string[];
+  log_path?: string;
+  log_url?: string;
 };
 
 const API = "http://127.0.0.1:8766";
@@ -231,6 +233,11 @@ export default function App() {
     await openUrl(`${API}${job.result.index_url}`);
   }
 
+  async function openFullLog() {
+    if (!job) return;
+    await openUrl(`${API}${job.log_url || `/api/jobs/${job.id}/log`}`);
+  }
+
   useEffect(() => {
     void checkBackend();
   }, []);
@@ -413,7 +420,10 @@ export default function App() {
           )}
           {latestLog && <p className="latest-log">{latestLog}</p>}
           {job.status === "error" && <p className="error-text">{job.error}</p>}
-          {job.status === "done" && <button onClick={openPreview}>Open exam index</button>}
+          <div className="job-actions">
+            {job.status === "done" && <button onClick={openPreview}>Open exam index</button>}
+            <button className="secondary" onClick={openFullLog}>Open full log</button>
+          </div>
           <pre>{job.logs.slice(-12).join("\n")}</pre>
         </section>
       )}

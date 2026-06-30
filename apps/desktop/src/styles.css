@@ -61,6 +61,7 @@ progress { width: 100%; height: 14px; margin: 14px 0; accent-color: var(--accent
 .progress-meta span { display: block; color: var(--muted); font-size: .82rem; margin-bottom: 4px; }
 .progress-meta strong { font-variant-numeric: tabular-nums; }
 .latest-log { border: 1px solid var(--line); border-radius: 8px; background: #f4f6f5; color: var(--ink); padding: 10px 12px; margin: 12px 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .9rem; }
+.job-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
 pre { white-space: pre-wrap; background: #f4f6f5; border: 1px solid var(--line); border-radius: 8px; padding: 12px; max-height: 220px; overflow: auto; }
 .error-text { color: var(--bad); }
 

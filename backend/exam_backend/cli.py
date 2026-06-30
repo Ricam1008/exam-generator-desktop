@@ -10,6 +10,7 @@ import math
 import shutil
 import sys
 import threading
+import traceback
 import uuid
 import importlib.util
 from dataclasses import dataclass, field
@@ -52,6 +53,8 @@ class Job:
     result: dict[str, Any] | None = None
     error: str | None = None
     logs: list[str] = field(default_factory=list)
+    log_path: str | None = None
+    log_url: str | None = None
 
 
 class State:
@@ -69,10 +72,94 @@ def slugify(value: str) -> str:
     return generate_exams.slugify(value, max_length=80)
 
 
+def fallback_log_dir() -> Path:
+    return Path.home() / ".exam-generator-desktop" / "logs"
+
+
+def generation_log_path(job: Job, base_dir: Path) -> Path:
+    return base_dir / "logs" / f"generation-{job.id}.log"
+
+
+def ensure_job_log_path(job: Job) -> Path:
+    if not job.log_path:
+        attach_job_log_path(job, fallback_log_dir() / f"generation-{job.id}.log")
+    assert job.log_path is not None
+    return Path(job.log_path)
+
+
+def attach_job_log_path(job: Job, path: Path) -> None:
+    path = path.expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    previous = Path(job.log_path) if job.log_path else None
+    if previous and previous != path and previous.exists():
+        existing = previous.read_text(encoding="utf-8", errors="replace")
+        path.write_text(existing, encoding="utf-8")
+    elif not path.exists():
+        path.write_text("", encoding="utf-8")
+    job.log_path = str(path)
+    job.log_url = f"/api/jobs/{job.id}/log"
+
+
+def append_job_log_file(job: Job, text: str) -> None:
+    try:
+        path = ensure_job_log_path(job)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(text)
+    except OSError:
+        # In-memory logs should keep working even if the filesystem refuses a log write.
+        return
+
+
 def job_log(job: Job, message: str) -> None:
     job.updated_at = now_iso()
     stamp = dt.datetime.now().strftime("%H:%M:%S")
-    job.logs.append(f"{stamp} {message}")
+    line = f"{stamp} {message}"
+    job.logs.append(line)
+    append_job_log_file(job, f"{line}\n")
+
+
+def job_debug(job: Job, title: str, content: str) -> None:
+    stamp = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    append_job_log_file(job, f"\n--- {stamp} {title} ---\n{content}\n--- END {title} ---\n")
+
+
+def text_response(handler: BaseHTTPRequestHandler, status: int, body: str) -> None:
+    data = body.encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "text/plain; charset=utf-8")
+    handler.send_header("Content-Length", str(len(data)))
+    handler.send_header("Cache-Control", "no-store")
+    handler.end_headers()
+    handler.wfile.write(data)
+
+
+def job_log_text(job: Job) -> str:
+    if job.log_path:
+        path = Path(job.log_path)
+        if path.exists():
+            return path.read_text(encoding="utf-8", errors="replace")
+    return "\n".join(job.logs) + ("\n" if job.logs else "")
+
+
+def log_job_configuration(job: Job, payload: dict[str, Any], model: str, mode: str, output_path: str) -> None:
+    job_debug(
+        job,
+        "Job configuration",
+        json.dumps(
+            {
+                "job_id": job.id,
+                "kind": job.kind,
+                "mode": mode,
+                "model": model,
+                "input_path": payload.get("input_path"),
+                "output_path": output_path,
+                "overwrite": bool(payload.get("overwrite", False)),
+                "started_at": job.started_at,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+    )
 
 
 def json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
@@ -423,6 +510,23 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
         overwrite = bool(payload.get("overwrite", False))
         model = str(payload.get("model") or STATE.selected_model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
         STATE.selected_model = model
+        log_job_configuration(job, payload, model, mode, output_path)
+        job_debug(
+            job,
+            "Dependency status",
+            json.dumps(
+                {
+                    "python": sys.version.split()[0],
+                    "pypdf": importlib.util.find_spec("pypdf") is not None,
+                    "pdfplumber": importlib.util.find_spec("pdfplumber") is not None,
+                    "templates": all((PACKAGE_DIR / "templates" / name).exists() for name in ["index_template.html", "app.js", "styles.css"]),
+                    "ollama_endpoint": DEFAULT_OLLAMA,
+                    "model": model,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
         if not input_path:
             raise ValueError("Input folder is required.")
         job.message = "Preparing output workspace"
@@ -432,8 +536,11 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
         if backup_path:
             job_log(job, f"Backup created: {backup_path}")
         project_root = materialize_input(input_path, output_path, overwrite=overwrite)
+        attach_job_log_path(job, generation_log_path(job, project_root))
         job_log(job, f"Output workspace: {project_root}")
+        job_log(job, f"Full log: {job.log_path}")
         STATE.preview_root = project_root
+        debug_log = lambda title, content: job_debug(job, title, content)
 
         if mode in {"example", "all"}:
             args = generator_args(project_root, overwrite=overwrite, example=mode == "example", model=model)
@@ -441,6 +548,7 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
             if mode == "example":
                 pdfs = pdfs[:1]
             total = max(1, len(pdfs))
+            job_debug(job, "PDF queue", "\n".join(str(pdf) for pdf in pdfs) or "No PDFs found.")
             failures = []
             for index, pdf in enumerate(pdfs, start=1):
                 job.message = f"Generating {pdf.name}"
@@ -453,8 +561,10 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
                         args,
                         PACKAGE_DIR / "templates",
                         progress=lambda message: job_log(job, message),
+                        debug=debug_log,
                     )
                     if result:
+                        job_debug(job, f"Result metadata: {pdf.name}", json.dumps(result, ensure_ascii=False, indent=2))
                         job_log(job, f"Wrote {result['source_pdf']} ({result['mc_count']} MC, {result['open_count']} open)")
                         source_file = Path(result["exam_dir"]) / "source.txt"
                         try:
@@ -464,6 +574,7 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
                         except OSError:
                             pass
                 except Exception as exc:
+                    job_debug(job, f"Traceback: {pdf.name}", traceback.format_exc())
                     if mode == "example":
                         raise
                     failures.append(pdf.name)
@@ -484,8 +595,9 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
                 job.message = f"Generating final exam for {course.name}"
                 job.progress = int((index - 1) / total * 90)
                 job_log(job, f"Starting final exam {index}/{total}: {course.name}")
-                result = generate_final_exams.write_final_exam(args, course)
+                result = generate_final_exams.write_final_exam(args, course, debug=debug_log)
                 if result:
+                    job_debug(job, f"Final result metadata: {course.name}", json.dumps(result, ensure_ascii=False, indent=2))
                     job_log(job, f"Final {result['course']}: {result['mc']} MC, {result['open']} open")
                     source_file = course / "exams" / "final-exam" / "source.txt"
                     try:
@@ -504,6 +616,7 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
         job.progress = 100
         job.message = "Done"
         duration = (dt.datetime.now().astimezone() - started).total_seconds()
+        job_debug(job, "Job finished", f"status=done\nduration_seconds={duration:.2f}\nfinished_at={now_iso()}")
         if mode in {"all", "finals"} and metric_chars > 0:
             record_generation_metric(model, mode, metric_chars, metric_words, duration)
             job_log(job, f"Saved estimate sample for {model}: {metric_words:,} words in {int(duration // 60)} min")
@@ -513,6 +626,8 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
         job.status = "error"
         job.error = str(exc)
         job.message = "Failed"
+        job_debug(job, "Traceback", traceback.format_exc())
+        job_debug(job, "Job finished", f"status=error\nfinished_at={now_iso()}")
         job_log(job, f"Failed: {exc}")
 
 
@@ -533,7 +648,16 @@ class Handler(BaseHTTPRequestHandler):
             json_response(self, 200, {"ok": True, "version": "0.1.0"})
             return
         if parsed_path.path.startswith("/api/jobs/"):
-            job_id = parsed_path.path.rsplit("/", 1)[-1]
+            tail = parsed_path.path[len("/api/jobs/"):]
+            if tail.endswith("/log"):
+                job_id = tail[:-len("/log")].rstrip("/")
+                job = STATE.jobs.get(job_id)
+                if not job:
+                    text_response(self, 404, "Job not found\n")
+                    return
+                text_response(self, 200, job_log_text(job))
+                return
+            job_id = tail.rsplit("/", 1)[-1]
             job = STATE.jobs.get(job_id)
             if not job:
                 json_response(self, 404, {"error": "Job not found"})
@@ -558,6 +682,7 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed_path.path == "/api/generate":
                 job = Job(id=str(uuid.uuid4()), kind=str(payload.get("mode", "example")))
                 STATE.jobs[job.id] = job
+                attach_job_log_path(job, fallback_log_dir() / f"generation-{job.id}.log")
                 job_log(job, f"Queued {job.kind} generation")
                 threading.Thread(target=run_generation, args=(job, payload), daemon=True).start()
                 json_response(self, 200, {"job_id": job.id})

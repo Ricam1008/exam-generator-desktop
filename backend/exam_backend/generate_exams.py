@@ -21,10 +21,12 @@ from typing import Any, Callable
 
 DEFAULT_ENDPOINT = "http://localhost:11434/api/chat"
 DEFAULT_MODEL = "gemma4:31b-cloud"
+GENERATOR_VERSION = "0.1.0"
 MIN_WORDS_FOR_FULL_EXAM = 3000
 LOW_TEXT_WORD_THRESHOLD = 800
 MAX_PROMPT_TEXT_CHARS = 52000
 FULL_COVERAGE_TEXT_CHARS = 22000
+DebugLogger = Callable[[str, str], None]
 
 
 EXAM_JSON_SCHEMA: dict[str, Any] = {
@@ -243,8 +245,10 @@ def extract_with_pypdf(pdf_path: Path) -> tuple[str, int | None] | None:
 
     reader = PdfReader(str(pdf_path))
     page_text = []
-    for page in reader.pages:
-        page_text.append(page.extract_text() or "")
+    for page_number, page in enumerate(reader.pages, start=1):
+        extracted_text = page.extract_text() or ""
+        if extracted_text.strip():
+            page_text.append(f"--- Page {page_number} ---\n[PAGE {page_number} TEXT]\n{extracted_text}")
     return "\n\n".join(page_text), len(reader.pages)
 
 
@@ -348,7 +352,7 @@ def clean_extracted_text(text: str) -> str:
     return text.strip()
 
 
-def extract_pdf_text(pdf_path: Path) -> tuple[str, str | None, int | None]:
+def extract_pdf_text(pdf_path: Path, debug: DebugLogger | None = None) -> tuple[str, str | None, int | None]:
     attempts = [
         ("pdfplumber", extract_with_pdfplumber),
         ("pypdf", extract_with_pypdf),
@@ -356,6 +360,7 @@ def extract_pdf_text(pdf_path: Path) -> tuple[str, str | None, int | None]:
         ("strings fallback", extract_with_strings),
     ]
     last_error = None
+    last_page_count: int | None = None
     for name, extractor in attempts:
         try:
             result = extractor(pdf_path)
@@ -365,6 +370,8 @@ def extract_pdf_text(pdf_path: Path) -> tuple[str, str | None, int | None]:
         if not result:
             continue
         text, page_count = result
+        if page_count is not None:
+            last_page_count = page_count
         text = clean_extracted_text(text)
         if text:
             words = count_words(text)
@@ -375,10 +382,28 @@ def extract_pdf_text(pdf_path: Path) -> tuple[str, str | None, int | None]:
                 warning = "PDF layout/table extraction was unavailable; table structure and visual chart details may be underrepresented. Install pdfplumber for better table extraction."
             elif words < LOW_TEXT_WORD_THRESHOLD:
                 warning = f"Only {words} words were extracted; this PDF may contain scanned slides, images, or little text."
+            if debug:
+                debug(
+                    f"PDF extraction: {pdf_path.name}",
+                    json.dumps(
+                        {
+                            "extractor": name,
+                            "page_count": page_count,
+                            "characters": len(text),
+                            "words": words,
+                            "warning": warning,
+                            "contains_table_blocks": "[TABLE " in text,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                )
             return text, warning, page_count
 
     message = last_error or "No PDF text extractor was available."
-    return "", f"Could not extract usable text. {message}", None
+    if debug:
+        debug(f"PDF extraction failed: {pdf_path.name}", message)
+    return "", f"Could not extract usable text. {message}", last_page_count
 
 
 def count_words(text: str) -> int:
@@ -466,6 +491,271 @@ def scaled_retry_counts(mc: int, open_count: int, attempt: int, args: argparse.N
     return min(args.max_mc, retry_mc), min(args.max_open, retry_open)
 
 
+def source_pages_from_text(text: str) -> list[int]:
+    pages: set[int] = set()
+    patterns = [
+        r"---\s*Page\s+(\d+)\s*---",
+        r"\[PAGE\s+(\d+)\s+(?:TEXT|TABLES)\]",
+        r"\[TABLE\s+page=(\d+)\b",
+    ]
+    for pattern in patterns:
+        for match in re.findall(pattern, text, flags=re.IGNORECASE):
+            try:
+                page = int(match)
+            except (TypeError, ValueError):
+                continue
+            if page > 0:
+                pages.add(page)
+    return sorted(pages)
+
+
+def source_type_from_text(text: str) -> str:
+    lower = text.casefold()
+    kinds = set()
+    if re.search(r"\[table\s+page=|\[page\s+\d+\s+tables\]|\btabelle\b|\btable\b", lower):
+        kinds.add("table")
+    if re.search(r"\b(abbildung|diagramm|grafik|graph|kurve|chart|figure|plot|axis|achsen|verschiebung)\b", lower):
+        kinds.add("diagram")
+    if re.search(r"(?:[a-zA-ZÄÖÜäöüß]\s*=\s*[^,\n;.]{1,40})|[πΠΔ∂Σ√∫≤≥→←]|\\(?:Delta|pi|sum|frac)|\bformel\b", text):
+        kinds.add("formula")
+    if len(kinds) > 1:
+        return "mixed"
+    if kinds:
+        return next(iter(kinds))
+    if text.strip():
+        return "text"
+    return "unknown"
+
+
+def question_source_meta(source_text: str, chunk_id: str) -> dict[str, Any]:
+    source_type = source_type_from_text(source_text)
+    return {
+        "source_pages": source_pages_from_text(source_text),
+        "source_type": source_type,
+        "chunk_id": chunk_id,
+        "visual_required": source_type in {"diagram", "table", "mixed"},
+    }
+
+
+def attach_question_metadata(questions: list[dict[str, Any]], source_text: str, chunk_id: str) -> None:
+    meta = question_source_meta(source_text, chunk_id)
+    for question in questions:
+        question.setdefault("_meta", dict(meta))
+
+
+def exam_questions(exam: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        question
+        for question in ensure_list(exam.get("multiple_choice")) + ensure_list(exam.get("open_ended"))
+        if isinstance(question, dict)
+    ]
+
+
+def detected_visual_count(text: str) -> int:
+    table_blocks = len(re.findall(r"\[TABLE\s+page=", text, flags=re.IGNORECASE))
+    visual_terms = re.findall(
+        r"\b(abbildung|diagramm|grafik|graph|kurve|chart|figure|plot|axis|achsen)\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return table_blocks + len(visual_terms)
+
+
+def question_text_blob(question: dict[str, Any]) -> str:
+    parts = [
+        str(question.get("topic") or ""),
+        str(question.get("question") or ""),
+        str(question.get("explanation") or ""),
+        str(question.get("expected_answer") or ""),
+        " ".join(str(item) for item in ensure_list(question.get("key_concepts"))),
+    ]
+    for option in ensure_list(question.get("options")):
+        if isinstance(option, dict):
+            parts.append(str(option.get("text") or ""))
+    return " ".join(parts)
+
+
+def is_calculation_question(question: dict[str, Any]) -> bool:
+    blob = question_text_blob(question)
+    has_number_or_formula = bool(re.search(r"\d|[=+\-*/%πΠΔ∂Σ√∫≤≥]", blob))
+    has_calculation_word = bool(
+        re.search(
+            r"\b(berechne|berechnen|rechnung|calculation|calculate|preis|menge|kosten|erlös|gewinn|elastizität|welfare|überschuss|gleichgewicht)\b",
+            blob,
+            flags=re.IGNORECASE,
+        )
+    )
+    return has_number_or_formula and has_calculation_word
+
+
+def is_diagram_question(question: dict[str, Any]) -> bool:
+    meta = question.get("_meta") if isinstance(question.get("_meta"), dict) else {}
+    if meta.get("source_type") in {"diagram", "table", "mixed"}:
+        return True
+    return bool(
+        re.search(
+            r"\b(abbildung|diagramm|grafik|graph|kurve|chart|figure|achsen|interpretier|verschiebung)\b",
+            question_text_blob(question),
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def question_distribution(exam: dict[str, Any]) -> dict[str, int]:
+    mc = ensure_list(exam.get("multiple_choice"))
+    open_ended = ensure_list(exam.get("open_ended"))
+    questions = [question for question in mc + open_ended if isinstance(question, dict)]
+    distribution = {
+        "multiple_choice": len(mc),
+        "open_ended": len(open_ended),
+    }
+    diagram_count = sum(1 for question in questions if is_diagram_question(question))
+    calculation_count = sum(1 for question in questions if is_calculation_question(question))
+    if diagram_count:
+        distribution["diagram_interpretation"] = diagram_count
+    if calculation_count:
+        distribution["calculation"] = calculation_count
+    return distribution
+
+
+def topic_distribution(exam: dict[str, Any]) -> dict[str, int]:
+    topics: dict[str, int] = {}
+    for question in ensure_list(exam.get("multiple_choice")):
+        if not isinstance(question, dict):
+            continue
+        topic = str(question.get("topic") or "").strip()
+        if topic:
+            topics[topic] = topics.get(topic, 0) + 1
+    for question in ensure_list(exam.get("open_ended")):
+        if not isinstance(question, dict):
+            continue
+        concepts = [str(item).strip() for item in ensure_list(question.get("key_concepts")) if str(item).strip()]
+        if concepts:
+            topics[concepts[0]] = topics.get(concepts[0], 0) + 1
+    return dict(sorted(topics.items(), key=lambda item: (-item[1], item[0]))[:40])
+
+
+def format_number_list(values: list[int]) -> str:
+    return ",".join(str(value) for value in values) if values else "None"
+
+
+def apply_exam_audit(
+    exam: dict[str, Any],
+    source_pdf: str,
+    source_text: str,
+    pages_total: int | None,
+    chunks_total: int,
+    chunks_processed: int,
+    chunks_failed: int,
+    warnings: list[str] | None = None,
+    visuals_detected: int | None = None,
+) -> dict[str, Any]:
+    inferred_pages = source_pages_from_text(source_text)
+    total_pages = int(pages_total or 0)
+    if total_pages <= 0 and inferred_pages:
+        total_pages = max(inferred_pages)
+
+    pages_used = sorted(
+        {
+            int(page)
+            for question in exam_questions(exam)
+            for page in ensure_list((question.get("_meta") or {}).get("source_pages") if isinstance(question.get("_meta"), dict) else [])
+            if isinstance(page, int) or (isinstance(page, str) and page.isdigit())
+        }
+    )
+    if total_pages > 0:
+        pages_used = [page for page in pages_used if 1 <= page <= total_pages]
+        pages_without_questions = [page for page in range(1, total_pages + 1) if page not in set(pages_used)]
+        coverage_ratio = round(len(pages_used) / total_pages, 4)
+    else:
+        pages_without_questions = []
+        coverage_ratio = 0.0
+
+    detected = detected_visual_count(source_text) if visuals_detected is None else max(0, int(visuals_detected))
+    visual_questions = sum(
+        1
+        for question in exam_questions(exam)
+        if isinstance(question.get("_meta"), dict)
+        and question["_meta"].get("source_type") in {"diagram", "table", "mixed"}
+    )
+    visuals_used = min(detected, visual_questions) if detected else 0
+
+    audit_warnings = [warning for warning in (warnings or []) if warning]
+    if pages_without_questions:
+        audit_warnings.append(f"Pages without generated questions: {format_number_list(pages_without_questions)}")
+    if chunks_failed:
+        audit_warnings.append(f"{chunks_failed} chunk(s) failed during generation.")
+    if detected and visuals_used < detected:
+        audit_warnings.append(f"Only {visuals_used}/{detected} detected visual/table source marker(s) were reflected in question metadata.")
+
+    exam["audit"] = {
+        "generator_version": GENERATOR_VERSION,
+        "source_file": source_pdf,
+        "pages_total": total_pages,
+        "pages_used": pages_used,
+        "pages_without_questions": pages_without_questions,
+        "coverage_ratio": coverage_ratio,
+        "visuals_detected": detected,
+        "visuals_used": visuals_used,
+        "chunks_total": max(0, int(chunks_total)),
+        "chunks_processed": max(0, int(chunks_processed)),
+        "chunks_failed": max(0, int(chunks_failed)),
+        "question_distribution": question_distribution(exam),
+        "topic_distribution": topic_distribution(exam),
+        "warnings": audit_warnings,
+    }
+    return exam
+
+
+def format_audit_summary(audit: dict[str, Any]) -> str:
+    def dotted(label: str, value: Any) -> str:
+        return f"{label:.<24}{value}"
+
+    lines = [
+        "=" * 50,
+        "AUDIT SUMMARY",
+        "=" * 50,
+        "",
+        f"Generator version: {audit.get('generator_version') or 'unknown'}",
+        f"Source file: {audit.get('source_file') or 'unknown'}",
+        "",
+        f"Pages total: {audit.get('pages_total', 0)}",
+        f"Pages used: {len(ensure_list(audit.get('pages_used')))}",
+        "",
+        "Pages without questions:",
+        format_number_list([int(page) for page in ensure_list(audit.get("pages_without_questions")) if isinstance(page, int)]),
+        "",
+        "Coverage ratio:",
+        f"{float(audit.get('coverage_ratio') or 0.0):.2f}",
+        "",
+        "Chunks:",
+        f"{audit.get('chunks_processed', 0)} / {audit.get('chunks_total', 0)} processed",
+        "",
+        "Visuals:",
+        f"{audit.get('visuals_used', 0)} / {audit.get('visuals_detected', 0)} used",
+        "",
+        "Question distribution:",
+    ]
+    question_counts = audit.get("question_distribution")
+    if isinstance(question_counts, dict) and question_counts:
+        lines.extend(dotted(str(key), value) for key, value in question_counts.items())
+    else:
+        lines.append("None")
+
+    topics = audit.get("topic_distribution")
+    lines.extend(["", "Topic distribution:"])
+    if isinstance(topics, dict) and topics:
+        lines.extend(dotted(str(key), value) for key, value in list(topics.items())[:20])
+    else:
+        lines.append("None")
+
+    warnings = [str(warning) for warning in ensure_list(audit.get("warnings")) if str(warning).strip()]
+    lines.extend(["", "Warnings:"])
+    lines.extend(warnings or ["None"])
+    lines.extend(["", "=" * 50])
+    return "\n".join(lines)
+
+
 def post_ollama(endpoint: str, model: str, prompt: str, timeout: int) -> str:
     payload = {
         "model": model,
@@ -516,29 +806,60 @@ def escape_invalid_json_backslashes(raw: str) -> str:
     return "".join(repaired)
 
 
-def load_model_json_candidate(raw: str) -> dict[str, Any]:
+def load_model_json_candidate(
+    raw: str,
+    debug: DebugLogger | None = None,
+    context: str = "model response",
+    audit_warnings: list[str] | None = None,
+) -> dict[str, Any]:
     try:
         return json.loads(raw)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
         repaired = escape_invalid_json_backslashes(raw)
         if repaired == raw:
             raise
-        return json.loads(repaired)
+        try:
+            parsed = json.loads(repaired)
+        except json.JSONDecodeError:
+            if debug:
+                debug(f"JSON repair failed: {context}", f"{type(exc).__name__}: {exc}")
+            raise
+        if debug:
+            debug(f"JSON repair applied: {context}", f"{type(exc).__name__}: {exc}\nEscaped invalid single-backslash sequences.")
+        if audit_warnings is not None:
+            audit_warnings.append(f"Parser repair applied for {context}: escaped invalid single-backslash sequences.")
+        return parsed
 
 
-def load_json_from_model(raw: str) -> dict[str, Any]:
+def load_json_from_model(
+    raw: str,
+    debug: DebugLogger | None = None,
+    context: str = "model response",
+    audit_warnings: list[str] | None = None,
+) -> dict[str, Any]:
     raw = raw.strip()
     try:
-        return load_model_json_candidate(raw)
-    except json.JSONDecodeError:
+        return load_model_json_candidate(raw, debug=debug, context=context, audit_warnings=audit_warnings)
+    except json.JSONDecodeError as exc:
         start = raw.find("{")
         end = raw.rfind("}")
         if start == -1 or end == -1 or end <= start:
             raise
-        return load_model_json_candidate(raw[start : end + 1])
+        if debug:
+            debug(f"JSON object extracted: {context}", f"{type(exc).__name__}: {exc}\nUsing substring {start}:{end + 1}.")
+        if audit_warnings is not None:
+            audit_warnings.append(f"Parser repair applied for {context}: extracted JSON object from surrounding text.")
+        return load_model_json_candidate(raw[start : end + 1], debug=debug, context=context, audit_warnings=audit_warnings)
 
 
-def call_json_with_retries(args: argparse.Namespace, prompt: str, context: str, progress: Callable[[str], None] | None = None) -> dict[str, Any]:
+def call_json_with_retries(
+    args: argparse.Namespace,
+    prompt: str,
+    context: str,
+    progress: Callable[[str], None] | None = None,
+    debug: DebugLogger | None = None,
+    audit_warnings: list[str] | None = None,
+) -> dict[str, Any]:
     last_error: Exception | None = None
     for attempt in range(max(0, args.retries) + 1):
         retry_prompt = prompt
@@ -548,12 +869,26 @@ def call_json_with_retries(args: argparse.Namespace, prompt: str, context: str, 
                 "Return one complete valid JSON object only. No markdown, no comments, no prose outside JSON. "
                 "Do not use single-backslash LaTeX commands inside JSON strings; use plain text or doubled JSON backslashes."
             )
+        raw = ""
         try:
             if progress:
                 progress(f"Waiting for Ollama: {context} (attempt {attempt + 1}/{max(0, args.retries) + 1})")
-            return load_json_from_model(post_ollama(args.endpoint, args.model, retry_prompt, args.timeout))
+            if debug:
+                debug(
+                    f"Ollama request: {context} attempt {attempt + 1}",
+                    f"endpoint={args.endpoint}\nmodel={args.model}\ntimeout={args.timeout}\n\nPROMPT:\n{retry_prompt}",
+                )
+            raw = post_ollama(args.endpoint, args.model, retry_prompt, args.timeout)
+            if debug:
+                debug(f"Ollama raw response: {context} attempt {attempt + 1}", raw)
+            return load_json_from_model(raw, debug=debug, context=f"{context} attempt {attempt + 1}", audit_warnings=audit_warnings)
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError, OSError) as exc:
             last_error = exc
+            if debug:
+                debug(
+                    f"Ollama/JSON error: {context} attempt {attempt + 1}",
+                    f"{type(exc).__name__}: {exc}" + (f"\n\nRAW RESPONSE:\n{raw}" if raw else ""),
+                )
             if attempt < max(0, args.retries):
                 if progress:
                     progress(f"RETRY {attempt + 1}/{args.retries} for {context}: {exc}")
@@ -681,15 +1016,16 @@ def normalize_exam(
             options.append({"text": text, "is_correct": bool(option.get("is_correct", False))})
         if len(options) < 4:
             continue
-        mc_questions.append(
-            {
-                "id": str(question.get("id") or f"mc-{index:03d}"),
-                "topic": str(question.get("topic") or ""),
-                "question": str(question.get("question") or "").strip(),
-                "options": options,
-                "explanation": str(question.get("explanation") or "").strip(),
-            }
-        )
+        normalized_mc = {
+            "id": str(question.get("id") or f"mc-{index:03d}"),
+            "topic": str(question.get("topic") or ""),
+            "question": str(question.get("question") or "").strip(),
+            "options": options,
+            "explanation": str(question.get("explanation") or "").strip(),
+        }
+        if isinstance(question.get("_meta"), dict):
+            normalized_mc["_meta"] = question["_meta"]
+        mc_questions.append(normalized_mc)
 
     open_questions = []
     open_source = first_list(model_exam, ["open_ended", "open_ended_questions", "open_questions", "short_answer", "essay_questions"])
@@ -705,16 +1041,17 @@ def normalize_exam(
                 "21-40": "Partially relevant with major conceptual gaps.",
                 "0-20": "Mostly wrong, vague, or empty.",
             }
-        open_questions.append(
-            {
-                "id": str(question.get("id") or f"open-{index:03d}"),
-                "question": str(question.get("question") or "").strip(),
-                "expected_answer": str(question.get("expected_answer") or "").strip(),
-                "key_concepts": [str(item) for item in ensure_list(question.get("key_concepts")) if str(item).strip()],
-                "grading_rubric": rubric,
-                "max_score": 100,
-            }
-        )
+        normalized_open = {
+            "id": str(question.get("id") or f"open-{index:03d}"),
+            "question": str(question.get("question") or "").strip(),
+            "expected_answer": str(question.get("expected_answer") or "").strip(),
+            "key_concepts": [str(item) for item in ensure_list(question.get("key_concepts")) if str(item).strip()],
+            "grading_rubric": rubric,
+            "max_score": 100,
+        }
+        if isinstance(question.get("_meta"), dict):
+            normalized_open["_meta"] = question["_meta"]
+        open_questions.append(normalized_open)
 
     today = dt.date.today().isoformat()
     title = Path(source_pdf).stem
@@ -890,6 +1227,8 @@ def generate_full_coverage_exam(
     word_count: int,
     args: argparse.Namespace,
     progress: Callable[[str], None] | None = None,
+    debug: DebugLogger | None = None,
+    pages_total: int | None = None,
 ) -> dict[str, Any]:
     chunks = chunk_text(text)
     target_mc, target_open = target_counts(word_count, args)
@@ -901,12 +1240,23 @@ def generate_full_coverage_exam(
     seen_open: set[str] = set()
     failed_chunks = 0
     processed_chunks = 0
+    audit_warnings: list[str] = []
+    if extraction_warning:
+        audit_warnings.append(f"Extraction warning: {extraction_warning}")
 
     for index, chunk in enumerate(chunks, start=1):
+        chunk_id = f"chunk-{index:03d}"
         if progress:
             progress(f"Processing chunk {index}/{len(chunks)}")
         try:
-            coverage = call_json_with_retries(args, build_chunk_coverage_prompt(course, source_pdf, chunk, index, len(chunks)), f"{source_pdf} coverage chunk {index}", progress)
+            coverage = call_json_with_retries(
+                args,
+                build_chunk_coverage_prompt(course, source_pdf, chunk, index, len(chunks)),
+                f"{source_pdf} coverage chunk {index}",
+                progress,
+                debug,
+                audit_warnings,
+            )
             if progress:
                 progress(f"Generating questions batch {index}/{len(chunks)}")
             data = call_json_with_retries(
@@ -924,14 +1274,28 @@ def generate_full_coverage_exam(
                 ),
                 f"{source_pdf} questions chunk {index}",
                 progress,
+                debug,
+                audit_warnings,
             )
-            mc_questions.extend(normalize_mc_items(first_list(data, ["multiple_choice", "multiple_choice_questions", "mc_questions", "mcq", "mc"]), seen_mc))
-            open_questions.extend(normalize_open_items(first_list(data, ["open_ended", "open_ended_questions", "open_questions", "short_answer", "essay_questions"]), seen_open))
+            raw_mc = first_list(data, ["multiple_choice", "multiple_choice_questions", "mc_questions", "mcq", "mc"])
+            raw_open = first_list(data, ["open_ended", "open_ended_questions", "open_questions", "short_answer", "essay_questions"])
+            new_mc = normalize_mc_items(raw_mc, seen_mc)
+            new_open = normalize_open_items(raw_open, seen_open)
+            attach_question_metadata(new_mc, chunk, chunk_id)
+            attach_question_metadata(new_open, chunk, chunk_id)
+            mc_questions.extend(new_mc)
+            open_questions.extend(new_open)
             processed_chunks += 1
+            discarded = max(0, len(raw_mc) - len(new_mc)) + max(0, len(raw_open) - len(new_open))
+            if discarded:
+                audit_warnings.append(f"Discarded {discarded} duplicate or invalid generation(s) in {chunk_id}.")
+            if not new_mc and not new_open:
+                audit_warnings.append(f"{chunk_id} produced no usable questions.")
             if progress:
                 progress(f"Merged {len(mc_questions)} MC / {len(open_questions)} open")
         except RuntimeError as exc:
             failed_chunks += 1
+            audit_warnings.append(f"{chunk_id} failed: {exc}")
             if progress:
                 progress(f"Chunk {index}/{len(chunks)} failed: {exc}")
 
@@ -947,6 +1311,7 @@ def generate_full_coverage_exam(
         warnings.append(f"Full coverage processed {processed_chunks}/{len(chunks)} chunks; {failed_chunks} chunk(s) failed.")
     if len(mc_questions) < target_mc or len(open_questions) < target_open:
         warnings.append(f"Generated {len(mc_questions)} MC and {len(open_questions)} open questions instead of target {target_mc}/{target_open}.")
+    audit_warnings.extend(warnings)
 
     exam = normalize_exam(
         {"multiple_choice": mc_questions[:target_mc], "open_ended": open_questions[:target_open]},
@@ -955,7 +1320,8 @@ def generate_full_coverage_exam(
         extraction_warning,
         word_count,
     )
-    return apply_coverage_metadata(exam, "full_coverage", len(chunks), processed_chunks, failed_chunks, " ".join(warnings) if warnings else None)
+    exam = apply_coverage_metadata(exam, "full_coverage", len(chunks), processed_chunks, failed_chunks, " ".join(warnings) if warnings else None)
+    return apply_exam_audit(exam, source_pdf, text, pages_total, len(chunks), processed_chunks, failed_chunks, audit_warnings)
 
 
 def heuristic_exam(
@@ -1031,6 +1397,7 @@ def write_exam_folder(
     args: argparse.Namespace,
     template_dir: Path,
     progress: Callable[[str], None] | None = None,
+    debug: DebugLogger | None = None,
 ) -> dict[str, Any] | None:
     course_dir = pdf_path.parent
     course = course_dir.name
@@ -1041,12 +1408,15 @@ def write_exam_folder(
         print(f"SKIP existing: {exam_dir}", flush=True)
         return None
 
-    text, extraction_warning, page_count = extract_pdf_text(pdf_path)
+    text, extraction_warning, page_count = extract_pdf_text(pdf_path, debug=debug)
     word_count = count_words(text)
     if progress:
         pages = page_count if page_count is not None else "unknown"
         progress(f"Extracted {word_count:,} words from {pages} pages")
 
+    audit_warnings: list[str] = []
+    if extraction_warning:
+        audit_warnings.append(f"Extraction warning: {extraction_warning}")
     base_mc, base_open = target_counts(word_count, args)
     last_error: Exception | None = None
     exam: dict[str, Any] | None = None
@@ -1056,7 +1426,7 @@ def write_exam_folder(
     if coverage_mode == "full_coverage":
         if progress:
             progress("Using full-coverage generation")
-        exam = generate_full_coverage_exam(course, pdf_path.name, text, extraction_warning, word_count, args, progress)
+        exam = generate_full_coverage_exam(course, pdf_path.name, text, extraction_warning, word_count, args, progress, debug, page_count)
     else:
         if progress:
             progress("Using representative generation")
@@ -1064,6 +1434,7 @@ def write_exam_folder(
         if len(text) > len(prompt_text):
             chunk_note = "Long PDF text was chunked into representative excerpts for LLM generation."
             extraction_warning = f"{extraction_warning} {chunk_note}".strip() if extraction_warning else chunk_note
+            audit_warnings.append(chunk_note)
 
         for attempt in range(max_attempts):
             target_mc, target_open = scaled_retry_counts(base_mc, base_open, attempt, args)
@@ -1079,15 +1450,33 @@ def write_exam_folder(
             try:
                 if progress:
                     progress(f"Waiting for Ollama: {pdf_path.name} (attempt {attempt + 1}/{max_attempts}, {target_mc} MC / {target_open} open)")
+                if debug:
+                    debug(
+                        f"Ollama request: {pdf_path.name} representative attempt {attempt + 1}",
+                        f"endpoint={args.endpoint}\nmodel={args.model}\ntimeout={args.timeout}\n\nPROMPT:\n{prompt}",
+                    )
                 raw = post_ollama(args.endpoint, args.model, prompt, args.timeout)
-                model_exam = load_json_from_model(raw)
+                if debug:
+                    debug(f"Ollama raw response: {pdf_path.name} representative attempt {attempt + 1}", raw)
+                model_exam = load_json_from_model(
+                    raw,
+                    debug=debug,
+                    context=f"{pdf_path.name} representative attempt {attempt + 1}",
+                    audit_warnings=audit_warnings,
+                )
                 exam = normalize_exam(model_exam, course, pdf_path.name, extraction_warning, word_count)
+                attach_question_metadata(exam["multiple_choice"], prompt_text, "representative-001")
+                attach_question_metadata(exam["open_ended"], prompt_text, "representative-001")
                 exam = apply_coverage_metadata(exam, "representative", 1, 1, 0, None)
+                exam = apply_exam_audit(exam, pdf_path.name, text, page_count, 1, 1, 0, audit_warnings)
                 if progress:
                     progress(f"Ollama returned usable exam JSON for {pdf_path.name}")
                 break
             except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError, OSError) as exc:
                 last_error = exc
+                audit_warnings.append(f"Representative attempt {attempt + 1} failed validation or parsing: {type(exc).__name__}: {exc}")
+                if debug:
+                    debug(f"Ollama/JSON error: {pdf_path.name} representative attempt {attempt + 1}", f"{type(exc).__name__}: {exc}")
                 if attempt < max_attempts - 1:
                     message = f"RETRY {attempt + 1}/{args.retries} for {pdf_path.name}: {exc}"
                     print(message, flush=True)
@@ -1102,6 +1491,26 @@ def write_exam_folder(
         if progress:
             progress(f"Using fallback inspection exam for {pdf_path.name}")
         exam = heuristic_exam(course, pdf_path.name, text, extraction_warning, word_count)
+        attach_question_metadata(exam["multiple_choice"], text, "heuristic-001")
+        attach_question_metadata(exam["open_ended"], text, "heuristic-001")
+        audit_warnings.append("Heuristic fallback exam generated after model output could not be used.")
+        exam = apply_coverage_metadata(exam, "heuristic", 1, 1, 0, None)
+        exam = apply_exam_audit(exam, pdf_path.name, text, page_count, 1, 1, 0, audit_warnings)
+
+    if "audit" not in exam:
+        metadata = exam.get("metadata", {})
+        exam = apply_exam_audit(
+            exam,
+            pdf_path.name,
+            text,
+            page_count,
+            int(metadata.get("source_chunk_count") or 1),
+            int(metadata.get("processed_chunk_count") or 1),
+            int(metadata.get("failed_chunk_count") or 0),
+            audit_warnings,
+        )
+    if debug:
+        debug(f"AUDIT SUMMARY: {pdf_path.name}", format_audit_summary(exam["audit"]))
 
     if exam_dir.exists() and args.overwrite:
         shutil.rmtree(exam_dir)

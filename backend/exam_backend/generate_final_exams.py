@@ -12,7 +12,7 @@ import textwrap
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import generate_exams
 
@@ -21,6 +21,7 @@ DEFAULT_ENDPOINT = "http://localhost:11434/api/chat"
 DEFAULT_MODEL = "gemma4:31b-cloud"
 BLUEPRINT_CHARS = 30000
 QUESTION_SOURCE_CHARS = 18000
+DebugLogger = Callable[[str, str], None]
 
 
 FINAL_SYSTEM_PROMPT = """You are an expert university final-exam writer.
@@ -77,6 +78,7 @@ def source_entries(course_dir: Path) -> list[dict[str, Any]]:
             continue
         data = json.loads(exam_json.read_text(encoding="utf-8"))
         metadata = data.get("metadata", {})
+        audit = data.get("audit") if isinstance(data.get("audit"), dict) else {}
         text = source_path.read_text(encoding="utf-8", errors="replace").strip()
         words = count_words(text)
         entries.append(
@@ -86,6 +88,8 @@ def source_entries(course_dir: Path) -> list[dict[str, Any]]:
                 "text": text,
                 "words": words,
                 "warning": metadata.get("text_extraction_warning"),
+                "pages_total": int(audit.get("pages_total") or 0),
+                "visuals_detected": int(audit.get("visuals_detected") or 0),
             }
         )
     return entries
@@ -160,22 +164,25 @@ def post_ollama(endpoint: str, model: str, system_prompt: str, user_prompt: str,
     return response_data.get("response", "")
 
 
-def parse_json(raw: str) -> dict[str, Any]:
-    raw = raw.strip()
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start < 0 or end <= start:
-            raise
-        parsed = json.loads(raw[start : end + 1])
+def parse_json(
+    raw: str,
+    debug: DebugLogger | None = None,
+    context: str = "model response",
+    audit_warnings: list[str] | None = None,
+) -> dict[str, Any]:
+    parsed = generate_exams.load_json_from_model(raw, debug=debug, context=context, audit_warnings=audit_warnings)
     if not isinstance(parsed, dict):
         raise ValueError("Model JSON response is not an object.")
     return parsed
 
 
-def call_json(args: argparse.Namespace, user_prompt: str, context: str) -> dict[str, Any]:
+def call_json(
+    args: argparse.Namespace,
+    user_prompt: str,
+    context: str,
+    debug: DebugLogger | None = None,
+    audit_warnings: list[str] | None = None,
+) -> dict[str, Any]:
     last_error: Exception | None = None
     for attempt in range(max(0, args.retries) + 1):
         prompt = user_prompt
@@ -185,18 +192,38 @@ def call_json(args: argparse.Namespace, user_prompt: str, context: str) -> dict[
                 "The previous response was invalid or incomplete. Return one complete valid JSON object only. "
                 "No markdown, no trailing commas, no comments, no prose outside JSON."
             )
+        raw = ""
         try:
+            if debug:
+                debug(
+                    f"Ollama request: {context} attempt {attempt + 1}",
+                    f"endpoint={args.endpoint}\nmodel={args.model}\ntimeout={args.timeout}\n\nSYSTEM PROMPT:\n{FINAL_SYSTEM_PROMPT}\n\nUSER PROMPT:\n{prompt}",
+                )
             raw = post_ollama(args.endpoint, args.model, FINAL_SYSTEM_PROMPT, prompt, args.timeout)
-            return parse_json(raw)
+            if debug:
+                debug(f"Ollama raw response: {context} attempt {attempt + 1}", raw)
+            return parse_json(raw, debug=debug, context=f"{context} attempt {attempt + 1}", audit_warnings=audit_warnings)
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError, OSError) as exc:
             last_error = exc
+            if debug:
+                debug(
+                    f"Ollama/JSON error: {context} attempt {attempt + 1}",
+                    f"{type(exc).__name__}: {exc}" + (f"\n\nRAW RESPONSE:\n{raw}" if raw else ""),
+                )
             if attempt < max(0, args.retries):
                 print(f"RETRY {attempt + 1}/{args.retries} for {context}: {exc}", flush=True)
                 continue
     raise RuntimeError(f"Could not get valid JSON for {context}: {last_error}") from last_error
 
 
-def build_blueprint(args: argparse.Namespace, course: str, entries: list[dict[str, Any]], aggregate: str) -> dict[str, Any]:
+def build_blueprint(
+    args: argparse.Namespace,
+    course: str,
+    entries: list[dict[str, Any]],
+    aggregate: str,
+    debug: DebugLogger | None = None,
+    audit_warnings: list[str] | None = None,
+) -> dict[str, Any]:
     chunks = chunk_text(aggregate, BLUEPRINT_CHARS)
     chunk_blueprints = []
     for index, chunk in enumerate(chunks, start=1):
@@ -225,7 +252,7 @@ SOURCE CHUNK:
 <<<SOURCE
 {chunk}
 SOURCE>>>"""
-        data = call_json(args, prompt, f"{course} blueprint chunk {index}")
+        data = call_json(args, prompt, f"{course} blueprint chunk {index}", debug=debug, audit_warnings=audit_warnings)
         chunk_blueprints.append(data)
         print(f"BLUEPRINT {course}: chunk {index}/{len(chunks)}", flush=True)
 
@@ -435,7 +462,15 @@ SOURCE EXCERPT FOR THIS BATCH:
 SOURCE>>>"""
 
 
-def generate_mc(args: argparse.Namespace, course: str, blueprint: dict[str, Any], source_chunks: list[str], target: int) -> list[dict[str, Any]]:
+def generate_mc(
+    args: argparse.Namespace,
+    course: str,
+    blueprint: dict[str, Any],
+    source_chunks: list[str],
+    target: int,
+    debug: DebugLogger | None = None,
+    audit_warnings: list[str] | None = None,
+) -> list[dict[str, Any]]:
     questions: list[dict[str, Any]] = []
     seen: set[str] = set()
     batch_index = 0
@@ -449,22 +484,37 @@ def generate_mc(args: argparse.Namespace, course: str, blueprint: dict[str, Any]
             excerpt = selected_source_for_batch(source_chunks, batch_index - 1)
             stems = [question["question"] for question in questions]
             try:
-                data = call_json(args, mc_prompt(course, blueprint, excerpt, count, batch_index, stems), f"{course} MC batch {batch_index} ({count})")
+                data = call_json(
+                    args,
+                    mc_prompt(course, blueprint, excerpt, count, batch_index, stems),
+                    f"{course} MC batch {batch_index} ({count})",
+                    debug=debug,
+                    audit_warnings=audit_warnings,
+                )
                 break
             except RuntimeError as exc:
                 smaller = max(5, count // 2)
                 if smaller == count:
                     print(f"MC {course}: abandoning batch {batch_index} after JSON failures: {exc}", flush=True)
+                    if audit_warnings is not None:
+                        audit_warnings.append(f"Final MC batch {batch_index} failed: {exc}")
                     break
                 print(f"MC {course}: reducing batch {batch_index} from {count} to {smaller} after JSON failure", flush=True)
+                if audit_warnings is not None:
+                    audit_warnings.append(f"Final MC batch {batch_index} reduced from {count} to {smaller} after JSON failure: {exc}")
                 count = smaller
         if data is None:
             empty_batches += 1
             if empty_batches >= 3:
                 break
             continue
-        new_questions = normalize_mc(data.get("multiple_choice"), seen)
+        raw_questions = data.get("multiple_choice")
+        new_questions = normalize_mc(raw_questions, seen)
+        generate_exams.attach_question_metadata(new_questions, excerpt, f"final-mc-batch-{batch_index:03d}")
         questions.extend(new_questions)
+        raw_count = len(raw_questions) if isinstance(raw_questions, list) else 0
+        if audit_warnings is not None and raw_count > len(new_questions):
+            audit_warnings.append(f"Discarded {raw_count - len(new_questions)} duplicate or invalid final MC generation(s) in batch {batch_index}.")
         print(f"MC {course}: {len(questions)}/{target}", flush=True)
         if not new_questions:
             empty_batches += 1
@@ -477,7 +527,15 @@ def generate_mc(args: argparse.Namespace, course: str, blueprint: dict[str, Any]
     return questions[:target]
 
 
-def generate_open(args: argparse.Namespace, course: str, blueprint: dict[str, Any], source_chunks: list[str], target: int) -> list[dict[str, Any]]:
+def generate_open(
+    args: argparse.Namespace,
+    course: str,
+    blueprint: dict[str, Any],
+    source_chunks: list[str],
+    target: int,
+    debug: DebugLogger | None = None,
+    audit_warnings: list[str] | None = None,
+) -> list[dict[str, Any]]:
     questions: list[dict[str, Any]] = []
     seen: set[str] = set()
     batch_index = 0
@@ -491,22 +549,37 @@ def generate_open(args: argparse.Namespace, course: str, blueprint: dict[str, An
             excerpt = selected_source_for_batch(source_chunks, batch_index + 3)
             stems = [question["question"] for question in questions]
             try:
-                data = call_json(args, open_prompt(course, blueprint, excerpt, count, batch_index, stems), f"{course} open batch {batch_index} ({count})")
+                data = call_json(
+                    args,
+                    open_prompt(course, blueprint, excerpt, count, batch_index, stems),
+                    f"{course} open batch {batch_index} ({count})",
+                    debug=debug,
+                    audit_warnings=audit_warnings,
+                )
                 break
             except RuntimeError as exc:
                 smaller = max(2, count // 2)
                 if smaller == count:
                     print(f"OPEN {course}: abandoning batch {batch_index} after JSON failures: {exc}", flush=True)
+                    if audit_warnings is not None:
+                        audit_warnings.append(f"Final open batch {batch_index} failed: {exc}")
                     break
                 print(f"OPEN {course}: reducing batch {batch_index} from {count} to {smaller} after JSON failure", flush=True)
+                if audit_warnings is not None:
+                    audit_warnings.append(f"Final open batch {batch_index} reduced from {count} to {smaller} after JSON failure: {exc}")
                 count = smaller
         if data is None:
             empty_batches += 1
             if empty_batches >= 3:
                 break
             continue
-        new_questions = normalize_open(data.get("open_ended"), seen)
+        raw_questions = data.get("open_ended")
+        new_questions = normalize_open(raw_questions, seen)
+        generate_exams.attach_question_metadata(new_questions, excerpt, f"final-open-batch-{batch_index:03d}")
         questions.extend(new_questions)
+        raw_count = len(raw_questions) if isinstance(raw_questions, list) else 0
+        if audit_warnings is not None and raw_count > len(new_questions):
+            audit_warnings.append(f"Discarded {raw_count - len(new_questions)} duplicate or invalid final open generation(s) in batch {batch_index}.")
         print(f"OPEN {course}: {len(questions)}/{target}", flush=True)
         if not new_questions:
             empty_batches += 1
@@ -535,7 +608,7 @@ def adaptive_targets(args: argparse.Namespace, entries: list[dict[str, Any]], to
     return mc, open_count, warning
 
 
-def write_final_exam(args: argparse.Namespace, course_dir: Path) -> dict[str, Any] | None:
+def write_final_exam(args: argparse.Namespace, course_dir: Path, debug: DebugLogger | None = None) -> dict[str, Any] | None:
     final_dir = course_dir / "exams" / "final-exam"
     if final_dir.exists() and not args.overwrite:
         print(f"SKIP existing final: {final_dir}", flush=True)
@@ -552,10 +625,33 @@ def write_final_exam(args: argparse.Namespace, course_dir: Path) -> dict[str, An
     weak_count = sum(1 for entry in entries if entry["warning"] or entry["words"] < 800)
     target_mc, target_open, target_warning = adaptive_targets(args, entries, total_words, weak_count)
     source_chunks = chunk_text(aggregate, QUESTION_SOURCE_CHARS)
-    blueprint = build_blueprint(args, course, entries, aggregate)
+    audit_warnings = [
+        f"Included source warning for {entry['source_pdf']}: {entry['warning']}"
+        for entry in entries
+        if entry.get("warning")
+    ]
+    audit_warnings.append("Final exam combines multiple source decks; page coverage is approximate and per-source audits remain the detailed reference.")
+    if debug:
+        debug(
+            f"Final source summary: {course}",
+            json.dumps(
+                {
+                    "course": course,
+                    "source_count": len(entries),
+                    "total_words": total_words,
+                    "weak_source_count": weak_count,
+                    "target_mc": target_mc,
+                    "target_open": target_open,
+                    "source_chunks": len(source_chunks),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+    blueprint = build_blueprint(args, course, entries, aggregate, debug=debug, audit_warnings=audit_warnings)
 
-    mc_questions = generate_mc(args, course, blueprint, source_chunks, target_mc)
-    open_questions = generate_open(args, course, blueprint, source_chunks, target_open)
+    mc_questions = generate_mc(args, course, blueprint, source_chunks, target_mc, debug=debug, audit_warnings=audit_warnings)
+    open_questions = generate_open(args, course, blueprint, source_chunks, target_open, debug=debug, audit_warnings=audit_warnings)
     if not mc_questions or not open_questions:
         raise RuntimeError(f"Final exam for {course} did not produce usable questions.")
 
@@ -564,6 +660,7 @@ def write_final_exam(args: argparse.Namespace, course_dir: Path) -> dict[str, An
         warnings.append(
             f"Generated {len(mc_questions)} MC and {len(open_questions)} open questions instead of target {args.target_mc}/{args.target_open}; source quality or model output limited the final."
         )
+    audit_warnings.extend(warnings)
 
     exam = {
         "metadata": {
@@ -593,6 +690,21 @@ def write_final_exam(args: argparse.Namespace, course_dir: Path) -> dict[str, An
         "multiple_choice": mc_questions,
         "open_ended": open_questions,
     }
+    pages_total = sum(int(entry.get("pages_total") or 0) for entry in entries)
+    visuals_detected = sum(int(entry.get("visuals_detected") or 0) for entry in entries)
+    exam = generate_exams.apply_exam_audit(
+        exam,
+        "Final exam from all course source decks",
+        aggregate,
+        pages_total or None,
+        len(source_chunks),
+        len(source_chunks),
+        0,
+        audit_warnings,
+        visuals_detected=visuals_detected or None,
+    )
+    if debug:
+        debug(f"AUDIT SUMMARY: final exam {course}", generate_exams.format_audit_summary(exam["audit"]))
 
     if final_dir.exists() and args.overwrite:
         shutil.rmtree(final_dir)
