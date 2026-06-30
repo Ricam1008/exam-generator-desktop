@@ -120,10 +120,10 @@ cd exam-generator-desktop
 
 If the repository is private, the GitHub account must have access first.
 
-### 7. Install The Python PDF Dependency
+### 7. Install The Python PDF Dependencies
 
 ```bash
-python3 -m pip install --user pypdf
+python3 -m pip install --user pypdf pdfplumber
 ```
 
 ### 8. Install App Dependencies
@@ -226,10 +226,10 @@ cd exam-generator-desktop
 
 If the repository is private, the GitHub account must have access first.
 
-### 7. Install The Python PDF Dependency
+### 7. Install The Python PDF Dependencies
 
 ```powershell
-python -m pip install --user pypdf
+python -m pip install --user pypdf pdfplumber
 ```
 
 ### 8. Install App Dependencies
@@ -309,13 +309,13 @@ ollama pull gemma4:31b-cloud
 On Mac:
 
 ```bash
-python3 -m pip install --user pypdf
+python3 -m pip install --user pypdf pdfplumber
 ```
 
 On Windows:
 
 ```powershell
-python -m pip install --user pypdf
+python -m pip install --user pypdf pdfplumber
 ```
 
 ### App Dependencies Are Missing

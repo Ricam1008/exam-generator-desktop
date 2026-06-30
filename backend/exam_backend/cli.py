@@ -211,11 +211,13 @@ def check_dependencies(output_path: str | None = None, model: str = DEFAULT_MODE
     ok = ok and templates_ok
 
     pypdf_ok = importlib.util.find_spec("pypdf") is not None
+    pdfplumber_ok = importlib.util.find_spec("pdfplumber") is not None
+    pdf_detail = "pypdf and pdfplumber available" if pdfplumber_ok else "pypdf available; pdfplumber missing, table/layout extraction will be weaker"
     checks.append({
         "id": "pypdf",
-        "label": "PDF text extractor",
+        "label": "PDF text and layout extractor",
         "ok": pypdf_ok,
-        "detail": "pypdf available" if pypdf_ok else "Run: python3 -m pip install --user pypdf",
+        "detail": pdf_detail if pypdf_ok else "Run: python3 -m pip install --user pypdf pdfplumber",
     })
     ok = ok and pypdf_ok
 

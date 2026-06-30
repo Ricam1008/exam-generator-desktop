@@ -116,6 +116,7 @@ Keep established technical terms, theory names, study names, author names, formu
 Focus on definitions, models, theories, central findings, distinctions between similar concepts, examples, applications, and likely exam-relevant lecture material.
 Avoid duplicate, trivial, or overly easy questions.
 Distractors must be plausible and based on common misconceptions or nearby concepts from the source material.
+Formula and JSON safety: prefer plain-text formula notation over LaTeX commands. If a JSON string must contain a backslash, emit it as a doubled JSON backslash.
 
 Return valid JSON only. No markdown. No prose outside JSON."""
 
@@ -140,6 +141,10 @@ Question counts:
 - Create exactly {target_mc} multiple-choice questions if the source text supports it.
 - Create exactly {target_open} open-ended questions if the source text supports it.
 - If the source text is too thin or repetitive, create fewer high-quality questions and rely on the metadata warning.
+
+Source handling:
+- Treat [TABLE ...] blocks as structured source evidence; preserve row/column relationships when creating questions.
+- If a chart, curve, or graphic is only visible visually and not described in the extracted text or table blocks, do not invent its details.
 
 Multiple-choice requirements:
 - Write question text, options, explanations, topics, expected answers, key concepts, and rubrics in German.
@@ -243,6 +248,45 @@ def extract_with_pypdf(pdf_path: Path) -> tuple[str, int | None] | None:
     return "\n\n".join(page_text), len(reader.pages)
 
 
+def clean_table_cell(cell: Any, max_chars: int = 240) -> str:
+    clean = re.sub(r"\s+", " ", str(cell or "")).strip()
+    if len(clean) > max_chars:
+        return f"{clean[:max_chars].rstrip()} ..."
+    return clean
+
+
+def format_pdf_table(page_number: int, table_index: int, table: list[list[Any]]) -> str:
+    rows = []
+    for row in table:
+        clean_row = [clean_table_cell(cell) for cell in row]
+        if any(clean_row):
+            rows.append(clean_row)
+
+    if len(rows) < 2:
+        return ""
+
+    width = min(max(len(row) for row in rows), 8)
+    normalized = [(row + [""] * width)[:width] for row in rows]
+    header = normalized[0]
+    if not any(header):
+        header = [f"Column {index + 1}" for index in range(width)]
+
+    lines = [f"[TABLE page={page_number} index={table_index}]"]
+    lines.append("Columns: " + " | ".join(cell or f"Column {index + 1}" for index, cell in enumerate(header)))
+    for row_number, row in enumerate(normalized[1:61], start=1):
+        values = []
+        for cell_index, value in enumerate(row):
+            if value:
+                column = header[cell_index] or f"Column {cell_index + 1}"
+                values.append(f"{column}={value}")
+        if values:
+            lines.append(f"Row {row_number}: " + "; ".join(values))
+    if len(normalized) > 61:
+        lines.append(f"... {len(normalized) - 61} more rows")
+    lines.append("[/TABLE]")
+    return "\n".join(lines)
+
+
 def extract_with_pdfplumber(pdf_path: Path) -> tuple[str, int | None] | None:
     try:
         import pdfplumber  # type: ignore
@@ -251,8 +295,26 @@ def extract_with_pdfplumber(pdf_path: Path) -> tuple[str, int | None] | None:
 
     page_text = []
     with pdfplumber.open(str(pdf_path)) as pdf:
-        for page in pdf.pages:
-            page_text.append(page.extract_text() or "")
+        for page_number, page in enumerate(pdf.pages, start=1):
+            sections = []
+            extracted_text = page.extract_text() or ""
+            if extracted_text.strip():
+                sections.append(f"[PAGE {page_number} TEXT]\n{extracted_text}")
+
+            try:
+                tables = page.extract_tables() or []
+            except Exception:
+                tables = []
+            formatted_tables = [
+                formatted
+                for table_index, table in enumerate(tables, start=1)
+                if (formatted := format_pdf_table(page_number, table_index, table))
+            ]
+            if formatted_tables:
+                sections.append(f"[PAGE {page_number} TABLES]\n" + "\n\n".join(formatted_tables))
+
+            if sections:
+                page_text.append(f"--- Page {page_number} ---\n" + "\n\n".join(sections))
         return "\n\n".join(page_text), len(pdf.pages)
 
 
@@ -288,8 +350,8 @@ def clean_extracted_text(text: str) -> str:
 
 def extract_pdf_text(pdf_path: Path) -> tuple[str, str | None, int | None]:
     attempts = [
-        ("pypdf", extract_with_pypdf),
         ("pdfplumber", extract_with_pdfplumber),
+        ("pypdf", extract_with_pypdf),
         ("pdftotext", extract_with_pdftotext),
         ("strings fallback", extract_with_strings),
     ]
@@ -309,6 +371,8 @@ def extract_pdf_text(pdf_path: Path) -> tuple[str, str | None, int | None]:
             warning = None
             if name == "strings fallback":
                 warning = "Text extraction used a rough fallback; question quality may be weak. Install pypdf or Poppler/pdftotext for better extraction."
+            elif name == "pypdf":
+                warning = "PDF layout/table extraction was unavailable; table structure and visual chart details may be underrepresented. Install pdfplumber for better table extraction."
             elif words < LOW_TEXT_WORD_THRESHOLD:
                 warning = f"Only {words} words were extracted; this PDF may contain scanned slides, images, or little text."
             return text, warning, page_count
@@ -423,16 +487,55 @@ def post_ollama(endpoint: str, model: str, prompt: str, timeout: int) -> str:
     return parsed.get("response", "")
 
 
+def escape_invalid_json_backslashes(raw: str) -> str:
+    repaired: list[str] = []
+    index = 0
+    simple_escapes = {'"', "\\", "/", "b", "f", "n", "r", "t"}
+    hex_digits = set("0123456789abcdefABCDEF")
+
+    while index < len(raw):
+        char = raw[index]
+        if char != "\\":
+            repaired.append(char)
+            index += 1
+            continue
+
+        next_char = raw[index + 1] if index + 1 < len(raw) else ""
+        if next_char in simple_escapes:
+            repaired.append(raw[index : index + 2])
+            index += 2
+            continue
+        if next_char == "u" and index + 5 < len(raw) and all(item in hex_digits for item in raw[index + 2 : index + 6]):
+            repaired.append(raw[index : index + 6])
+            index += 6
+            continue
+
+        repaired.append("\\\\")
+        index += 1
+
+    return "".join(repaired)
+
+
+def load_model_json_candidate(raw: str) -> dict[str, Any]:
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        repaired = escape_invalid_json_backslashes(raw)
+        if repaired == raw:
+            raise
+        return json.loads(repaired)
+
+
 def load_json_from_model(raw: str) -> dict[str, Any]:
     raw = raw.strip()
     try:
-        return json.loads(raw)
+        return load_model_json_candidate(raw)
     except json.JSONDecodeError:
         start = raw.find("{")
         end = raw.rfind("}")
         if start == -1 or end == -1 or end <= start:
             raise
-        return json.loads(raw[start : end + 1])
+        return load_model_json_candidate(raw[start : end + 1])
 
 
 def call_json_with_retries(args: argparse.Namespace, prompt: str, context: str, progress: Callable[[str], None] | None = None) -> dict[str, Any]:
@@ -442,7 +545,8 @@ def call_json_with_retries(args: argparse.Namespace, prompt: str, context: str, 
         if attempt:
             retry_prompt += (
                 "\n\nSTRICT RETRY INSTRUCTION:\n"
-                "Return one complete valid JSON object only. No markdown, no comments, no prose outside JSON."
+                "Return one complete valid JSON object only. No markdown, no comments, no prose outside JSON. "
+                "Do not use single-backslash LaTeX commands inside JSON strings; use plain text or doubled JSON backslashes."
             )
         try:
             if progress:
@@ -671,6 +775,7 @@ Chunk: {chunk_index} of {chunk_count}
 
 Write notes in German, preserving established technical terms, study names, formulas, and author names where useful.
 Focus on exam-relevant definitions, theories, models, findings, distinctions, examples, applications, and conceptual traps.
+Treat [TABLE ...] blocks as structured source evidence. Do not invent details from charts or graphics that are not present in the extracted text or table blocks.
 
 Return JSON only:
 {{
@@ -715,6 +820,10 @@ Question counts:
 Language requirements:
 - Write questions, options, explanations, expected answers, key concepts, and rubrics in German.
 - Preserve established technical terms, model names, formulas, author names, and source quotations in the original language where appropriate.
+
+Source handling:
+- Treat [TABLE ...] blocks as structured source evidence; preserve row/column relationships when creating questions.
+- If a chart, curve, or graphic is only visible visually and not described in the extracted text or table blocks, do not invent its details.
 
 Multiple-choice requirements:
 - True multiple-choice, not single-choice.

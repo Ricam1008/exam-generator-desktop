@@ -121,6 +121,32 @@ class BackendSafetyTests(unittest.TestCase):
         self.assertLess(mc, 40)
         self.assertLess(open_count, 10)
 
+    def test_model_json_accepts_unescaped_formula_backslashes(self) -> None:
+        raw = r'{"coverage_notes":[{"topic":"Kostenfunktion \Delta K","exam_targets":["Gewinn \pi = R-C"],"common_traps":["Zeile\nbleibt Escape"],"source_area":"S. 3"}]}'
+
+        parsed = generate_exams.load_json_from_model(raw)
+
+        note = parsed["coverage_notes"][0]
+        self.assertEqual(note["topic"], "Kostenfunktion \\Delta K")
+        self.assertEqual(note["exam_targets"], ["Gewinn \\pi = R-C"])
+        self.assertEqual(note["common_traps"], ["Zeile\nbleibt Escape"])
+
+    def test_pdf_tables_are_formatted_as_structured_source_blocks(self) -> None:
+        formatted = generate_exams.format_pdf_table(
+            7,
+            2,
+            [
+                ["Preis", "Nachfrage", "Angebot"],
+                ["10", "80", "40"],
+                ["20", "50", "70"],
+            ],
+        )
+
+        self.assertIn("[TABLE page=7 index=2]", formatted)
+        self.assertIn("Columns: Preis | Nachfrage | Angebot", formatted)
+        self.assertIn("Row 1: Preis=10; Nachfrage=80; Angebot=40", formatted)
+        self.assertIn("[/TABLE]", formatted)
+
     def test_normalize_accepts_common_question_key_aliases(self) -> None:
         model_exam = {
             "mc_questions": [
