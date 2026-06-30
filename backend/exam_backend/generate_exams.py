@@ -119,6 +119,7 @@ EXAM_JSON_SCHEMA: dict[str, Any] = {
                 "properties": {
                     "id": {"type": "string"},
                     "topic": {"type": "string"},
+                    "answer_mode": {"type": "string", "enum": ["single_correct", "multiple_correct"]},
                     "question": {"type": "string"},
                     "options": {
                         "type": "array",
@@ -134,6 +135,7 @@ EXAM_JSON_SCHEMA: dict[str, Any] = {
                         },
                     },
                     "explanation": {"type": "string"},
+                    "_meta": {"type": "object"},
                 },
             },
         },
@@ -158,6 +160,7 @@ EXAM_JSON_SCHEMA: dict[str, Any] = {
                     "grading_rubric": {"type": "object"},
                     "rubric_template": {"type": "string"},
                     "max_score": {"type": "integer", "const": 100},
+                    "_meta": {"type": "object"},
                 },
             },
         },
@@ -205,16 +208,23 @@ Question counts:
 Source handling:
 - Treat [TABLE ...] blocks as structured source evidence; preserve row/column relationships when creating questions.
 - If a chart, curve, or graphic is only visible visually and not described in the extracted text or table blocks, do not invent its details.
+- Return per-question _meta where possible. evidence_pages must only contain pages that directly support the question. If exact pages are unknown, use [].
+- source_excerpt should be a short source-backed phrase, formula, table row summary, or sentence where possible.
+- source_type must be one of text, formula, table, diagram, mixed, unknown. Use unknown when unsure.
 
 Multiple-choice requirements:
 - Write question text, options, explanations, topics, expected answers, key concepts, and rubrics in German.
 - Preserve established technical terms, model names, formulas, and source quotations in the original language where appropriate.
-- True multiple-choice, not single-choice.
+- Use the source to decide whether each MC question is single_correct or multiple_correct. Do not enforce a global ratio.
 - Each question has 4 to 6 options.
 - Each option has a hardcoded boolean is_correct.
 - There may be one correct answer, several correct answers, all correct, or none correct, but only when justified by the source.
+- Include answer_mode: "single_correct" when exactly one option is correct, otherwise "multiple_correct".
 - Include a short explanation for each MC question.
 - Do not make every question have the same number of correct options.
+- Prefer a balanced exam-like mix: basic recall, conceptual traps, application questions, calculation/formula questions, and graph/table/diagram interpretation where the source supports it.
+- Include plausible near-miss distractors and common formula, sign, graph-reading, or concept-swap mistakes when source-supported.
+- Do not make every question hard and do not make every question a trap.
 
 Open-ended requirements:
 - Each open question has max_score 100.
@@ -245,10 +255,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing exam folders.")
     parser.add_argument("--only-folder", help="Generate only PDFs inside a folder with this name.")
     parser.add_argument("--limit", type=int, help="Generate at most this many exams. Useful for the first inspection pass.")
-    parser.add_argument("--min-mc", type=int, default=40)
-    parser.add_argument("--max-mc", type=int, default=60)
-    parser.add_argument("--min-open", type=int, default=10)
-    parser.add_argument("--max-open", type=int, default=20)
+    parser.add_argument("--target-mode", choices=["auto", "manual"], default="auto")
+    parser.add_argument("--target-mc", type=int, help="Manual multiple-choice target. Requires --target-mode manual.")
+    parser.add_argument("--target-open", type=int, help="Manual open-ended target. Requires --target-mode manual.")
+    parser.add_argument("--min-mc", type=int, default=None, help="Lower safety bound for auto MC targets.")
+    parser.add_argument("--max-mc", type=int, default=None, help="Upper safety bound for auto MC targets.")
+    parser.add_argument("--min-open", type=int, default=None, help="Lower safety bound for auto open-ended targets.")
+    parser.add_argument("--max-open", type=int, default=None, help="Upper safety bound for auto open-ended targets.")
     parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT)
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--timeout", type=int, default=600, help="LLM request timeout in seconds.")
@@ -714,32 +727,192 @@ def distribute_counts(total: int, buckets: int) -> list[int]:
     return [base + (1 if index < remainder else 0) for index in range(buckets)]
 
 
-def target_counts(words: int, args: argparse.Namespace) -> tuple[int, int]:
-    if words < LOW_TEXT_WORD_THRESHOLD:
-        return min(12, args.min_mc), min(4, args.min_open)
-    if words < MIN_WORDS_FOR_FULL_EXAM:
-        return min(25, args.min_mc), min(8, args.min_open)
-    if words < 6000:
-        mc = args.min_mc
-        open_count = args.min_open
-    elif words < 12000:
-        mc = round((args.min_mc + args.max_mc) / 2)
-        open_count = round((args.min_open + args.max_open) / 2)
+def positive_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def clamp_optional(value: int, minimum: int | None, maximum: int | None) -> int:
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return max(0, value)
+
+
+def formula_marker_count(text: str) -> int:
+    return len(
+        re.findall(
+            r"(?:[a-zA-ZÄÖÜäöüß]\s*=\s*[^,\n;.]{1,40})|[πΠΔ∂Σ√∫≤≥→←]|\\(?:Delta|pi|sum|frac)|\bformel\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def repetition_ratio(text: str) -> float:
+    words = [word.casefold() for word in re.findall(r"\b[\wÄÖÜäöüß-]{3,}\b", text)]
+    if not words:
+        return 1.0
+    return len(set(words)) / len(words)
+
+
+def resolve_target_plan(
+    text: str,
+    word_count: int,
+    page_count: int | None,
+    chunk_count: int,
+    coverage_mode: str,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    inferred_pages = source_pages_from_text(text)
+    pages = int(page_count or 0)
+    if pages <= 0 and inferred_pages:
+        pages = max(inferred_pages)
+    chunks = max(1, int(chunk_count or 1))
+    markers = visual_markers_from_text(text)
+    visuals = max(0, detected_visual_count(text))
+    tables = max(0, int(markers.get("tables") or 0))
+    formulas = formula_marker_count(text)
+    formula_density = round(formulas / max(1, word_count) * 1000, 4)
+    target_mode = str(getattr(args, "target_mode", "auto") or "auto").strip()
+    target_mc = positive_int(getattr(args, "target_mc", None))
+    target_open = positive_int(getattr(args, "target_open", None))
+    min_mc = positive_int(getattr(args, "min_mc", None))
+    max_mc = positive_int(getattr(args, "max_mc", None))
+    min_open = positive_int(getattr(args, "min_open", None))
+    max_open = positive_int(getattr(args, "max_open", None))
+
+    exact_pair_manual = (
+        min_mc is not None
+        and max_mc is not None
+        and min_open is not None
+        and max_open is not None
+        and min_mc == max_mc
+        and min_open == max_open
+    )
+    explicit_manual = target_mode == "manual" and target_mc is not None and target_open is not None
+    if explicit_manual or exact_pair_manual:
+        mc = target_mc if explicit_manual else min_mc
+        open_count = target_open if explicit_manual else min_open
+        assert mc is not None and open_count is not None
+        return {
+            "mode": "manual",
+            "page_count": pages,
+            "word_count": max(0, int(word_count)),
+            "chunk_count": chunks,
+            "visuals_detected": visuals,
+            "tables_detected": tables,
+            "formula_density": formula_density,
+            "target_multiple_choice": max(0, int(mc)),
+            "target_open_ended": max(0, int(open_count)),
+            "reason": "manual targets from explicit target values" if explicit_manual else "manual targets from exact min/max pairs",
+        }
+    if target_mode == "manual":
+        raise ValueError("target_mode=manual requires --target-mc and --target-open, or exact min/max pairs.")
+
+    size_basis = pages if pages > 0 else max(1, round(word_count / 450))
+    if pages > 0:
+        tiny_source = size_basis <= 2
+        small_source = size_basis <= 8
+        medium_source = size_basis <= 25
+        large_source = size_basis <= 60
     else:
-        mc = args.max_mc
-        open_count = args.max_open
-    mc = max(args.min_mc, min(args.max_mc, mc))
-    open_count = max(args.min_open, min(args.max_open, open_count))
-    return mc, open_count
+        tiny_source = word_count < LOW_TEXT_WORD_THRESHOLD
+        small_source = word_count < MIN_WORDS_FOR_FULL_EXAM
+        medium_source = word_count < 9000
+        large_source = word_count < 22000
+    if tiny_source:
+        bucket = "tiny"
+        mc, open_count = 10, 4
+        bucket_range = "1-2 pages or very low word count"
+    elif small_source:
+        bucket = "small"
+        mc, open_count = 20, 6
+        bucket_range = "3-8 pages or short source"
+    elif medium_source:
+        bucket = "medium"
+        mc, open_count = 38, 13
+        bucket_range = "9-25 pages or medium source"
+    elif large_source:
+        bucket = "large"
+        mc, open_count = 58, 21
+        bucket_range = "26-60 pages or large source"
+    else:
+        bucket = "very_large"
+        mc, open_count = 68, 24
+        bucket_range = "very large capped source"
+
+    adjustment = 0
+    density_notes: list[str] = []
+    if tables or visuals >= 4:
+        adjustment += 2
+        density_notes.append("visual/table evidence")
+    if formula_density >= 2.0:
+        adjustment += 2
+        density_notes.append("formula-dense source")
+    if chunks >= 4 and bucket in {"medium", "large", "very_large"}:
+        adjustment += min(4, chunks // 2)
+        density_notes.append("many source chunks")
+    if repetition_ratio(text) < 0.18:
+        adjustment -= 3
+        density_notes.append("high repetition")
+    if word_count < 350:
+        adjustment -= 2
+        density_notes.append("very sparse text")
+
+    mc = clamp_optional(mc + adjustment, None, 70)
+    open_count = clamp_optional(open_count + round(adjustment / 3), None, 25)
+    mc = max(5, mc)
+    open_count = max(2, open_count)
+
+    had_bounds = any(value is not None for value in [min_mc, max_mc, min_open, max_open])
+    bounded_mc = clamp_optional(mc, min_mc, max_mc)
+    bounded_open = clamp_optional(open_count, min_open, max_open)
+    mode = "auto_with_bounds" if had_bounds and (bounded_mc != mc or bounded_open != open_count) else "auto"
+    if had_bounds and mode == "auto":
+        mode = "auto_with_bounds"
+    reason = f"{bucket} planner bucket from {bucket_range}; coverage_mode={coverage_mode}"
+    if density_notes:
+        reason += "; adjusted for " + ", ".join(density_notes)
+    if mode == "auto_with_bounds":
+        reason += "; clamped by configured bounds"
+    return {
+        "mode": mode,
+        "page_count": pages,
+        "word_count": max(0, int(word_count)),
+        "chunk_count": chunks,
+        "visuals_detected": visuals,
+        "tables_detected": tables,
+        "formula_density": formula_density,
+        "target_multiple_choice": bounded_mc,
+        "target_open_ended": bounded_open,
+        "reason": reason,
+    }
+
+
+def target_counts(words: int, args: argparse.Namespace) -> tuple[int, int]:
+    plan = resolve_target_plan("", words, None, 1, str(getattr(args, "coverage_mode", "auto") or "auto"), args)
+    return int(plan["target_multiple_choice"]), int(plan["target_open_ended"])
 
 
 def scaled_retry_counts(mc: int, open_count: int, attempt: int, args: argparse.Namespace) -> tuple[int, int]:
     if attempt <= 0:
         return mc, open_count
     factor = 0.85 if attempt == 1 else 0.7
-    retry_mc = max(8, int(round(mc * factor)))
-    retry_open = max(3, int(round(open_count * factor)))
-    return min(args.max_mc, retry_mc), min(args.max_open, retry_open)
+    retry_mc = max(1, int(round(mc * factor)))
+    retry_open = max(1, int(round(open_count * factor)))
+    return (
+        clamp_optional(retry_mc, None, positive_int(getattr(args, "max_mc", None))),
+        clamp_optional(retry_open, None, positive_int(getattr(args, "max_open", None))),
+    )
 
 
 def source_pages_from_text(text: str) -> list[int]:
@@ -779,14 +952,13 @@ def source_type_from_text(text: str) -> str:
 
 
 def question_source_meta(source_text: str, chunk_id: str) -> dict[str, Any]:
-    source_type = source_type_from_text(source_text)
     pages = source_pages_from_text(source_text)
     return {
         "chunk_id": chunk_id,
         "chunk_page_range": pages,
         "evidence_pages": [],
         "source_excerpt": None,
-        "source_type": source_type,
+        "source_type": "unknown",
         "visual_required": False,
         "source_pages": [],
     }
@@ -807,7 +979,7 @@ def attach_question_metadata(questions: list[dict[str, Any]], source_text: str, 
             merged["source_pages"] = list(merged["evidence_pages"])
             excerpt = existing.get("source_excerpt")
             merged["source_excerpt"] = str(excerpt).strip()[:500] if excerpt else None
-            source_type = str(existing.get("source_type") or merged["source_type"]).strip()
+            source_type = str(existing.get("source_type") or "unknown").strip()
             if source_type in {"text", "formula", "table", "diagram", "mixed", "unknown"}:
                 merged["source_type"] = source_type
             merged["visual_required"] = bool(existing.get("visual_required", False))
@@ -849,43 +1021,153 @@ def question_text_blob(question: dict[str, Any]) -> str:
 def is_calculation_question(question: dict[str, Any]) -> bool:
     blob = question_text_blob(question)
     has_number_or_formula = bool(re.search(r"\d|[=+\-*/%πΠΔ∂Σ√∫≤≥]", blob))
-    has_calculation_word = bool(
+    requires_calculation = bool(
         re.search(
-            r"\b(berechne|berechnen|rechnung|calculation|calculate|preis|menge|kosten|erlös|gewinn|elastizität|welfare|überschuss|gleichgewicht)\b",
+            r"\b(berechne|berechnen|berechnet|bestimme|ermittle|rechne|calculation|calculate|derive|solve|algebraisch|numerisch)\b",
             blob,
             flags=re.IGNORECASE,
         )
     )
-    return has_number_or_formula and has_calculation_word
+    return has_number_or_formula and requires_calculation
 
 
 def is_diagram_question(question: dict[str, Any]) -> bool:
     meta = question.get("_meta") if isinstance(question.get("_meta"), dict) else {}
-    if meta.get("source_type") in {"diagram", "table", "mixed"}:
+    return meta.get("source_type") == "diagram" or bool(meta.get("visual_required"))
+
+
+def is_formula_question(question: dict[str, Any]) -> bool:
+    meta = question.get("_meta") if isinstance(question.get("_meta"), dict) else {}
+    blob = question_text_blob(question)
+    if meta.get("source_type") == "formula":
         return True
+    has_symbolic_formula = bool(
+        re.search(r"[a-zA-ZÄÖÜäöüß]\s*=\s*[^,\n;.]{1,40}|[πΠΔ∂Σ√∫≤≥]|\\(?:Delta|pi|sum|frac)", blob, flags=re.IGNORECASE)
+    )
+    centers_formula = bool(
+        re.search(
+            r"\b(formel|gleichung|funktion|ableitung|transform|anwenden|erkläre|wähle)\b",
+            blob,
+            flags=re.IGNORECASE,
+        )
+    )
+    return has_symbolic_formula and centers_formula
+
+
+def is_definition_question(question: dict[str, Any]) -> bool:
+    blob = question_text_blob(question)
     return bool(
         re.search(
-            r"\b(abbildung|diagramm|grafik|graph|kurve|chart|figure|achsen|interpretier|verschiebung)\b",
-            question_text_blob(question),
+            r"\b(definiere|definition|was ist|was versteht man|begriff|bezeichnet|nenne)\b",
+            blob,
             flags=re.IGNORECASE,
         )
     )
 
 
-def question_distribution(exam: dict[str, Any]) -> dict[str, int]:
-    mc = ensure_list(exam.get("multiple_choice"))
-    open_ended = ensure_list(exam.get("open_ended"))
-    questions = [question for question in mc + open_ended if isinstance(question, dict)]
-    distribution = {
-        "multiple_choice": len(mc),
-        "open_ended": len(open_ended),
+def is_application_question(question: dict[str, Any]) -> bool:
+    blob = question_text_blob(question)
+    return bool(
+        re.search(
+            r"\b(anwend|szenario|fall|beispiel|unternehmen|markt|situation|gegeben|use-case|praxis|folge für)\b",
+            blob,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def question_counts(exam: dict[str, Any]) -> dict[str, int]:
+    return {
+        "multiple_choice": len(ensure_list(exam.get("multiple_choice"))),
+        "open_ended": len(ensure_list(exam.get("open_ended"))),
     }
-    diagram_count = sum(1 for question in questions if is_diagram_question(question))
-    calculation_count = sum(1 for question in questions if is_calculation_question(question))
-    if diagram_count:
-        distribution["diagram_interpretation"] = diagram_count
-    if calculation_count:
-        distribution["calculation"] = calculation_count
+
+
+def skill_tags(exam: dict[str, Any]) -> dict[str, int]:
+    tags = {
+        "conceptual": 0,
+        "definition": 0,
+        "application": 0,
+        "formula": 0,
+        "calculation": 0,
+        "diagram_interpretation": 0,
+    }
+    for question in exam_questions(exam):
+        tagged = False
+        if is_definition_question(question):
+            tags["definition"] += 1
+            tagged = True
+        if is_application_question(question):
+            tags["application"] += 1
+            tagged = True
+        if is_formula_question(question):
+            tags["formula"] += 1
+            tagged = True
+        if is_calculation_question(question):
+            tags["calculation"] += 1
+            tagged = True
+        if is_diagram_question(question):
+            tags["diagram_interpretation"] += 1
+            tagged = True
+        if not tagged or re.search(r"\b(warum|erkläre|beziehung|unterschied|wirkung|konzept|theorie)\b", question_text_blob(question), flags=re.IGNORECASE):
+            tags["conceptual"] += 1
+    return tags
+
+
+def answer_mode_for_mc(question: dict[str, Any]) -> str:
+    explicit = str(question.get("answer_mode") or "").strip()
+    if explicit in {"single_correct", "multiple_correct"}:
+        return explicit
+    correct_count = sum(1 for option in ensure_list(question.get("options")) if isinstance(option, dict) and bool(option.get("is_correct")))
+    return "single_correct" if correct_count == 1 else "multiple_correct"
+
+
+def answer_modes(exam: dict[str, Any]) -> dict[str, int]:
+    counts = {"single_correct": 0, "multiple_correct": 0, "free_text": 0}
+    for question in ensure_list(exam.get("multiple_choice")):
+        if isinstance(question, dict):
+            counts[answer_mode_for_mc(question)] += 1
+    counts["free_text"] = len(ensure_list(exam.get("open_ended")))
+    return counts
+
+
+def source_traceability(exam: dict[str, Any]) -> dict[str, int]:
+    questions = exam_questions(exam)
+    with_evidence = 0
+    with_excerpt = 0
+    mc_without = 0
+    open_without = 0
+    for collection_name, collection in [("mc", ensure_list(exam.get("multiple_choice"))), ("open", ensure_list(exam.get("open_ended")))]:
+        for question in collection:
+            if not isinstance(question, dict):
+                continue
+            meta = question.get("_meta") if isinstance(question.get("_meta"), dict) else {}
+            has_evidence = bool(ensure_list(meta.get("evidence_pages")))
+            if has_evidence:
+                with_evidence += 1
+            elif collection_name == "mc":
+                mc_without += 1
+            else:
+                open_without += 1
+            if str(meta.get("source_excerpt") or "").strip():
+                with_excerpt += 1
+    return {
+        "questions_total": len(questions),
+        "questions_with_evidence_pages": with_evidence,
+        "questions_without_evidence_pages": len(questions) - with_evidence,
+        "mc_without_evidence_pages": mc_without,
+        "open_without_evidence_pages": open_without,
+        "questions_with_source_excerpt": with_excerpt,
+    }
+
+
+def question_distribution(exam: dict[str, Any]) -> dict[str, int]:
+    distribution = question_counts(exam)
+    tags = skill_tags(exam)
+    if tags["diagram_interpretation"]:
+        distribution["diagram_interpretation"] = tags["diagram_interpretation"]
+    if tags["calculation"]:
+        distribution["calculation"] = tags["calculation"]
     return distribution
 
 
@@ -923,6 +1205,7 @@ def apply_exam_audit(
     timing: dict[str, Any] | None = None,
     repair_generation: dict[str, Any] | None = None,
     pages_covered_by_chunks: list[int] | None = None,
+    target_planning: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     inferred_pages = source_pages_from_text(source_text)
     total_pages = int(pages_total or 0)
@@ -990,6 +1273,23 @@ def apply_exam_audit(
         "chunks_total": max(0, int(chunks_total)),
         "chunks_processed": max(0, int(chunks_processed)),
         "chunks_failed": max(0, int(chunks_failed)),
+        "target_planning": target_planning
+        or {
+            "mode": "unknown",
+            "page_count": total_pages,
+            "word_count": count_words(source_text),
+            "chunk_count": max(0, int(chunks_total)),
+            "visuals_detected": detected,
+            "tables_detected": int(visual_markers_from_text(source_text).get("tables") or 0),
+            "formula_density": round(formula_marker_count(source_text) / max(1, count_words(source_text)) * 1000, 4),
+            "target_multiple_choice": len(ensure_list(exam.get("multiple_choice"))),
+            "target_open_ended": len(ensure_list(exam.get("open_ended"))),
+            "reason": "target planning metadata was not supplied",
+        },
+        "question_counts": question_counts(exam),
+        "skill_tags": skill_tags(exam),
+        "answer_modes": answer_modes(exam),
+        "source_traceability": source_traceability(exam),
         "question_distribution": question_distribution(exam),
         "topic_distribution": topic_distribution(exam),
         "repair_generation": repair_generation
@@ -1034,11 +1334,38 @@ def format_audit_summary(audit: dict[str, Any]) -> str:
         "Visuals:",
         f"{audit.get('visuals_used', 0)} / {audit.get('visuals_detected', 0)} used",
         "",
-        "Question distribution:",
+        "Target planning:",
     ]
-    question_counts = audit.get("question_distribution")
-    if isinstance(question_counts, dict) and question_counts:
-        lines.extend(dotted(str(key), value) for key, value in question_counts.items())
+    target_plan = audit.get("target_planning")
+    if isinstance(target_plan, dict) and target_plan:
+        lines.extend(
+            [
+                dotted("mode", target_plan.get("mode", "unknown")),
+                dotted("target MC", target_plan.get("target_multiple_choice", 0)),
+                dotted("target open", target_plan.get("target_open_ended", 0)),
+            ]
+        )
+    else:
+        lines.append("None")
+
+    lines.extend(["", "Question counts:"])
+    counts = audit.get("question_counts") or audit.get("question_distribution")
+    if isinstance(counts, dict) and counts:
+        lines.extend(dotted(str(key), value) for key, value in counts.items())
+    else:
+        lines.append("None")
+
+    tags = audit.get("skill_tags")
+    lines.extend(["", "Skill tags:"])
+    if isinstance(tags, dict) and tags:
+        lines.extend(dotted(str(key), value) for key, value in tags.items())
+    else:
+        lines.append("None")
+
+    modes = audit.get("answer_modes")
+    lines.extend(["", "Answer modes:"])
+    if isinstance(modes, dict) and modes:
+        lines.extend(dotted(str(key), value) for key, value in modes.items())
     else:
         lines.append("None")
 
@@ -1254,15 +1581,19 @@ def normalize_mc_items(raw_questions: Any, existing: set[str]) -> list[dict[str,
                 options.append({"text": option_text, "is_correct": bool(option.get("is_correct", False))})
         if len(options) < 4:
             continue
-        questions.append(
-            {
-                "id": "",
-                "topic": str(raw.get("topic") or "").strip(),
-                "question": question_text,
-                "options": options,
-                "explanation": explanation,
-            }
-        )
+        normalized = {
+            "id": "",
+            "topic": str(raw.get("topic") or "").strip(),
+            "question": question_text,
+            "options": options,
+            "explanation": explanation,
+        }
+        answer_mode = str(raw.get("answer_mode") or "").strip()
+        if answer_mode in {"single_correct", "multiple_correct"}:
+            normalized["answer_mode"] = answer_mode
+        if isinstance(raw.get("_meta"), dict):
+            normalized["_meta"] = raw["_meta"]
+        questions.append(normalized)
         existing.add(signature)
     return questions
 
@@ -1335,6 +1666,9 @@ def normalize_exam(
             "options": options,
             "explanation": str(question.get("explanation") or "").strip(),
         }
+        answer_mode = str(question.get("answer_mode") or "").strip()
+        if answer_mode in {"single_correct", "multiple_correct"}:
+            normalized_mc["answer_mode"] = answer_mode
         if isinstance(question.get("_meta"), dict):
             normalized_mc["_meta"] = question["_meta"]
         mc_questions.append(normalized_mc)
@@ -1451,13 +1785,19 @@ Source handling:
 - coverage_notes must summarize the exam-relevant coverage behind the generated questions.
 - If you generate any question, coverage_notes must contain at least one note.
 - evidence_pages in per-question _meta should include only pages that directly support the question. If exact evidence pages are unknown, use an empty array.
+- source_excerpt should be a short source-backed phrase, formula, table row summary, or sentence where possible.
+- source_type must be one of text, formula, table, diagram, mixed, unknown. Use unknown when unsure.
 - chunk_page_range is broad provenance, not exact evidence.
 
 Multiple-choice requirements:
-- True multiple-choice, not single-choice.
+- Use the source to decide whether each MC question is single_correct or multiple_correct. Do not enforce a global ratio.
 - Each question has 4 to 6 options.
 - Every option has a hardcoded boolean is_correct.
+- Include answer_mode: "single_correct" when exactly one option is correct, otherwise "multiple_correct".
 - Distractors must be plausible and source-adjacent.
+- Prefer a balanced exam-like mix: basic recall, conceptual traps, application questions, calculation/formula questions, and graph/table/diagram interpretation where the source supports it.
+- Useful traps include near-miss distractors, common formula mistakes, sign mistakes, confusing similar concepts, MC/TC swaps, fixed-cost/marginal-cost mistakes, Pmax via P=0 instead of Q=0, Cournot/Bertrand swaps, substitution/income-effect swaps, normal/inferior/Giffen confusion, elastic/inelastic revenue direction mistakes, monopoly P/MR/MC confusion, and graph-reading traps when supported.
+- Do not make every question hard and do not make every question a trap.
 
 Open-ended requirements:
 - Each open question has topic, question_type "open_ended", expected_answer, key_concepts, rubric_template, and max_score 100.
@@ -1494,6 +1834,7 @@ Return exactly this JSON shape:
         {{"text": "string", "is_correct": false}},
         {{"text": "string", "is_correct": true}}
       ],
+      "answer_mode": "multiple_correct",
       "explanation": "string",
       "_meta": {{
         "evidence_pages": [],
@@ -1565,6 +1906,14 @@ Use the coverage notes as planning context, but rely only on the source text for
 
 Open-ended questions must use one rubric_template key from:
 {rubric_templates}
+
+Question quality:
+- Prefer a balanced exam-like MC mix: recall, conceptual traps, application, formula/calculation, and graph/table/diagram interpretation where the source supports it.
+- Use plausible near-miss distractors and common source-supported mistakes, but do not make every question hard or trap-based.
+- Use answer_mode "single_correct" or "multiple_correct" per MC question based on the actual correct options. Do not enforce a fixed ratio.
+- Return per-question _meta where possible: evidence_pages, source_excerpt, source_type, visual_required.
+- evidence_pages must only contain pages that directly support the question; use [] when exact pages are unknown.
+- source_type must be one of text, formula, table, diagram, mixed, unknown; use unknown when unsure.
 
 Strict JSON output:
 - Return only valid JSON.
@@ -1938,7 +2287,9 @@ def generate_full_coverage_exam(
     chunking_started = time.perf_counter()
     chunks = chunk_text(text)
     add_seconds(timing, "chunking_seconds", chunking_started)
-    target_mc, target_open = target_counts(word_count, args)
+    target_planning = resolve_target_plan(text, word_count, pages_total, len(chunks), "full_coverage", args)
+    target_mc = int(target_planning["target_multiple_choice"])
+    target_open = int(target_planning["target_open_ended"])
     mc_targets = distribute_counts(target_mc, len(chunks))
     open_targets = distribute_counts(target_open, len(chunks))
     max_parallel_chunks = min(normalize_max_parallel_chunks(args), max(1, len(chunks)))
@@ -2033,7 +2384,7 @@ def generate_full_coverage_exam(
     )
 
     too_many_failed = failed_chunks > len(chunks) // 2
-    if processed_chunks == 0 or too_many_failed or len(mc_questions) < args.min_mc or len(open_questions) < args.min_open:
+    if processed_chunks == 0 or too_many_failed or not mc_questions or not open_questions:
         raise RuntimeError(
             f"Full-coverage generation failed for {source_pdf}: processed {processed_chunks}/{len(chunks)} chunks, "
             f"generated {len(mc_questions)} MC and {len(open_questions)} open questions."
@@ -2067,6 +2418,7 @@ def generate_full_coverage_exam(
         timing=timing,
         repair_generation=repair_generation,
         pages_covered_by_chunks=sorted(pages_covered_by_chunks),
+        target_planning=target_planning,
     )
 
 
@@ -2177,11 +2529,11 @@ def write_exam_folder(
     audit_warnings: list[str] = []
     if extraction_warning:
         audit_warnings.append(f"Extraction warning: {extraction_warning}")
-    base_mc, base_open = target_counts(word_count, args)
     last_error: Exception | None = None
     exam: dict[str, Any] | None = None
     max_attempts = max(0, args.retries) + 1
     coverage_mode = resolve_coverage_mode(text, args)
+    target_planning: dict[str, Any] | None = None
 
     if coverage_mode == "full_coverage":
         if progress:
@@ -2195,6 +2547,9 @@ def write_exam_folder(
             chunk_note = "Long PDF text was chunked into representative excerpts for LLM generation."
             extraction_warning = f"{extraction_warning} {chunk_note}".strip() if extraction_warning else chunk_note
             audit_warnings.append(chunk_note)
+        target_planning = resolve_target_plan(text, word_count, page_count, max(1, len(chunk_text(text))), coverage_mode, args)
+        base_mc = int(target_planning["target_multiple_choice"])
+        base_open = int(target_planning["target_open_ended"])
 
         for attempt in range(max_attempts):
             target_mc, target_open = scaled_retry_counts(base_mc, base_open, attempt, args)
@@ -2233,7 +2588,7 @@ def write_exam_folder(
                 attach_question_metadata(exam["open_ended"], prompt_text, "representative-001")
                 exam = apply_coverage_metadata(exam, "representative", 1, 1, 0, None)
                 add_seconds(timing, "validation_seconds", validation_started)
-                exam = apply_exam_audit(exam, pdf_path.name, text, page_count, 1, 1, 0, audit_warnings, timing=timing)
+                exam = apply_exam_audit(exam, pdf_path.name, text, page_count, 1, 1, 0, audit_warnings, timing=timing, target_planning=target_planning)
                 if progress:
                     progress(f"Ollama returned usable exam JSON for {pdf_path.name}")
                 break
@@ -2260,7 +2615,9 @@ def write_exam_folder(
         attach_question_metadata(exam["open_ended"], text, "heuristic-001")
         audit_warnings.append("Heuristic fallback exam generated after model output could not be used.")
         exam = apply_coverage_metadata(exam, "heuristic", 1, 1, 0, None)
-        exam = apply_exam_audit(exam, pdf_path.name, text, page_count, 1, 1, 0, audit_warnings, timing=timing)
+        if target_planning is None:
+            target_planning = resolve_target_plan(text, word_count, page_count, max(1, len(chunk_text(text))), coverage_mode, args)
+        exam = apply_exam_audit(exam, pdf_path.name, text, page_count, 1, 1, 0, audit_warnings, timing=timing, target_planning=target_planning)
 
     if "audit" not in exam:
         metadata = exam.get("metadata", {})
@@ -2274,6 +2631,7 @@ def write_exam_folder(
             int(metadata.get("failed_chunk_count") or 0),
             audit_warnings,
             timing=timing,
+            target_planning=target_planning,
         )
 
     if exam_dir.exists() and args.overwrite:

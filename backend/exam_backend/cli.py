@@ -479,12 +479,11 @@ def materialize_input(input_path: str, output_path: str, overwrite: bool = False
 
 
 def generator_args(root: Path, overwrite: bool = False, example: bool = False, model: str = DEFAULT_MODEL) -> argparse.Namespace:
-    min_mc, max_mc = (12, 20) if example else (40, 60)
-    min_open, max_open = (4, 8) if example else (10, 20)
     coverage_mode = "representative" if example else "auto"
     return argparse.Namespace(
         root=str(root), overwrite=overwrite, only_folder=None, limit=None,
-        min_mc=min_mc, max_mc=max_mc, min_open=min_open, max_open=max_open,
+        target_mode="auto", target_mc=None, target_open=None,
+        min_mc=None, max_mc=None, min_open=None, max_open=None,
         endpoint="http://localhost:11434/api/chat", model=(model or DEFAULT_MODEL).strip() or DEFAULT_MODEL,
         timeout=600, retries=3, allow_heuristic_fallback=True, coverage_mode=coverage_mode, max_parallel_chunks=2,
     )

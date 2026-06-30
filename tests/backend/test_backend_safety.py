@@ -193,8 +193,11 @@ class BackendSafetyTests(unittest.TestCase):
     def test_desktop_example_uses_smaller_ai_request_and_fallback(self) -> None:
         args = generator_args(Path("/tmp/example"), example=True, model="llama3.1:8b")
 
-        self.assertEqual((args.min_mc, args.max_mc), (12, 20))
-        self.assertEqual((args.min_open, args.max_open), (4, 8))
+        self.assertEqual(args.target_mode, "auto")
+        self.assertIsNone(args.target_mc)
+        self.assertIsNone(args.target_open)
+        self.assertEqual((args.min_mc, args.max_mc), (None, None))
+        self.assertEqual((args.min_open, args.max_open), (None, None))
         self.assertTrue(args.allow_heuristic_fallback)
         self.assertEqual(args.coverage_mode, "representative")
         self.assertEqual(args.model, "llama3.1:8b")
@@ -204,6 +207,9 @@ class BackendSafetyTests(unittest.TestCase):
         args = generator_args(Path("/tmp/example"), example=False, model="qwen2.5:14b")
 
         self.assertEqual(args.coverage_mode, "auto")
+        self.assertEqual(args.target_mode, "auto")
+        self.assertEqual((args.min_mc, args.max_mc), (None, None))
+        self.assertEqual((args.min_open, args.max_open), (None, None))
         self.assertEqual(args.model, "qwen2.5:14b")
         self.assertEqual(args.max_parallel_chunks, 2)
 
@@ -318,6 +324,46 @@ class BackendSafetyTests(unittest.TestCase):
         self.assertEqual(generate_exams.resolve_coverage_mode("short", args), "representative")
         self.assertEqual(generate_exams.resolve_coverage_mode("x" * (generate_exams.MAX_PROMPT_TEXT_CHARS + 1), args), "full_coverage")
 
+    def test_target_planner_scales_tiny_sources_down(self) -> None:
+        args = SimpleNamespace(target_mode="auto", target_mc=None, target_open=None, min_mc=None, max_mc=None, min_open=None, max_open=None)
+        text = "--- Page 1 ---\n[PAGE 1 TEXT]\n" + "alpha beta gamma " * 40
+
+        plan = generate_exams.resolve_target_plan(text, generate_exams.count_words(text), 1, 1, "representative", args)
+
+        self.assertEqual(plan["mode"], "auto")
+        self.assertLessEqual(plan["target_multiple_choice"], 12)
+        self.assertLessEqual(plan["target_open_ended"], 4)
+
+    def test_target_planner_scales_large_sources_up_and_caps(self) -> None:
+        args = SimpleNamespace(target_mode="auto", target_mc=None, target_open=None, min_mc=None, max_mc=None, min_open=None, max_open=None)
+        large_pages = "\n\n".join(f"--- Page {page} ---\n[PAGE {page} TEXT]\n" + "alpha beta gamma " * 80 for page in range(1, 31))
+        very_large_pages = "\n\n".join(f"--- Page {page} ---\n[PAGE {page} TEXT]\n" + "alpha beta gamma " * 120 for page in range(1, 90))
+
+        large = generate_exams.resolve_target_plan(large_pages, generate_exams.count_words(large_pages), 30, 6, "full_coverage", args)
+        very_large = generate_exams.resolve_target_plan(very_large_pages, generate_exams.count_words(very_large_pages), 89, 12, "full_coverage", args)
+
+        self.assertGreaterEqual(large["target_multiple_choice"], 40)
+        self.assertGreaterEqual(large["target_open_ended"], 12)
+        self.assertLessEqual(very_large["target_multiple_choice"], 70)
+        self.assertLessEqual(very_large["target_open_ended"], 25)
+
+    def test_target_planner_respects_bounds_and_manual_modes(self) -> None:
+        bounded_args = SimpleNamespace(target_mode="auto", target_mc=None, target_open=None, min_mc=10, max_mc=12, min_open=3, max_open=4)
+        manual_args = SimpleNamespace(target_mode="manual", target_mc=7, target_open=2, min_mc=None, max_mc=None, min_open=None, max_open=None)
+        exact_pair_args = SimpleNamespace(target_mode="auto", target_mc=None, target_open=None, min_mc=9, max_mc=9, min_open=3, max_open=3)
+        text = "alpha beta gamma " * 2000
+
+        bounded = generate_exams.resolve_target_plan(text, generate_exams.count_words(text), 12, 4, "full_coverage", bounded_args)
+        manual = generate_exams.resolve_target_plan(text, generate_exams.count_words(text), 12, 4, "full_coverage", manual_args)
+        exact_pair = generate_exams.resolve_target_plan(text, generate_exams.count_words(text), 12, 4, "full_coverage", exact_pair_args)
+
+        self.assertEqual(bounded["mode"], "auto_with_bounds")
+        self.assertEqual((bounded["target_multiple_choice"], bounded["target_open_ended"]), (12, 4))
+        self.assertEqual(manual["mode"], "manual")
+        self.assertEqual((manual["target_multiple_choice"], manual["target_open_ended"]), (7, 2))
+        self.assertEqual(exact_pair["mode"], "manual")
+        self.assertEqual((exact_pair["target_multiple_choice"], exact_pair["target_open_ended"]), (9, 3))
+
     def test_audit_tracks_pages_chunks_question_metadata_and_summary(self) -> None:
         source_text = "\n\n".join(
             [
@@ -332,6 +378,7 @@ class BackendSafetyTests(unittest.TestCase):
                     {
                         "topic": "Nachfrage",
                         "question": "Welche Aussage zur Tabelle stimmt?",
+                        "answer_mode": "multiple_correct",
                         "options": [
                             {"text": "A", "is_correct": True},
                             {"text": "B", "is_correct": False},
@@ -371,18 +418,32 @@ class BackendSafetyTests(unittest.TestCase):
         self.assertAlmostEqual(audit["coverage_ratio_evidence"], 0.0, places=3)
         self.assertEqual(audit["chunks_total"], 2)
         self.assertEqual(audit["chunks_processed"], 2)
+        self.assertEqual(audit["question_counts"]["multiple_choice"], 1)
+        self.assertEqual(audit["question_counts"]["open_ended"], 1)
+        self.assertEqual(audit["answer_modes"], {"single_correct": 0, "multiple_correct": 1, "free_text": 1})
+        self.assertEqual(audit["source_traceability"]["questions_total"], 2)
+        self.assertEqual(audit["source_traceability"]["questions_without_evidence_pages"], 2)
+        self.assertEqual(audit["source_traceability"]["mc_without_evidence_pages"], 1)
+        self.assertEqual(audit["source_traceability"]["open_without_evidence_pages"], 1)
+        self.assertEqual(audit["skill_tags"]["formula"], 1)
+        self.assertEqual(audit["skill_tags"]["calculation"], 0)
         self.assertEqual(audit["question_distribution"]["multiple_choice"], 1)
         self.assertEqual(audit["question_distribution"]["open_ended"], 1)
         self.assertIn("validation warning", audit["warnings"])
         self.assertEqual(exam["multiple_choice"][0]["_meta"]["chunk_page_range"], [1])
         self.assertEqual(exam["multiple_choice"][0]["_meta"]["evidence_pages"], [])
         self.assertEqual(exam["multiple_choice"][0]["_meta"]["chunk_id"], "chunk-001")
+        self.assertEqual(exam["multiple_choice"][0]["answer_mode"], "multiple_correct")
 
         summary = generate_exams.format_audit_summary(audit)
         self.assertIn("AUDIT SUMMARY", summary)
         self.assertIn("Pages total: 3", summary)
         self.assertIn("Pages covered by chunks: 2", summary)
         self.assertIn("Pages with exact evidence: 0", summary)
+        self.assertIn("Target planning:", summary)
+        self.assertIn("Question counts:", summary)
+        self.assertIn("Skill tags:", summary)
+        self.assertIn("Answer modes:", summary)
         self.assertIn("validation warning", summary)
 
     def test_write_exam_folder_writes_audit_json_and_log_summary(self) -> None:
@@ -962,6 +1023,137 @@ class BackendSafetyTests(unittest.TestCase):
         questions = generate_exams.normalize_mc_items(raw, set())
 
         self.assertEqual(len(questions), 1)
+
+    def test_answer_mode_and_source_metadata_are_preserved_conservatively(self) -> None:
+        raw = [
+            {
+                "topic": "Monopol",
+                "question": "Welche Aussagen stimmen?",
+                "answer_mode": "single_correct",
+                "options": [
+                    {"text": "A", "is_correct": True},
+                    {"text": "B", "is_correct": False},
+                    {"text": "C", "is_correct": False},
+                    {"text": "D", "is_correct": False},
+                ],
+                "explanation": "A ist korrekt.",
+                "_meta": {
+                    "evidence_pages": [2, "3", 0, "x"],
+                    "source_excerpt": "P = MC",
+                    "source_type": "formula",
+                    "visual_required": False,
+                },
+            }
+        ]
+
+        questions = generate_exams.normalize_mc_items(raw, set())
+        generate_exams.attach_question_metadata(questions, "--- Page 2 ---\n[PAGE 2 TEXT]\nFormel und Tabelle [TABLE page=2 index=1]", "chunk-001")
+
+        self.assertEqual(questions[0]["answer_mode"], "single_correct")
+        self.assertEqual(questions[0]["_meta"]["evidence_pages"], [2, 3])
+        self.assertEqual(questions[0]["_meta"]["source_pages"], [2, 3])
+        self.assertEqual(questions[0]["_meta"]["source_excerpt"], "P = MC")
+        self.assertEqual(questions[0]["_meta"]["source_type"], "formula")
+        self.assertEqual(questions[0]["_meta"]["chunk_page_range"], [2])
+
+    def test_missing_source_type_defaults_to_unknown_not_chunk_mixed(self) -> None:
+        questions = [
+            {
+                "question": "Welche Aussage stimmt?",
+                "options": [
+                    {"text": "A", "is_correct": True},
+                    {"text": "B", "is_correct": False},
+                    {"text": "C", "is_correct": False},
+                    {"text": "D", "is_correct": False},
+                ],
+                "explanation": "A.",
+            }
+        ]
+
+        generate_exams.attach_question_metadata(
+            questions,
+            "--- Page 1 ---\n[PAGE 1 TEXT]\nDiagramm, Tabelle und Formel: P = MC.\n[TABLE page=1 index=1]\nColumns: A | B\n[/TABLE]",
+            "chunk-001",
+        )
+
+        self.assertEqual(questions[0]["_meta"]["source_type"], "unknown")
+
+    def test_skill_tags_keep_calculation_and_diagram_classification_strict(self) -> None:
+        exam = {
+            "multiple_choice": [
+                {
+                    "question": "Welche Formel beschreibt den Zusammenhang P = MC?",
+                    "options": [
+                        {"text": "A", "is_correct": True},
+                        {"text": "B", "is_correct": False},
+                        {"text": "C", "is_correct": False},
+                        {"text": "D", "is_correct": False},
+                    ],
+                    "explanation": "Die Formel wird nur erwähnt.",
+                    "_meta": {"source_type": "formula", "visual_required": False},
+                },
+                {
+                    "question": "Berechne den Gewinn bei Preis 10 und Kosten 6.",
+                    "options": [
+                        {"text": "4", "is_correct": True},
+                        {"text": "6", "is_correct": False},
+                        {"text": "10", "is_correct": False},
+                        {"text": "16", "is_correct": False},
+                    ],
+                    "explanation": "10 - 6 = 4.",
+                    "_meta": {"source_type": "text", "visual_required": False},
+                },
+                {
+                    "question": "Interpretiere die Verschiebung der Kurve.",
+                    "options": [
+                        {"text": "A", "is_correct": True},
+                        {"text": "B", "is_correct": False},
+                        {"text": "C", "is_correct": False},
+                        {"text": "D", "is_correct": False},
+                    ],
+                    "explanation": "Die Grafik zeigt die Verschiebung.",
+                    "_meta": {"source_type": "text", "visual_required": False},
+                },
+                {
+                    "question": "Interpretiere die Achsen im Diagramm.",
+                    "options": [
+                        {"text": "A", "is_correct": True},
+                        {"text": "B", "is_correct": False},
+                        {"text": "C", "is_correct": False},
+                        {"text": "D", "is_correct": False},
+                    ],
+                    "explanation": "Das Diagramm stützt A.",
+                    "_meta": {"source_type": "diagram", "visual_required": False},
+                },
+            ],
+            "open_ended": [],
+        }
+
+        tags = generate_exams.skill_tags(exam)
+
+        self.assertEqual(tags["formula"], 1)
+        self.assertEqual(tags["calculation"], 1)
+        self.assertEqual(tags["diagram_interpretation"], 1)
+
+    def test_generation_prompts_have_no_fixed_answer_mode_ratio(self) -> None:
+        prompt = generate_exams.build_generation_prompt("Course", "source.pdf", "P = MC", 4, 2, None)
+        merged = generate_exams.build_merged_chunk_prompt("Course", "source.pdf", "P = MC", 2, 1, 1, 1)
+
+        self.assertNotIn("70/30", prompt)
+        self.assertNotIn("70/30", merged)
+        self.assertIn("Do not enforce a global ratio", prompt)
+        self.assertIn("Do not enforce a global ratio", merged)
+        self.assertIn("source_excerpt", merged)
+
+    def test_student_ui_has_no_new_target_or_answer_mode_controls(self) -> None:
+        app_js = (ROOT / "backend" / "exam_backend" / "templates" / "app.js").read_text(encoding="utf-8")
+        template = (ROOT / "backend" / "exam_backend" / "templates" / "index_template.html").read_text(encoding="utf-8")
+        ui_source = app_js + "\n" + template
+
+        self.assertNotIn("target_mode", ui_source)
+        self.assertNotIn("target-count", ui_source)
+        self.assertNotIn("answer_mode", ui_source)
+        self.assertNotIn("target_planning", ui_source)
 
     def test_job_log_updates_activity_timestamp(self) -> None:
         job = Job(id="test", kind="example")
