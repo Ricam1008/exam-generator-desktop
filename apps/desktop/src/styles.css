@@ -17,6 +17,7 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 button, input, select { font: inherit; }
 button { min-height: 40px; border: 1px solid var(--accent); border-radius: 8px; background: var(--accent); color: white; font-weight: 750; padding: 0 14px; cursor: pointer; }
 button.secondary { background: white; color: var(--accent-dark); }
+button.danger { background: var(--bad); border-color: var(--bad); color: white; }
 button:disabled { opacity: .5; cursor: not-allowed; }
 input { width: 100%; min-height: 42px; border: 1px solid var(--line); border-radius: 8px; padding: 0 12px; color: var(--ink); background: white; }
 select { width: 100%; min-height: 42px; border: 1px solid var(--line); border-radius: 8px; padding: 0 34px 0 12px; color: var(--ink); background: white; }

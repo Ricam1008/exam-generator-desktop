@@ -45,6 +45,7 @@ type Job = {
   logs: string[];
   log_path?: string;
   log_url?: string;
+  cancel_requested?: boolean;
 };
 
 const API = "http://127.0.0.1:8766";
@@ -136,7 +137,8 @@ export default function App() {
     [availableModels, selectedModel],
   );
   const modelReady = Boolean(modelTest?.ok && modelTest.model === selectedModel && selectedModelAvailable);
-  const canGenerate = Boolean(backendReady && coreChecksOk && modelReady && inputPath);
+  const jobRunning = job?.status === "running";
+  const canGenerate = Boolean(backendReady && coreChecksOk && modelReady && inputPath && !jobRunning);
   const modelOptions = useMemo(() => {
     const options = [...availableModels];
     if (selectedModel && !options.includes(selectedModel)) options.unshift(selectedModel);
@@ -236,6 +238,18 @@ export default function App() {
   async function openFullLog() {
     if (!job) return;
     await openUrl(`${API}${job.log_url || `/api/jobs/${job.id}/log`}`);
+  }
+
+  async function stopJob() {
+    if (!job || job.status !== "running") return;
+    setError("");
+    try {
+      const result = await post<{ job: Job }>(`/api/jobs/${job.id}/cancel`, {});
+      setJob(result.job);
+      setNow(Date.now());
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
   }
 
   useEffect(() => {
@@ -422,6 +436,7 @@ export default function App() {
           {job.status === "error" && <p className="error-text">{job.error}</p>}
           <div className="job-actions">
             {job.status === "done" && <button onClick={openPreview}>Open exam index</button>}
+            {job.status === "running" && <button className="danger" onClick={stopJob}>Stop</button>}
             <button className="secondary" onClick={openFullLog}>Open full log</button>
           </div>
           <pre>{job.logs.slice(-12).join("\n")}</pre>

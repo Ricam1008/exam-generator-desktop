@@ -55,6 +55,7 @@ class Job:
     logs: list[str] = field(default_factory=list)
     log_path: str | None = None
     log_url: str | None = None
+    cancel_requested: bool = False
 
 
 class State:
@@ -66,6 +67,21 @@ class State:
 
 
 STATE = State()
+
+
+def is_cancel_requested(job: Job) -> bool:
+    return job.cancel_requested or job.status == "canceled"
+
+
+def request_job_cancel(job: Job) -> bool:
+    if job.status != "running":
+        return False
+    job.cancel_requested = True
+    job.status = "canceled"
+    job.message = "Canceled"
+    job_log(job, "Stop requested; no further PDFs will start. Any active Ollama call may finish in the background.")
+    job_debug(job, "Job canceled", f"status=canceled\ncanceled_at={now_iso()}")
+    return True
 
 
 def slugify(value: str) -> str:
@@ -550,6 +566,9 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
             job_debug(job, "PDF queue", "\n".join(str(pdf) for pdf in pdfs) or "No PDFs found.")
             failures = []
             for index, pdf in enumerate(pdfs, start=1):
+                if is_cancel_requested(job):
+                    job_log(job, "Generation stopped before starting the next PDF")
+                    return
                 job.message = f"Generating {pdf.name}"
                 job.progress = int((index - 1) / total * 90)
                 job_log(job, f"Starting {index}/{total}: {pdf.name}")
@@ -562,6 +581,9 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
                         progress=lambda message: job_log(job, message),
                         debug=debug_log,
                     )
+                    if is_cancel_requested(job):
+                        job_log(job, f"Discarding late result for {pdf.name} after stop request")
+                        return
                     if result:
                         job_debug(job, f"Result metadata: {pdf.name}", json.dumps(result, ensure_ascii=False, indent=2))
                         job_log(job, f"Wrote {result['source_pdf']} ({result['mc_count']} MC, {result['open_count']} open)")
@@ -591,10 +613,16 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
             courses = generate_final_exams.course_dirs(project_root, None)
             total = max(1, len(courses))
             for index, course in enumerate(courses, start=1):
+                if is_cancel_requested(job):
+                    job_log(job, "Generation stopped before starting the next final exam")
+                    return
                 job.message = f"Generating final exam for {course.name}"
                 job.progress = int((index - 1) / total * 90)
                 job_log(job, f"Starting final exam {index}/{total}: {course.name}")
                 result = generate_final_exams.write_final_exam(args, course, debug=debug_log)
+                if is_cancel_requested(job):
+                    job_log(job, f"Discarding late final-exam result for {course.name} after stop request")
+                    return
                 if result:
                     job_debug(job, f"Final result metadata: {course.name}", json.dumps(result, ensure_ascii=False, indent=2))
                     job_log(job, f"Final {result['course']}: {result['mc']} MC, {result['open']} open")
@@ -611,6 +639,9 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
         else:
             raise ValueError(f"Unknown generation mode: {mode}")
 
+        if is_cancel_requested(job):
+            job_log(job, "Generation stopped before completion")
+            return
         job.status = "done"
         job.progress = 100
         job.message = "Done"
@@ -622,6 +653,9 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
         job_log(job, "Done")
         job.result = {"project_root": str(project_root), "index_url": "/preview/exam_index.html"}
     except Exception as exc:
+        if is_cancel_requested(job):
+            job_debug(job, "Job finished", f"status=canceled\nfinished_at={now_iso()}")
+            return
         job.status = "error"
         job.error = str(exc)
         job.message = "Failed"
@@ -685,6 +719,14 @@ class Handler(BaseHTTPRequestHandler):
                 job_log(job, f"Queued {job.kind} generation")
                 threading.Thread(target=run_generation, args=(job, payload), daemon=True).start()
                 json_response(self, 200, {"job_id": job.id})
+            elif parsed_path.path.startswith("/api/jobs/") and parsed_path.path.endswith("/cancel"):
+                job_id = parsed_path.path[len("/api/jobs/"):-len("/cancel")].strip("/")
+                job = STATE.jobs.get(job_id)
+                if not job:
+                    json_response(self, 404, {"error": "Job not found"})
+                    return
+                canceled = request_job_cancel(job)
+                json_response(self, 200, {"ok": True, "canceled": canceled, "job": job.__dict__})
             elif parsed_path.path == "/api/set-preview-root":
                 root = Path(payload.get("root", "")).expanduser().resolve()
                 if not root.is_dir():

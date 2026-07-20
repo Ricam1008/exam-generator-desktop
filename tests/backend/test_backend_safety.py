@@ -1204,6 +1204,90 @@ class BackendSafetyTests(unittest.TestCase):
             self.assertEqual(job.log_path, str(log_path))
             self.assertEqual(job.log_url, "/api/jobs/test/log")
 
+    def test_cancel_job_marks_canceled_and_writes_full_log(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            job = Job(id="cancel", kind="all")
+            log_path = Path(temp) / "generation-cancel.log"
+            cli.attach_job_log_path(job, log_path)
+
+            self.assertTrue(cli.request_job_cancel(job))
+            self.assertEqual(job.status, "canceled")
+            self.assertTrue(job.cancel_requested)
+            self.assertEqual(job.message, "Canceled")
+
+            text = log_path.read_text(encoding="utf-8")
+            self.assertIn("Stop requested", text)
+            self.assertIn("Job canceled", text)
+
+    def test_cancel_endpoint_returns_updated_job(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            class FakePostHandler:
+                def __init__(self, path: str) -> None:
+                    self.path = path
+                    self.headers = {"Content-Length": "0"}
+                    self.rfile = io.BytesIO()
+                    self.status: int | None = None
+                    self.headers_sent: list[tuple[str, str]] = []
+                    self.wfile = io.BytesIO()
+
+                def send_response(self, status: int) -> None:
+                    self.status = status
+
+                def send_header(self, key: str, value: str) -> None:
+                    self.headers_sent.append((key, value))
+
+                def end_headers(self) -> None:
+                    return None
+
+            job = Job(id="endpoint-cancel", kind="all")
+            cli.attach_job_log_path(job, Path(temp) / "generation-endpoint-cancel.log")
+            cli.STATE.jobs[job.id] = job
+            try:
+                handler = FakePostHandler(f"/api/jobs/{job.id}/cancel")
+                cli.Handler.do_POST(handler)  # type: ignore[arg-type]
+                body = json.loads(handler.wfile.getvalue().decode("utf-8"))
+
+                self.assertEqual(handler.status, 200)
+                self.assertTrue(body["ok"])
+                self.assertTrue(body["canceled"])
+                self.assertEqual(body["job"]["status"], "canceled")
+                self.assertTrue(body["job"]["cancel_requested"])
+            finally:
+                cli.STATE.jobs.pop(job.id, None)
+
+    def test_run_generation_stops_before_next_pdf_after_cancel_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            tmp = Path(temp)
+            source = tmp / "source"
+            course = source / "Course"
+            course.mkdir(parents=True)
+            (course / "one.pdf").write_bytes(b"%PDF-1.4\n")
+            (course / "two.pdf").write_bytes(b"%PDF-1.4\n")
+            output = tmp / "out"
+            job = Job(id="stop-loop", kind="all")
+            calls: list[str] = []
+            original_write_exam_folder = cli.generate_exams.write_exam_folder
+
+            def fake_write_exam_folder(pdf_path: Path, *args: object, **kwargs: object) -> dict[str, object]:
+                calls.append(pdf_path.name)
+                cli.request_job_cancel(job)
+                return {
+                    "source_pdf": pdf_path.name,
+                    "exam_dir": str(tmp / "exam"),
+                    "mc_count": 1,
+                    "open_count": 1,
+                }
+
+            try:
+                cli.generate_exams.write_exam_folder = fake_write_exam_folder  # type: ignore[assignment]
+                cli.run_generation(job, {"input_path": str(source), "output_path": str(output), "mode": "all"})
+            finally:
+                cli.generate_exams.write_exam_folder = original_write_exam_folder  # type: ignore[assignment]
+
+            self.assertEqual(calls, ["one.pdf"])
+            self.assertEqual(job.status, "canceled")
+            self.assertTrue(any("Discarding late result for one.pdf after stop request" in line for line in job.logs))
+
     def test_run_generation_failure_writes_fallback_log_with_traceback(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             original_fallback_log_dir = cli.fallback_log_dir
