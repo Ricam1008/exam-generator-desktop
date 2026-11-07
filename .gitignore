@@ -21,3 +21,8 @@ apps/desktop/src-tauri/gen/
 # local env
 .env
 .env.*
+
+# Local analysis and packaged runtimes
+.codebase-memory/
+backend/*.egg-info/
+backend/sidecar-bin/

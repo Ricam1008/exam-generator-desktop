@@ -14,7 +14,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
-import generate_exams
+from exam_backend import generate_exams, runtime
 
 
 DEFAULT_ENDPOINT = "http://localhost:11434/api/chat"
@@ -145,6 +145,10 @@ def selected_source_for_batch(chunks: list[str], batch_index: int, window: int =
 
 
 def post_ollama(endpoint: str, model: str, system_prompt: str, user_prompt: str, timeout: int) -> str:
+    runtime.check_cancel()
+    response = runtime.complete([{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}], timeout, 0.18)
+    if response is not None:
+        return response
     payload = {
         "model": model,
         "stream": False,
@@ -185,6 +189,7 @@ def call_json(
 ) -> dict[str, Any]:
     last_error: Exception | None = None
     for attempt in range(max(0, args.retries) + 1):
+        runtime.check_cancel()
         prompt = user_prompt
         if attempt:
             prompt += (
@@ -278,82 +283,8 @@ def question_signature(text: str) -> str:
     return text[:180]
 
 
-def normalize_mc(raw_questions: Any, existing: set[str]) -> list[dict[str, Any]]:
-    normalized = []
-    if not isinstance(raw_questions, list):
-        return normalized
-    for raw in raw_questions:
-        if not isinstance(raw, dict):
-            continue
-        question_text = str(raw.get("question", "")).strip()
-        explanation = str(raw.get("explanation", "")).strip()
-        if not question_text or not explanation:
-            continue
-        signature = question_signature(question_text)
-        if signature in existing:
-            continue
-        options = []
-        for option in raw.get("options", []):
-            if not isinstance(option, dict):
-                continue
-            option_text = str(option.get("text", "")).strip()
-            if not option_text:
-                continue
-            options.append({"text": option_text, "is_correct": bool(option.get("is_correct", False))})
-        if len(options) < 4:
-            continue
-        normalized.append(
-            {
-                "id": "",
-                "topic": str(raw.get("topic", "")).strip(),
-                "question": question_text,
-                "options": options[:6],
-                "explanation": explanation,
-            }
-        )
-        existing.add(signature)
-    return normalized
-
-
-def normalize_open(raw_questions: Any, existing: set[str]) -> list[dict[str, Any]]:
-    normalized = []
-    if not isinstance(raw_questions, list):
-        return normalized
-    for raw in raw_questions:
-        if not isinstance(raw, dict):
-            continue
-        question_text = str(raw.get("question", "")).strip()
-        expected = str(raw.get("expected_answer", "")).strip()
-        if not question_text or not expected:
-            continue
-        signature = question_signature(question_text)
-        if signature in existing:
-            continue
-        rubric = raw.get("grading_rubric")
-        if not isinstance(rubric, dict):
-            rubric = {
-                "90-100": "Excellent, precise, complete, and well structured.",
-                "76-89": "Good answer with minor gaps.",
-                "61-75": "Solid answer with noticeable gaps.",
-                "41-60": "On topic but incomplete or imprecise.",
-                "21-40": "Partially relevant with major conceptual gaps.",
-                "0-20": "Mostly wrong, vague, or empty.",
-            }
-        concepts = raw.get("key_concepts")
-        if not isinstance(concepts, list):
-            concepts = []
-        normalized.append(
-            {
-                "id": "",
-                "question": question_text,
-                "expected_answer": expected,
-                "key_concepts": [str(item) for item in concepts if str(item).strip()],
-                "grading_rubric": rubric,
-                "max_score": 100,
-            }
-        )
-        existing.add(signature)
-    return normalized
+normalize_mc = generate_exams.normalize_mc_items
+normalize_open = generate_exams.normalize_open_items
 
 
 def mc_prompt(course: str, blueprint: dict[str, Any], source_excerpt: str, count: int, batch_index: int, existing_stems: list[str]) -> str:
@@ -480,7 +411,7 @@ def generate_mc(
         remaining = target - len(questions)
         count = min(args.mc_batch_size, remaining)
         data = None
-        while count >= 5:
+        while count >= 1:
             excerpt = selected_source_for_batch(source_chunks, batch_index - 1)
             stems = [question["question"] for question in questions]
             try:
@@ -493,7 +424,7 @@ def generate_mc(
                 )
                 break
             except RuntimeError as exc:
-                smaller = max(5, count // 2)
+                smaller = max(1, count // 2)
                 if smaller == count:
                     print(f"MC {course}: abandoning batch {batch_index} after JSON failures: {exc}", flush=True)
                     if audit_warnings is not None:
@@ -545,7 +476,7 @@ def generate_open(
         remaining = target - len(questions)
         count = min(args.open_batch_size, remaining)
         data = None
-        while count >= 2:
+        while count >= 1:
             excerpt = selected_source_for_batch(source_chunks, batch_index + 3)
             stems = [question["question"] for question in questions]
             try:
@@ -558,7 +489,7 @@ def generate_open(
                 )
                 break
             except RuntimeError as exc:
-                smaller = max(2, count // 2)
+                smaller = max(1, count // 2)
                 if smaller == count:
                     print(f"OPEN {course}: abandoning batch {batch_index} after JSON failures: {exc}", flush=True)
                     if audit_warnings is not None:
@@ -614,7 +545,9 @@ def write_final_exam(args: argparse.Namespace, course_dir: Path, debug: DebugLog
         print(f"SKIP existing final: {final_dir}", flush=True)
         return None
 
-    entries = source_entries(course_dir)
+    entries = getattr(args, "source_entries", None)
+    if entries is None:
+        entries = source_entries(course_dir)
     if not entries:
         print(f"SKIP no source entries: {course_dir}", flush=True)
         return None
@@ -652,7 +585,7 @@ def write_final_exam(args: argparse.Namespace, course_dir: Path, debug: DebugLog
 
     mc_questions = generate_mc(args, course, blueprint, source_chunks, target_mc, debug=debug, audit_warnings=audit_warnings)
     open_questions = generate_open(args, course, blueprint, source_chunks, target_open, debug=debug, audit_warnings=audit_warnings)
-    if not mc_questions or not open_questions:
+    if (target_mc > 0 and not mc_questions) or (target_open > 0 and not open_questions):
         raise RuntimeError(f"Final exam for {course} did not produce usable questions.")
 
     warnings = [target_warning] if target_warning else []
@@ -706,13 +639,11 @@ def write_final_exam(args: argparse.Namespace, course_dir: Path, debug: DebugLog
     if debug:
         debug(f"AUDIT SUMMARY: final exam {course}", generate_exams.format_audit_summary(exam["audit"]))
 
-    if final_dir.exists() and args.overwrite:
-        shutil.rmtree(final_dir)
-    final_dir.mkdir(parents=True, exist_ok=True)
+    runtime.check_cancel()
+    ctx = runtime.CONTEXT.get() or {}
+    exam["metadata"].update({"language": ctx.get("language", "de"), "provider_id": ctx.get("profile_id"), "model": ctx.get("model", args.model), "profile_snapshot": ctx.get("profile_snapshot")})
     template_dir = Path(__file__).resolve().parent / "templates"
-    (final_dir / "index.html").write_text(generate_exams.render_exam_html(template_dir, exam), encoding="utf-8")
-    (final_dir / "exam.json").write_text(json.dumps(exam, ensure_ascii=False, indent=2), encoding="utf-8")
-    (final_dir / "source.txt").write_text(aggregate, encoding="utf-8")
+    runtime.publish_exam(final_dir, exam, aggregate, lambda data: generate_exams.render_exam_html(template_dir, data))
     print(f"WROTE FINAL {final_dir}", flush=True)
     return {
         "course": course,

@@ -4,6 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import hashlib
+import os
+import secrets
+import tempfile
+import time
 import datetime as dt
 import json
 import math
@@ -23,9 +29,10 @@ from urllib import error, parse, request
 PACKAGE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(PACKAGE_DIR))
 
-import generate_exams  # type: ignore  # noqa: E402
-import generate_final_exams  # type: ignore  # noqa: E402
-import local_server  # type: ignore  # noqa: E402
+from exam_backend import generate_exams, generate_final_exams, local_server, runtime
+
+if __name__ == "__main__":
+    sys.modules["exam_backend.cli"] = sys.modules[__name__]
 
 DEFAULT_MODEL = "gemma4:31b-cloud"
 DEFAULT_OLLAMA = "http://localhost:11434"
@@ -56,6 +63,7 @@ class Job:
     log_path: str | None = None
     log_url: str | None = None
     cancel_requested: bool = False
+    diagnostics: bool = False
 
 
 class State:
@@ -63,7 +71,12 @@ class State:
         self.jobs: dict[str, Job] = {}
         self.preview_root: Path | None = None
         self.selected_model = DEFAULT_MODEL
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
+        self.events: dict[str, threading.Event] = {}
+        self.workspaces: dict[str, dict] = {}
+        self.preview_tokens: dict[str, dict] = {}
+        self.token = secrets.token_urlsafe(32)
+        self.port = 8766
 
 
 STATE = State()
@@ -74,13 +87,16 @@ def is_cancel_requested(job: Job) -> bool:
 
 
 def request_job_cancel(job: Job) -> bool:
-    if job.status != "running":
+    if job.status not in {"running", "stopping"}:
         return False
-    job.cancel_requested = True
-    job.status = "canceled"
-    job.message = "Canceled"
-    job_log(job, "Stop requested; no further PDFs will start. Any active Ollama call may finish in the background.")
-    job_debug(job, "Job canceled", f"status=canceled\ncanceled_at={now_iso()}")
+    with STATE.lock:
+        if job.status not in {"running", "stopping"}:
+            return False
+        job.cancel_requested = True
+        job.status = "stopping"
+        job.message = "Wird gestoppt …"
+        STATE.events.setdefault(job.id, threading.Event()).set()
+    job_log(job, "Stopp angefordert. Ein bereits angenommener Cloud-Auftrag kann trotzdem berechnet werden.")
     return True
 
 
@@ -129,12 +145,21 @@ def append_job_log_file(job: Job, text: str) -> None:
 def job_log(job: Job, message: str) -> None:
     job.updated_at = now_iso()
     stamp = dt.datetime.now().strftime("%H:%M:%S")
-    line = f"{stamp} {message}"
+    line = f"{stamp} {redact_log(message)}"
     job.logs.append(line)
+    job.logs[:] = job.logs[-200:]
     append_job_log_file(job, f"{line}\n")
 
 
+def redact_log(text: str) -> str:
+    import re
+    return re.sub(r"(?i)(bearer\s+|api[_-]?key[\"\s:=]+|refresh_token[\"\s:=]+|access_token[\"\s:=]+)[^\s\",}]+", r"\1[REDACTED]", str(text))
+
+
 def job_debug(job: Job, title: str, content: str) -> None:
+    if not job.diagnostics:
+        return
+    content = redact_log(content)
     stamp = dt.datetime.now().astimezone().isoformat(timespec="seconds")
     append_job_log_file(job, f"\n--- {stamp} {title} ---\n{content}\n--- END {title} ---\n")
 
@@ -189,10 +214,17 @@ def json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[st
 
 
 def read_json(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
+    if handler.headers.get("Transfer-Encoding"):
+        raise ValueError("Transfer-Encoding wird nicht unterstützt.")
     length = int(handler.headers.get("Content-Length", "0") or 0)
-    if length <= 0:
+    if length < 0 or length > 1_048_576:
+        raise ValueError("Anfrage zu groß (maximal 1 MiB).")
+    if not length:
         return {}
-    return json.loads(handler.rfile.read(length).decode("utf-8"))
+    payload = json.loads(handler.rfile.read(length).decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("Die Anfrage muss ein JSON-Objekt sein.")
+    return payload
 
 
 def load_metrics() -> dict[str, Any]:
@@ -206,7 +238,7 @@ def load_metrics() -> dict[str, Any]:
 def save_metrics(data: dict[str, Any]) -> None:
     path = metrics_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    runtime.atomic_json(path, data)
 
 
 def record_generation_metric(model: str, mode: str, source_chars: int, source_words: int, duration_seconds: float) -> None:
@@ -327,9 +359,8 @@ def check_dependencies(output_path: str | None = None, model: str = DEFAULT_MODE
     out = Path(output_path).expanduser() if output_path else DEFAULT_OUTPUT_DIR
     try:
         out.mkdir(parents=True, exist_ok=True)
-        probe = out / ".write-test"
-        probe.write_text("ok", encoding="utf-8")
-        probe.unlink()
+        with tempfile.NamedTemporaryFile(prefix=".exam-write-", dir=out):
+            pass
         writable = True
         out_detail = str(out)
     except Exception as exc:
@@ -385,7 +416,7 @@ def scan_folder(input_path: str, model: str = DEFAULT_MODEL) -> dict[str, Any]:
     root = Path(input_path).expanduser().resolve()
     if not root.is_dir():
         raise ValueError("Input folder does not exist.")
-    pdfs = [p for p in sorted(root.rglob("*.pdf")) if "exams" not in [part.lower() for part in p.parts]]
+    pdfs = [p for p in sorted((p for p in root.rglob("*") if p.suffix.lower() == ".pdf")) if "exams" not in [part.lower() for part in p.parts]]
     courses: dict[str, int] = {}
     total_bytes = 0
     size_buckets = {"small": 0, "medium": 0, "large": 0, "huge": 0}
@@ -459,7 +490,8 @@ def scan_folder(input_path: str, model: str = DEFAULT_MODEL) -> dict[str, Any]:
 def ensure_separate_output(input_path: str, output_path: str) -> None:
     src_root = Path(input_path).expanduser().resolve()
     out_root = Path(output_path).expanduser().resolve()
-    if out_root == src_root or out_root.is_relative_to(src_root):
+    actual = (out_root / slugify(src_root.name)).resolve()
+    if out_root == src_root or out_root.is_relative_to(src_root) or actual == src_root or actual.is_relative_to(src_root) or src_root.is_relative_to(actual):
         raise ValueError("Choose an output folder outside the input folder so source PDFs stay read-only.")
 
 
@@ -479,17 +511,21 @@ def backup_existing_project(input_path: str, output_path: str, overwrite: bool =
 
 
 def materialize_input(input_path: str, output_path: str, overwrite: bool = False) -> Path:
+    ensure_separate_output(input_path, output_path)
     src_root = Path(input_path).expanduser().resolve()
     out_root = Path(output_path).expanduser().resolve() / slugify(src_root.name)
     out_root.mkdir(parents=True, exist_ok=True)
-    for pdf in sorted(src_root.rglob("*.pdf")):
+    for pdf in sorted((p for p in src_root.rglob("*") if p.suffix.lower() == ".pdf")):
         if "exams" in [part.lower() for part in pdf.parts]:
             continue
         rel = pdf.relative_to(src_root)
         dest = out_root / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
-        if dest.exists() and not overwrite:
+        if dest.exists() and generate_exams.pdf_file_hash(dest) == generate_exams.pdf_file_hash(pdf):
             continue
+        if dest.exists():
+            backup = dest.with_name(dest.name + ".previous-" + uuid.uuid4().hex)
+            shutil.copy2(dest, backup)
         shutil.copy2(pdf, dest)
     return out_root
 
@@ -501,7 +537,7 @@ def generator_args(root: Path, overwrite: bool = False, example: bool = False, m
         target_mode="auto", target_mc=None, target_open=None,
         min_mc=None, max_mc=None, min_open=None, max_open=None,
         endpoint="http://localhost:11434/api/chat", model=(model or DEFAULT_MODEL).strip() or DEFAULT_MODEL,
-        timeout=600, retries=3, allow_heuristic_fallback=True, coverage_mode=coverage_mode, max_parallel_chunks=2,
+        timeout=600, retries=2, allow_heuristic_fallback=False, coverage_mode=coverage_mode, max_parallel_chunks=2,
     )
 
 
@@ -514,282 +550,273 @@ def final_args(root: Path, overwrite: bool = False, model: str = DEFAULT_MODEL) 
     )
 
 
+def settings_path() -> Path:
+    return Path.home() / '.exam-generator-desktop' / 'workspaces.json'
+
+
+def load_registry():
+    try:
+        data = json.loads(settings_path().read_text(encoding='utf-8'))
+        STATE.workspaces.update(data.get('workspaces', {}))
+        return data
+    except (OSError, ValueError):
+        return {'workspaces': {}, 'grading_profile_id': None}
+
+
+def save_registry(data=None):
+    data = data or load_registry()
+    data['workspaces'] = STATE.workspaces
+    runtime.atomic_json(settings_path(), data)
+
+
+def scan_documents(payload):
+    from . import documents
+    root = payload.get('input_path')
+    if not isinstance(root, str) or not root.strip():
+        raise ValueError('Bitte einen Materialordner auswählen.')
+    sources = documents.discover_sources(root, payload.get('paths'))
+    courses = {}
+    for source in sources:
+        courses[source['course']] = courses.get(source['course'], 0) + 1
+    return {'input_path': str(Path(root).expanduser().resolve()), 'sources': sources, 'courses': courses, 'pdf_count': sum(s['format'].lower().lstrip('.') == 'pdf' for s in sources)}
+
+
+def generation_options(payload):
+    language = payload.get('language', 'de')
+    difficulty = payload.get('difficulty', 'balanced')
+    coverage = payload.get('coverage_mode', 'auto')
+    mode = payload.get('mode', 'example')
+    target_mode = payload.get('target_mode', 'auto')
+    if language not in {'de', 'en'} or difficulty not in {'basic', 'balanced', 'challenging'} or coverage not in {'auto', 'representative', 'full_coverage'} or mode not in {'example', 'all', 'finals'} or target_mode not in {'auto', 'manual'}:
+        raise ValueError('Ungültige Prüfungseinstellungen.')
+    result = {k: payload.get(k, v) for k, v in {'language': language, 'difficulty': difficulty, 'coverage_mode': coverage, 'mode': mode, 'target_mode': target_mode}.items()}
+    if target_mode == 'manual':
+        for key in ('target_mc', 'target_open'):
+            value = payload.get(key)
+            if type(value) is not int or not 0 <= value <= 150:
+                raise ValueError('Fragenanzahl muss zwischen 0 und 150 liegen.')
+            result[key] = value
+        if not result['target_mc'] and not result['target_open']:
+            raise ValueError('Mindestens eine Frage auswählen.')
+    return result
+
+
+def start_job(payload):
+    snapshot = copy.deepcopy(payload)
+    generation_options(snapshot)
+    # Reject overlap before creating a log, workspace, or permission probe.
+    ensure_separate_output(snapshot.get('input_path', ''), snapshot.get('output_path') or str(DEFAULT_OUTPUT_DIR))
+    scan = scan_documents(snapshot)
+    selected = snapshot.get('source_ids')
+    if not isinstance(selected, list) or not selected or any(not isinstance(x, str) for x in selected):
+        raise ValueError('Bitte mindestens ein Dokument auswählen.')
+    known = {s['id'] for s in scan['sources']}
+    if not set(selected) <= known:
+        raise ValueError('Die Materialauswahl hat sich geändert. Bitte erneut einlesen.')
+    snapshot['_sources'] = [s for s in scan['sources'] if s['id'] in selected]
+    from . import providers
+    profiles = providers.list_profiles()
+    profile = next((p for p in profiles if p['id'] == snapshot.get('profile_id', 'ollama')), None)
+    if not profile:
+        raise ValueError('KI-Verbindung nicht gefunden.')
+    snapshot['profile_id'] = profile['id']
+    snapshot['profile_snapshot'] = {k: profile.get(k) for k in ('id', 'kind', 'name', 'base_url', 'model', 'credential_saved')}
+    snapshot['model'] = snapshot.get('model') or profile.get('model')
+    if not snapshot['model']:
+        raise ValueError('Bitte ein Modell auswählen.')
+    with STATE.lock:
+        if any(j.status in {'running', 'stopping'} for j in STATE.jobs.values()):
+            raise ValueError('Ein Auftrag läuft bereits. Bitte warten oder stoppen.')
+        job = Job(id=uuid.uuid4().hex, kind=snapshot.get('mode', 'example'), diagnostics=snapshot.get('diagnostics') is True)
+        STATE.jobs[job.id] = job
+        STATE.events[job.id] = threading.Event()
+        for key in list(STATE.jobs)[:-40]:
+            if STATE.jobs[key].status not in {'running', 'stopping'}:
+                STATE.jobs.pop(key, None)
+                STATE.events.pop(key, None)
+        threading.Thread(target=run_generation, args=(job, snapshot), daemon=True).start()
+    return job
+
+
 def run_generation(job: Job, payload: dict[str, Any]) -> None:
-    started = dt.datetime.now().astimezone()
-    metric_chars = 0
-    metric_words = 0
+    from . import documents
+    staging = None
+    event = STATE.events.setdefault(job.id, threading.Event())
+    started = time.perf_counter()
     try:
-        input_path = payload.get("input_path")
-        output_path = payload.get("output_path") or str(DEFAULT_OUTPUT_DIR)
-        mode = payload.get("mode", "example")
-        overwrite = bool(payload.get("overwrite", False))
-        model = str(payload.get("model") or STATE.selected_model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
-        STATE.selected_model = model
-        log_job_configuration(job, payload, model, mode, output_path)
-        job_debug(
-            job,
-            "Dependency status",
-            json.dumps(
-                {
-                    "python": sys.version.split()[0],
-                    "pypdf": importlib.util.find_spec("pypdf") is not None,
-                    "pdfplumber": importlib.util.find_spec("pdfplumber") is not None,
-                    "templates": all((PACKAGE_DIR / "templates" / name).exists() for name in ["index_template.html", "app.js", "styles.css"]),
-                    "ollama_endpoint": DEFAULT_OLLAMA,
-                    "model": model,
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-        )
+        input_path = payload.get('input_path')
         if not input_path:
-            raise ValueError("Input folder is required.")
-        job.message = "Preparing output workspace"
-        job_log(job, "Preparing output workspace")
-        ensure_separate_output(input_path, output_path)
-        backup_path = backup_existing_project(input_path, output_path, overwrite=overwrite)
-        if backup_path:
-            job_log(job, f"Backup created: {backup_path}")
-        project_root = materialize_input(input_path, output_path, overwrite=overwrite)
-        attach_job_log_path(job, generation_log_path(job, project_root))
-        job_log(job, f"Output workspace: {project_root}")
-        job_log(job, f"Full log: {job.log_path}")
-        STATE.preview_root = project_root
-        debug_log = lambda title, content: job_debug(job, title, content)
-
-        if mode in {"example", "all"}:
-            args = generator_args(project_root, overwrite=overwrite, example=mode == "example", model=model)
-            pdfs = generate_exams.find_pdfs(project_root, args.only_folder)
-            if mode == "example":
-                pdfs = pdfs[:1]
-            total = max(1, len(pdfs))
-            job_debug(job, "PDF queue", "\n".join(str(pdf) for pdf in pdfs) or "No PDFs found.")
-            failures = []
-            for index, pdf in enumerate(pdfs, start=1):
-                if is_cancel_requested(job):
-                    job_log(job, "Generation stopped before starting the next PDF")
-                    return
-                job.message = f"Generating {pdf.name}"
-                job.progress = int((index - 1) / total * 90)
-                job_log(job, f"Starting {index}/{total}: {pdf.name}")
+            raise ValueError('Input folder is required.')
+        output = Path(payload.get('output_path') or DEFAULT_OUTPUT_DIR).expanduser().resolve()
+        ensure_separate_output(input_path, str(output))
+        options = generation_options(payload)
+        sources = payload.get('_sources') or scan_documents(payload)['sources']
+        if 'source_ids' in payload:
+            sources = [s for s in sources if s['id'] in payload['source_ids']]
+        if options['mode'] == 'example':
+            sources = sources[:1]
+        if not sources:
+            raise ValueError('Keine ausgewählten Dokumente gefunden.')
+        src_root = Path(input_path).expanduser().resolve()
+        workspace_id = hashlib.sha256(str(src_root).encode()).hexdigest()[:16]
+        destination = output / f'{slugify(src_root.name)}--{workspace_id}'
+        if destination.is_symlink():
+            raise ValueError('Der Arbeitsbereich darf kein symbolischer Link sein.')
+        if destination.resolve() == src_root or destination.resolve().is_relative_to(src_root) or src_root.is_relative_to(destination.resolve()):
+            raise ValueError('Arbeitsbereich und Originalmaterial müssen getrennt bleiben.')
+        output.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix='.exam-run-', dir=output))
+        if destination.exists():
+            shutil.copytree(destination, staging, dirs_exist_ok=True, symlinks=False)
+        attach_job_log_path(job, generation_log_path(job, staging))
+        model = payload.get('model') or DEFAULT_MODEL
+        profile_id = payload.get('profile_id') or 'ollama'
+        settings = dict(options, profile_id=profile_id, model=model, profile_snapshot=payload.get('profile_snapshot'), extraction_mode=payload.get('extraction_mode', 'auto'))
+        signature = hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()
+        manifest_path = staging / 'workspace.json'
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            manifest = {'version': 2, 'id': workspace_id, 'name': src_root.name, 'sources': {}, 'exams': {}}
+        summary = {'generated': [], 'reused': [], 'skipped': [], 'failed': []}
+        extracted = []
+        with runtime.generation_context(profile_id=profile_id, model=model, cancel_event=event, language=options['language'], difficulty=options['difficulty'], profile_snapshot=payload.get('profile_snapshot')) as context:
+            for index, source in enumerate(sources):
+                runtime.check_cancel()
+                job.message = f'Material aufbereiten: {source["name"]}'
+                job.progress = int(index / len(sources) * 25)
+                job_log(job, job.message)
                 try:
-                    result = generate_exams.write_exam_folder(
-                        pdf,
-                        project_root,
-                        args,
-                        PACKAGE_DIR / "templates",
-                        progress=lambda message: job_log(job, message),
-                        debug=debug_log,
-                    )
-                    if is_cancel_requested(job):
-                        job_log(job, f"Discarding late result for {pdf.name} after stop request")
-                        return
-                    if result:
-                        job_debug(job, f"Result metadata: {pdf.name}", json.dumps(result, ensure_ascii=False, indent=2))
-                        job_log(job, f"Wrote {result['source_pdf']} ({result['mc_count']} MC, {result['open_count']} open)")
-                        source_file = Path(result["exam_dir"]) / "source.txt"
-                        try:
-                            source_text = source_file.read_text(encoding="utf-8", errors="replace")
-                            metric_chars += len(source_text)
-                            metric_words += len(source_text.split())
-                        except OSError:
-                            pass
+                    # A scan is a snapshot, not permission to substitute changed content.
+                    if generate_exams.pdf_file_hash(Path(source['path'])) != source['fingerprint']:
+                        raise ValueError('Datei wurde seit dem Einlesen geändert. Bitte erneut einlesen.')
+                    doc = documents.extract_document(Path(source['path']), staging / '.exam-generator-cache', cancel_event=event, mode=payload.get('extraction_mode', 'auto'))
+                    runtime.check_cancel()
+                    doc.update({k: source[k] for k in ('id', 'name', 'fingerprint', 'path')})
+                    course = payload.get('course_assignments', {}).get(source['id'], source['course'])
+                    if not isinstance(course, str) or not course.strip():
+                        raise ValueError('Kursname fehlt.')
+                    course_dir = staging / (slugify(course) + '--' + hashlib.sha256(course.encode()).hexdigest()[:8])
+                    course_dir.mkdir(exist_ok=True)
+                    synthetic = course_dir / ('source-' + source['id'] + Path(source['name']).suffix.lower())
+                    context['documents'][str(synthetic)] = doc
+                    extracted.append((source, doc, course_dir, synthetic))
+                    manifest['sources'][source['id']] = dict(source, course=course)
+                except runtime.Canceled:
+                    raise
                 except Exception as exc:
-                    job_debug(job, f"Traceback: {pdf.name}", traceback.format_exc())
-                    if mode == "example":
-                        raise
-                    failures.append(pdf.name)
-                    job_log(job, f"FAILED {pdf.name}: {exc}")
-                    continue
-            if failures and len(failures) == len(pdfs):
-                raise RuntimeError(f"All PDFs failed: {', '.join(failures)}")
-            if failures:
-                job_log(job, f"Completed with {len(failures)} failed PDF(s)")
-            job.message = "Writing index pages"
-            job_log(job, "Writing index pages")
-            generate_exams.write_index_pages(project_root)
-        elif mode == "finals":
-            args = final_args(project_root, overwrite=overwrite, model=model)
-            courses = generate_final_exams.course_dirs(project_root, None)
-            total = max(1, len(courses))
-            for index, course in enumerate(courses, start=1):
-                if is_cancel_requested(job):
-                    job_log(job, "Generation stopped before starting the next final exam")
-                    return
-                job.message = f"Generating final exam for {course.name}"
-                job.progress = int((index - 1) / total * 90)
-                job_log(job, f"Starting final exam {index}/{total}: {course.name}")
-                result = generate_final_exams.write_final_exam(args, course, debug=debug_log)
-                if is_cancel_requested(job):
-                    job_log(job, f"Discarding late final-exam result for {course.name} after stop request")
-                    return
-                if result:
-                    job_debug(job, f"Final result metadata: {course.name}", json.dumps(result, ensure_ascii=False, indent=2))
-                    job_log(job, f"Final {result['course']}: {result['mc']} MC, {result['open']} open")
-                    source_file = course / "exams" / "final-exam" / "source.txt"
-                    try:
-                        source_text = source_file.read_text(encoding="utf-8", errors="replace")
-                        metric_chars += len(source_text)
-                        metric_words += len(source_text.split())
-                    except OSError:
-                        metric_words += int(result.get("words") or 0)
-            job.message = "Writing index pages"
-            job_log(job, "Writing index pages")
-            generate_exams.write_index_pages(project_root)
-        else:
-            raise ValueError(f"Unknown generation mode: {mode}")
-
-        if is_cancel_requested(job):
-            job_log(job, "Generation stopped before completion")
-            return
-        job.status = "done"
-        job.progress = 100
-        job.message = "Done"
-        duration = (dt.datetime.now().astimezone() - started).total_seconds()
-        job_debug(job, "Job finished", f"status=done\nduration_seconds={duration:.2f}\nfinished_at={now_iso()}")
-        if mode in {"all", "finals"} and metric_chars > 0:
-            record_generation_metric(model, mode, metric_chars, metric_words, duration)
-            job_log(job, f"Saved estimate sample for {model}: {metric_words:,} words in {int(duration // 60)} min")
-        job_log(job, "Done")
-        job.result = {"project_root": str(project_root), "index_url": "/preview/exam_index.html"}
-    except Exception as exc:
-        if is_cancel_requested(job):
-            job_debug(job, "Job finished", f"status=canceled\nfinished_at={now_iso()}")
-            return
-        job.status = "error"
-        job.error = str(exc)
-        job.message = "Failed"
-        job_debug(job, "Traceback", traceback.format_exc())
-        job_debug(job, "Job finished", f"status=error\nfinished_at={now_iso()}")
-        job_log(job, f"Failed: {exc}")
-
-
-class Handler(BaseHTTPRequestHandler):
-    def end_headers(self) -> None:
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        super().end_headers()
-
-    def do_OPTIONS(self) -> None:
-        self.send_response(HTTPStatus.NO_CONTENT)
-        self.end_headers()
-
-    def do_GET(self) -> None:
-        parsed_path = parse.urlparse(self.path)
-        if parsed_path.path == "/api/health":
-            json_response(self, 200, {"ok": True, "version": "0.1.0"})
-            return
-        if parsed_path.path.startswith("/api/jobs/"):
-            tail = parsed_path.path[len("/api/jobs/"):]
-            if tail.endswith("/log"):
-                job_id = tail[:-len("/log")].rstrip("/")
-                job = STATE.jobs.get(job_id)
-                if not job:
-                    text_response(self, 404, "Job not found\n")
-                    return
-                text_response(self, 200, job_log_text(job))
-                return
-            job_id = tail.rsplit("/", 1)[-1]
-            job = STATE.jobs.get(job_id)
-            if not job:
-                json_response(self, 404, {"error": "Job not found"})
-                return
-            json_response(self, 200, job.__dict__)
-            return
-        if parsed_path.path.startswith("/preview/"):
-            self.serve_preview(parsed_path.path[len("/preview/"):])
-            return
-        json_response(self, 404, {"error": "Not found"})
-
-    def do_POST(self) -> None:
-        parsed_path = parse.urlparse(self.path)
-        try:
-            payload = read_json(self)
-            if parsed_path.path == "/api/check":
-                json_response(self, 200, check_dependencies(payload.get("output_path"), payload.get("model", DEFAULT_MODEL)))
-            elif parsed_path.path == "/api/test-model":
-                json_response(self, 200, test_model(str(payload.get("model") or DEFAULT_MODEL)))
-            elif parsed_path.path == "/api/scan":
-                json_response(self, 200, scan_folder(payload.get("input_path", ""), payload.get("model", DEFAULT_MODEL)))
-            elif parsed_path.path == "/api/generate":
-                job = Job(id=str(uuid.uuid4()), kind=str(payload.get("mode", "example")))
-                STATE.jobs[job.id] = job
-                attach_job_log_path(job, fallback_log_dir() / f"generation-{job.id}.log")
-                job_log(job, f"Queued {job.kind} generation")
-                threading.Thread(target=run_generation, args=(job, payload), daemon=True).start()
-                json_response(self, 200, {"job_id": job.id})
-            elif parsed_path.path.startswith("/api/jobs/") and parsed_path.path.endswith("/cancel"):
-                job_id = parsed_path.path[len("/api/jobs/"):-len("/cancel")].strip("/")
-                job = STATE.jobs.get(job_id)
-                if not job:
-                    json_response(self, 404, {"error": "Job not found"})
-                    return
-                canceled = request_job_cancel(job)
-                json_response(self, 200, {"ok": True, "canceled": canceled, "job": job.__dict__})
-            elif parsed_path.path == "/api/set-preview-root":
-                root = Path(payload.get("root", "")).expanduser().resolve()
-                if not root.is_dir():
-                    raise ValueError("Preview root does not exist")
-                STATE.preview_root = root
-                json_response(self, 200, {"ok": True, "index_url": "/preview/exam_index.html"})
-            elif parsed_path.path == "/grade-open-answer":
-                result = local_server.call_ollama(payload, "http://localhost:11434/api/chat", STATE.selected_model or DEFAULT_MODEL, 180)
-                json_response(self, 200, result)
+                    summary['failed'].append({'name': source['name'], 'error': str(exc)})
+                    job_log(job, f'{source["name"]}: {exc}')
+            if not extracted:
+                raise ValueError('Kein Dokument konnte aufbereitet werden. Bitte die Materialhinweise prüfen.')
+            tasks = []
+            if options['mode'] == 'finals':
+                groups = {}
+                for item in extracted:
+                    groups.setdefault(item[2], []).append(item)
+                for course_dir, items in groups.items():
+                    tasks.append((course_dir, items))
             else:
-                json_response(self, 404, {"error": "Not found"})
-        except error.URLError as exc:
-            json_response(self, 502, {"error": f"Could not reach Ollama: {exc}"})
-        except Exception as exc:
-            json_response(self, 400, {"error": str(exc)})
-
-    def serve_preview(self, rel_path: str) -> None:
-        if STATE.preview_root is None:
-            json_response(self, 404, {"error": "No preview root selected"})
-            return
-        safe_rel = parse.unquote(rel_path).lstrip("/") or "exam_index.html"
-        target = (STATE.preview_root / safe_rel).resolve()
-        try:
-            target.relative_to(STATE.preview_root.resolve())
-        except ValueError:
-            json_response(self, 403, {"error": "Forbidden"})
-            return
-        if target.is_dir():
-            target = target / "index.html"
-        if not target.exists():
-            json_response(self, 404, {"error": "File not found"})
-            return
-        content_type = "text/html; charset=utf-8" if target.suffix == ".html" else "application/json; charset=utf-8" if target.suffix == ".json" else "text/plain; charset=utf-8"
-        body = target.read_bytes()
-        self.send_response(200)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-
-def serve(port: int) -> int:
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print(json.dumps({"event": "ready", "port": port}), flush=True)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
+                tasks = [(item[2], [item]) for item in extracted]
+            for index, (course_dir, items) in enumerate(tasks):
+                runtime.check_cancel()
+                source, doc, _, synthetic = items[0]
+                key = ('final:' + course_dir.name) if options['mode'] == 'finals' else source['id']
+                fingerprint = hashlib.sha256(''.join(item[0]['fingerprint'] + hashlib.sha256(item[1]['text'].encode()).hexdigest() for item in items).encode()).hexdigest()
+                entry = manifest['exams'].get(key, {})
+                exam_dir = course_dir / 'exams' / ('final-exam' if options['mode'] == 'finals' else synthetic.stem)
+                if entry.get('fingerprint') == fingerprint and entry.get('settings') == signature and (exam_dir / 'exam.json').exists() and not payload.get('overwrite'):
+                    summary['reused'].append(source['name'] if options['mode'] != 'finals' else course_dir.name)
+                    continue
+                job.message = f'Prüfung erstellen: {source["name"] if options["mode"] != "finals" else course_dir.name}'
+                job.progress = 25 + int(index / len(tasks) * 65)
+                job_log(job, job.message)
+                try:
+                    if options['mode'] == 'finals':
+                        args = final_args(staging, overwrite=True, model=model)
+                        if options['target_mode'] == 'manual':
+                            args.target_mc, args.target_open = options['target_mc'], options['target_open']
+                        args.source_entries = [dict(source_pdf=item[0]['name'], exam_folder=item[0]['id'], text=item[1]['text'], words=generate_exams.count_words(item[1]['text']), warning=' '.join(item[1].get('warnings', [])) or None, pages_total=item[1].get('page_count') or 0, visuals_detected=0) for item in items]
+                        result = generate_final_exams.write_final_exam(args, course_dir, debug=(lambda t, c: job_debug(job, t, c)) if job.diagnostics else None)
+                    else:
+                        args = generator_args(staging, overwrite=True, example=options['mode'] == 'example', model=model)
+                        args.coverage_mode = options['coverage_mode']
+                        args.target_mode = options['target_mode']
+                        args.target_mc, args.target_open = options.get('target_mc'), options.get('target_open')
+                        result = generate_exams.write_exam_folder(synthetic, staging, args, PACKAGE_DIR / 'templates', progress=lambda m: job_log(job, m), debug=(lambda t, c: job_debug(job, t, c)) if job.diagnostics else None)
+                    runtime.check_cancel()
+                    if not result:
+                        raise ValueError('Keine Prüfung erzeugt.')
+                    manifest['exams'][key] = {'fingerprint': fingerprint, 'settings': signature, 'path': str(exam_dir.relative_to(staging)), 'provider_id': profile_id, 'model': model}
+                    summary['generated'].append(source['name'] if options['mode'] != 'finals' else course_dir.name)
+                except runtime.Canceled:
+                    raise
+                except runtime.ProviderFailure as exc:
+                    summary['failed'].append({'name': source['name'], 'error': str(exc)})
+                    summary['skipped'].extend(item[1][0][0]['name'] for item in tasks[index + 1:])
+                    job_log(job, f'KI-Verbindung fehlgeschlagen: {exc}')
+                    break
+                except Exception as exc:
+                    summary['failed'].append({'name': source['name'], 'error': str(exc)})
+                    job_log(job, f'Prüfung fehlgeschlagen: {exc}')
+            runtime.check_cancel()
+            if not summary['generated'] and not summary['reused']:
+                raise ValueError('Keine verwendbare Prüfung erstellt. Bitte Verbindung und Material prüfen.')
+            manifest.update({'updated_at': now_iso(), 'settings': settings})
+            runtime.atomic_json(manifest_path, manifest)
+            generate_exams.write_index_pages(staging)
+            with STATE.lock:
+                runtime.check_cancel()
+                backup = runtime.replace_directory(staging, destination)
+                staging = None
+                STATE.workspaces[workspace_id] = {'id': workspace_id, 'name': src_root.name, 'root': str(destination), 'exam_count': len(manifest['exams']), 'updated_at': now_iso()}
+                try:
+                    save_registry()
+                except BaseException:
+                    os.replace(destination, destination.with_name('.failed-' + job.id))
+                    if backup:
+                        os.replace(backup, destination)
+                    STATE.workspaces.pop(workspace_id, None)
+                    raise
+                job.log_path = str(destination / 'logs' / f'generation-{job.id}.log')
+                job.result = dict(summary, workspace_id=workspace_id, project_root=str(destination), index_url='/preview/' + workspace_id + '/exam_index.html', usage=context['usage'])
+                job.status = 'partial' if summary['failed'] else 'done'
+                job.progress = 100
+                job.message = 'Mit Hinweisen abgeschlossen' if summary['failed'] else 'Abgeschlossen'
+                job_log(job, job.message)
+    except (runtime.Canceled, KeyboardInterrupt):
+        job.status = 'canceled'
+        job.message = 'Gestoppt'
+    except (Exception, runtime.ProviderFailure) as exc:
+        job.status = 'canceled' if event.is_set() else 'error'
+        job.error = str(exc)
+        job.message = 'Gestoppt' if event.is_set() else 'Fehlgeschlagen'
+        job_log(job, str(exc))
+        job_debug(job, 'Traceback', traceback.format_exc())
     finally:
-        server.server_close()
-    return 0
+        if staging and staging.exists():
+            # Preserve logs even though incomplete exam output is discarded.
+            try:
+                text = job_log_text(job)
+                attach_job_log_path(job, fallback_log_dir() / f'generation-{job.id}.log')
+                Path(job.log_path).write_text(text, encoding='utf-8')
+            except OSError:
+                pass
+            shutil.rmtree(staging)
+        job.updated_at = now_iso()
+
+
+from exam_backend.service import Handler, serve
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    sub = parser.add_subparsers(dest="command", required=True)
-    serve_parser = sub.add_parser("serve")
-    serve_parser.add_argument("--port", type=int, default=8766)
+    sub = parser.add_subparsers(dest='command', required=True)
+    serve_parser = sub.add_parser('serve')
+    serve_parser.add_argument('--port', type=int, default=8766)
     args = parser.parse_args()
-    if args.command == "serve":
-        return serve(args.port)
-    return 2
+    return serve(args.port)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     raise SystemExit(main())

@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Exam Generator",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "app.exam-generator.desktop",
   "build": {
     "frontendDist": "../dist",
@@ -20,13 +20,13 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src http://127.0.0.1:8766; style-src 'self'"
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost http://127.0.0.1:*; style-src 'self'; img-src 'self' data:"
     }
   },
   "bundle": {
     "active": true,
     "targets": "all",
-    "resources": ["../../../backend"],
+    "resources": [],
     "externalBin": []
   }
 }

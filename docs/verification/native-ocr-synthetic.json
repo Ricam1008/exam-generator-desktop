@@ -1,0 +1,84 @@
+{
+  "fixture_version": 1,
+  "measured_at": "2026-11-07T08:32:11+0100",
+  "platform": "darwin",
+  "versions": {
+    "docling": "2.148.0",
+    "ocrmac": "1.0.1",
+    "pypdfium2": "5.15.0",
+    "pdfplumber": "0.11.10",
+    "pypdf": "7.0.0"
+  },
+  "engines": [
+    {
+      "status": "measured",
+      "engine": "native",
+      "initialization_seconds": 0.0,
+      "peak_rss_bytes": 146210816,
+      "local_model_bytes": 0,
+      "downloads_performed": false,
+      "rows": [
+        {
+          "file": "german.png",
+          "category": "german",
+          "seconds": 0.382,
+          "text": "Gedächtnis und Lernen\nDas Arbeitsgedächtnis verarbeitet neue Informationen.\nWiederholung unterstützt die langfristige Speicherung.\nAufmerksamkeit beeinflusst die Aufnahme von Inhalten.",
+          "word_recall": 1.0,
+          "character_similarity": 1.0,
+          "reading_order": 1.0
+        },
+        {
+          "file": "english.png",
+          "category": "english",
+          "seconds": 0.077,
+          "text": "Learning and attention\nWorking memory has limited capacity.\nRetrieval practice improves long term retention.\nThe study compares younger and older participants.",
+          "word_recall": 1.0,
+          "character_similarity": 1.0,
+          "reading_order": 1.0
+        },
+        {
+          "file": "table.png",
+          "category": "table",
+          "seconds": 0.075,
+          "text": "Tabelle: Reaktionszeiten\nGruppe Mittelwert Einheit\nKontrolle 420 ms\nTraining 360 ms\nDifferenz 60 ms",
+          "word_recall": 1.0,
+          "character_similarity": 1.0,
+          "reading_order": 1.0
+        },
+        {
+          "file": "formula.png",
+          "category": "formula",
+          "seconds": 0.057,
+          "text": "Statistik und Formeln\nMittelwert = Summe / Anzahl\nVarianz = 16\nStandardabweichung = 4\nStichprobe n = 25",
+          "word_recall": 1.0,
+          "character_similarity": 1.0,
+          "reading_order": 1.0
+        },
+        {
+          "file": "rotated.png",
+          "category": "rotated",
+          "seconds": 0.094,
+          "text": "Entwicklungspsychologie\nKinder lernen durch Beobachtung.\nSoziale Erfahrungen beeinflussen die Entwicklung.\nDie Untersuchung umfasst drei Altersgruppen.",
+          "word_recall": 1.0,
+          "character_similarity": 1.0,
+          "reading_order": 1.0
+        },
+        {
+          "file": "mixed.png",
+          "category": "mixed",
+          "seconds": 0.075,
+          "text": "Experiment zur Aufmerksamkeit\nPhase A: Lernmaterial lesen.\nPhase B: Fragen ohne Unterlagen beantworten.\nErgebnis: Wiederholtes Abrufen verbessert die Erinnerung.",
+          "word_recall": 1.0,
+          "character_similarity": 1.0,
+          "reading_order": 1.0
+        }
+      ]
+    },
+    {
+      "engine": "granite",
+      "status": "not_run",
+      "reason": "No local Granite snapshot supplied."
+    }
+  ],
+  "enhanced_qualified": false
+}

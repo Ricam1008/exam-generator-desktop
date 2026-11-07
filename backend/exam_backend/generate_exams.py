@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import contextvars
+from exam_backend import runtime
 import concurrent.futures
 import datetime as dt
 import hashlib
@@ -312,7 +314,7 @@ def matches_only_folder(pdf_path: Path, root: Path, only_folder: str | None) -> 
 
 def find_pdfs(root: Path, only_folder: str | None) -> list[Path]:
     pdfs = []
-    for pdf in sorted(root.rglob("*.pdf")):
+    for pdf in sorted((p for p in root.rglob("*") if p.suffix.lower() == ".pdf")):
         if is_inside_exams(pdf):
             continue
         if matches_only_folder(pdf, root, only_folder):
@@ -444,7 +446,6 @@ def extract_pdf_text(pdf_path: Path, debug: DebugLogger | None = None) -> tuple[
         ("pdfplumber", extract_with_pdfplumber),
         ("pypdf", extract_with_pypdf),
         ("pdftotext", extract_with_pdftotext),
-        ("strings fallback", extract_with_strings),
     ]
     last_error = None
     last_page_count: int | None = None
@@ -612,8 +613,6 @@ def preprocessing_cache_key(pdf_path: Path, args: argparse.Namespace, source_has
         "source_file_hash": source_hash,
         "generator_version": GENERATOR_VERSION,
         "extraction_mode": str(getattr(args, "extraction_mode", "auto")),
-        "model_name": str(getattr(args, "model", DEFAULT_MODEL)),
-        "prompt_version": PROMPT_VERSION,
     }
 
 
@@ -975,14 +974,22 @@ def attach_question_metadata(questions: list[dict[str, Any]], source_text: str, 
                 for page in ensure_list(existing.get("evidence_pages", existing.get("source_pages")))
                 if isinstance(page, int) or (isinstance(page, str) and page.isdigit())
             ]
-            merged["evidence_pages"] = sorted({page for page in evidence_pages if page > 0})
+            merged["evidence_pages"] = sorted({page for page in evidence_pages if page > 0 and page in meta["chunk_page_range"]})
             merged["source_pages"] = list(merged["evidence_pages"])
             excerpt = existing.get("source_excerpt")
-            merged["source_excerpt"] = str(excerpt).strip()[:500] if excerpt else None
+            merged["source_excerpt"] = str(excerpt).strip()[:500] if excerpt and str(excerpt).strip() in source_text else None
             source_type = str(existing.get("source_type") or "unknown").strip()
             if source_type in {"text", "formula", "table", "diagram", "mixed", "unknown"}:
                 merged["source_type"] = source_type
             merged["visual_required"] = bool(existing.get("visual_required", False))
+        references = []
+        excerpt = merged.get("source_excerpt")
+        if excerpt:
+            for document in (runtime.CONTEXT.get() or {}).get("documents", {}).values():
+                for block in document.get("blocks", []):
+                    if excerpt in block.get("text", "") and block.get("locator"):
+                        references.append({"source_id": document.get("id"), "source_name": document.get("name"), "locator": block["locator"]})
+        merged["source_refs"] = references if len(references) == 1 else []
         question["_meta"] = merged
 
 
@@ -1384,6 +1391,10 @@ def format_audit_summary(audit: dict[str, Any]) -> str:
 
 
 def post_ollama(endpoint: str, model: str, prompt: str, timeout: int) -> str:
+    runtime.check_cancel()
+    response = runtime.complete([{"role": "system", "content": GENERATION_SYSTEM_PROMPT}, {"role": "user", "content": prompt}], timeout)
+    if response is not None:
+        return response
     payload = {
         "model": model,
         "stream": False,
@@ -1490,6 +1501,7 @@ def call_json_with_retries(
 ) -> dict[str, Any]:
     last_error: Exception | None = None
     for attempt in range(max(0, args.retries) + 1):
+        runtime.check_cancel()
         retry_prompt = prompt
         if attempt:
             retry_prompt += (
@@ -1558,6 +1570,12 @@ def question_signature(text: str) -> str:
     return text[:180]
 
 
+def strict_boolean(value: Any) -> bool:
+    if type(value) is not bool:
+        raise ValueError("Antwortschlüssel muss echte JSON-Wahrheitswerte enthalten.")
+    return value
+
+
 def normalize_mc_items(raw_questions: Any, existing: set[str]) -> list[dict[str, Any]]:
     questions = []
     if not isinstance(raw_questions, list):
@@ -1578,7 +1596,7 @@ def normalize_mc_items(raw_questions: Any, existing: set[str]) -> list[dict[str,
                 continue
             option_text = str(option.get("text") or "").strip()
             if option_text:
-                options.append({"text": option_text, "is_correct": bool(option.get("is_correct", False))})
+                options.append({"text": option_text, "is_correct": strict_boolean(option.get("is_correct"))})
         if len(options) < 4:
             continue
         normalized = {
@@ -1590,7 +1608,7 @@ def normalize_mc_items(raw_questions: Any, existing: set[str]) -> list[dict[str,
         }
         answer_mode = str(raw.get("answer_mode") or "").strip()
         if answer_mode in {"single_correct", "multiple_correct"}:
-            normalized["answer_mode"] = answer_mode
+            normalized["answer_mode"] = "single_correct" if sum(o["is_correct"] for o in options) == 1 else "multiple_correct"
         if isinstance(raw.get("_meta"), dict):
             normalized["_meta"] = raw["_meta"]
         questions.append(normalized)
@@ -1656,7 +1674,7 @@ def normalize_exam(
             text = str(option.get("text", "")).strip()
             if not text:
                 continue
-            options.append({"text": text, "is_correct": bool(option.get("is_correct", False))})
+            options.append({"text": text, "is_correct": strict_boolean(option.get("is_correct"))})
         if len(options) < 4:
             continue
         normalized_mc = {
@@ -1668,7 +1686,7 @@ def normalize_exam(
         }
         answer_mode = str(question.get("answer_mode") or "").strip()
         if answer_mode in {"single_correct", "multiple_correct"}:
-            normalized_mc["answer_mode"] = answer_mode
+            normalized_mc["answer_mode"] = "single_correct" if sum(o["is_correct"] for o in options) == 1 else "multiple_correct"
         if isinstance(question.get("_meta"), dict):
             normalized_mc["_meta"] = question["_meta"]
         mc_questions.append(normalized_mc)
@@ -1700,7 +1718,7 @@ def normalize_exam(
 
     today = dt.date.today().isoformat()
     title = Path(source_pdf).stem
-    if not mc_questions or not open_questions:
+    if not mc_questions and not open_questions:
         raise ValueError("The model response did not contain usable MC and open-ended questions.")
     for question in mc_questions:
         if not question["question"] or not question["explanation"]:
@@ -2002,6 +2020,7 @@ def generate_chunk_data(
     debug: DebugLogger | None = None,
     fallback: bool = False,
 ) -> dict[str, Any]:
+    runtime.check_cancel()
     chunk_id = f"chunk-{index:03d}"
     local_warnings: list[str] = []
     local_timing = new_timing()
@@ -2068,6 +2087,7 @@ def chunk_results_parallel(
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_parallel_chunks) as executor:
         futures = {
             executor.submit(
+                contextvars.copy_context().run,
                 generate_chunk_data,
                 course,
                 source_pdf,
@@ -2384,7 +2404,7 @@ def generate_full_coverage_exam(
     )
 
     too_many_failed = failed_chunks > len(chunks) // 2
-    if processed_chunks == 0 or too_many_failed or not mc_questions or not open_questions:
+    if processed_chunks == 0 or too_many_failed or (target_mc > 0 and not mc_questions) or (target_open > 0 and not open_questions):
         raise RuntimeError(
             f"Full-coverage generation failed for {source_pdf}: processed {processed_chunks}/{len(chunks)} chunks, "
             f"generated {len(mc_questions)} MC and {len(open_questions)} open questions."
@@ -2508,19 +2528,26 @@ def write_exam_folder(
         print(f"SKIP existing: {exam_dir}", flush=True)
         return None
 
-    cache_payload, cache_key, cache_path = load_preprocessing_cache(root, pdf_path, args, debug=debug, progress=progress)
-    if cache_payload:
-        text = str(cache_payload.get("extracted_text") or "")
-        extraction_warning = cache_payload.get("extraction_warning")
-        if extraction_warning is not None:
-            extraction_warning = str(extraction_warning)
-        page_count_value = cache_payload.get("page_count")
-        page_count = int(page_count_value) if isinstance(page_count_value, int) else None
+    runtime.check_cancel()
+    document = runtime.source_document(pdf_path)
+    if document:
+        text = document["text"]
+        extraction_warning = " ".join(document.get("warnings", [])) or None
+        page_count = document.get("page_count")
     else:
-        extraction_started = time.perf_counter()
-        text, extraction_warning, page_count = extract_pdf_text(pdf_path, debug=debug)
-        add_seconds(timing, "extraction_seconds", extraction_started)
-        write_preprocessing_cache(cache_path, cache_key, text, extraction_warning, page_count, chunk_text(text), debug=debug)
+        cache_payload, cache_key, cache_path = load_preprocessing_cache(root, pdf_path, args, debug=debug, progress=progress)
+        if cache_payload:
+            text = str(cache_payload.get("extracted_text") or "")
+            extraction_warning = cache_payload.get("extraction_warning")
+            if extraction_warning is not None:
+                extraction_warning = str(extraction_warning)
+            page_count_value = cache_payload.get("page_count")
+            page_count = int(page_count_value) if isinstance(page_count_value, int) else None
+        else:
+            extraction_started = time.perf_counter()
+            text, extraction_warning, page_count = extract_pdf_text(pdf_path, debug=debug)
+            add_seconds(timing, "extraction_seconds", extraction_started)
+            write_preprocessing_cache(cache_path, cache_key, text, extraction_warning, page_count, chunk_text(text), debug=debug)
     word_count = count_words(text)
     if progress:
         pages = page_count if page_count is not None else "unknown"
@@ -2634,20 +2661,15 @@ def write_exam_folder(
             target_planning=target_planning,
         )
 
-    if exam_dir.exists() and args.overwrite:
-        shutil.rmtree(exam_dir)
-    exam_dir.mkdir(parents=True, exist_ok=True)
-    write_started = time.perf_counter()
+    runtime.check_cancel()
+    ctx = runtime.CONTEXT.get() or {}
+    exam["metadata"].update({"language": ctx.get("language", "de"), "provider_id": ctx.get("profile_id"), "model": ctx.get("model", args.model), "profile_snapshot": ctx.get("profile_snapshot")})
+    if document:
+        exam["metadata"].update({"source_id": document.get("id"), "source_file": document.get("name", pdf_path.name), "source_fingerprint": document.get("fingerprint"), "source_pdf": document.get("name", pdf_path.name)})
+        exam["metadata"]["title"] = Path(document.get("name", pdf_path.name)).stem
+        exam["source_blocks"] = document.get("blocks", [])
     timing["total_seconds"] = round(time.perf_counter() - overall_started, 4)
-    (exam_dir / "index.html").write_text(render_exam_html(template_dir, exam), encoding="utf-8")
-    (exam_dir / "exam.json").write_text(json.dumps(exam, ensure_ascii=False, indent=2), encoding="utf-8")
-    (exam_dir / "source.txt").write_text(text, encoding="utf-8")
-    add_seconds(timing, "write_seconds", write_started)
-    timing["total_seconds"] = round(time.perf_counter() - overall_started, 4)
-    if isinstance(exam.get("audit"), dict):
-        exam["audit"]["timing"] = timing
-    (exam_dir / "index.html").write_text(render_exam_html(template_dir, exam), encoding="utf-8")
-    (exam_dir / "exam.json").write_text(json.dumps(exam, ensure_ascii=False, indent=2), encoding="utf-8")
+    runtime.publish_exam(exam_dir, exam, text, lambda data: render_exam_html(template_dir, data))
     if debug:
         debug(f"AUDIT SUMMARY: {pdf_path.name}", format_audit_summary(exam["audit"]))
         debug(f"TIMING SUMMARY: {pdf_path.name}", format_timing_summary(timing))
@@ -2669,6 +2691,8 @@ def write_exam_folder(
 def discover_generated_exams(root: Path) -> dict[Path, list[dict[str, Any]]]:
     courses: dict[Path, list[dict[str, Any]]] = {}
     for exam_json in sorted(root.rglob("exams/*/exam.json")):
+        if any(part.startswith(".") for part in exam_json.relative_to(root).parts):
+            continue
         try:
             data = json.loads(exam_json.read_text(encoding="utf-8"))
         except Exception:

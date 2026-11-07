@@ -1,13 +1,14 @@
 {
   "name": "exam-generator-desktop",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "tsc && vite build",
     "preview": "vite preview --host 127.0.0.1",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "package:mac": "tauri build --config src-tauri/tauri.release.conf.json --bundles app,dmg"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
@@ -22,6 +23,6 @@
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^4.3.4",
     "typescript": "^5.7.0",
-    "vite": "^6.0.0"
+    "vite": "^6.4.5"
   }
 }

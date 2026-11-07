@@ -1,322 +1,236 @@
 let exam = null;
 let mcChecked = false;
 let openGraded = false;
+let fingerprint = '';
+let saveTimer;
 const openResults = new Map();
-const DEFAULT_GRADING_RUBRIC = {
-  "90-100": "Precise, complete answer covering all key concepts.",
-  "61-89": "Mostly correct answer with minor to noticeable gaps.",
-  "41-60": "On topic but incomplete or imprecise.",
-  "21-40": "Partially relevant with major conceptual gaps.",
-  "0-20": "Mostly wrong, vague, or empty."
-};
-
 const $ = (selector) => document.querySelector(selector);
-
+const asArray = (value) => Array.isArray(value) ? value : [];
+const isPlainObject = (value) => value && typeof value === 'object' && !Array.isArray(value);
+const en = () => exam?.metadata?.language === 'en';
+const t = (de, english) => en() ? english : de;
+const previewBase = location.pathname.match(/^\/preview\/[^/]+\//)?.[0];
+const examPath = previewBase ? location.pathname.slice(previewBase.length).replace(/index\.html$/, 'exam.json') : '';
 function escapeHtml(value) {
-  return String(value ?? "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
+  return String(value ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#039;');
 }
-
-function asArray(value) {
-  return Array.isArray(value) ? value : [];
-}
-
-function isPlainObject(value) {
-  return value && typeof value === "object" && !Array.isArray(value);
-}
-
+const DEFAULT_GRADING_RUBRIC = { '90-100': 'Precise, complete, source-backed answer.', '60-89': 'Correct core idea with gaps.', '40-59': 'Partially correct.', '0-39': 'Major gaps or errors.' };
 function resolveGradingRubric(question) {
-  if (isPlainObject(question.grading_rubric) && Object.keys(question.grading_rubric).length) {
-    return question.grading_rubric;
-  }
-  const templates = isPlainObject(exam?.rubric_templates) ? exam.rubric_templates : {};
-  const template = templates[question.rubric_template];
-  if (isPlainObject(template) && Object.keys(template).length) {
-    return template;
-  }
-  return DEFAULT_GRADING_RUBRIC;
+  if (isPlainObject(question.grading_rubric)) return question.grading_rubric;
+  return exam?.rubric_templates?.[question.rubric_template] || DEFAULT_GRADING_RUBRIC;
 }
-
+function notice(message) {
+  $('#save-status').textContent = message;
+}
 async function loadExam() {
   try {
-    const response = await fetch("exam.json", { cache: "no-store" });
-    if (!response.ok) {
-      throw new Error(`Could not load exam.json (${response.status})`);
-    }
+    const response = await fetch('exam.json', {cache: 'no-store'});
+    if (!response.ok) throw new Error('Prüfung konnte nicht geladen werden.');
     exam = await response.json();
   } catch (error) {
-    const embedded = document.getElementById("embedded-exam-data");
-    if (!embedded?.textContent?.trim()) {
-      throw error;
-    }
+    const embedded = $('#embedded-exam-data');
+    if (!embedded?.textContent?.trim()) throw error;
     exam = JSON.parse(embedded.textContent);
   }
   renderExam();
   bindEvents();
-  updateProgress();
+  try {
+    let attempt;
+    if (previewBase) {
+      const response = await fetch(`${previewBase}attempt?exam_path=${encodeURIComponent(examPath)}`);
+      const saved = await response.json();
+      if (!response.ok) throw new Error(saved.error);
+      fingerprint = saved.fingerprint;
+      attempt = saved.attempt;
+    } else {
+      const data = new TextEncoder().encode(JSON.stringify(exam));
+      fingerprint = [...new Uint8Array(await crypto.subtle.digest('SHA-256', data))].map(n => n.toString(16).padStart(2, '0')).join('');
+      attempt = JSON.parse(localStorage.getItem(`exam-attempt:${fingerprint}`) || 'null');
+    }
+    if (isPlainObject(attempt)) restoreAttempt(attempt);
+    notice(t('Lernstand wird lokal gespeichert.', 'Your progress is saved locally.'));
+  } catch {
+    notice(t('Lernstand konnte nicht geladen werden. Diese Sitzung bleibt vorerst nur im Fenster.', 'Progress could not be loaded. This session currently stays in this window.'));
+  }
+  updateProgress(false);
 }
-
+function sourceDetails(question) {
+  const meta = question._meta || {};
+  const refs = asArray(meta.source_refs);
+  const pages = asArray(meta.evidence_pages);
+  const reference = refs.length ? refs.map(ref => `${ref.source_name || ''} · ${ref.locator?.kind || ''} ${ref.locator?.index ?? ''}`).join(', ') : pages.length ? `${t('Seite', 'Page')} ${pages.join(', ')}` : t('Keine genaue Quellenstelle bestätigt.', 'No exact source reference confirmed.');
+  return `<details class="source-details"><summary>${t('Quelle prüfen', 'Review source')}</summary><p>${escapeHtml(reference)}</p>${meta.source_excerpt ? `<blockquote>${escapeHtml(meta.source_excerpt)}</blockquote>` : ''}</details>`;
+}
 function renderExam() {
   const metadata = exam.metadata || {};
-  const title = metadata.title || metadata.source_pdf || "Local exam";
-  document.title = title;
-  $("#exam-title").textContent = title;
-  $("#exam-meta").textContent = `${metadata.course || "Unknown course"} · Source: ${metadata.source_pdf || "unknown PDF"}`;
-
-  if (metadata.text_extraction_warning) {
-    const warningBox = $("#warning-box");
-    warningBox.hidden = false;
-    warningBox.textContent = metadata.text_extraction_warning;
-  }
-
-  renderMcQuestions();
-  renderOpenQuestions();
+  document.documentElement.lang = en() ? 'en' : 'de';
+  document.title = metadata.title || metadata.source_file || metadata.source_pdf || 'Prüfung';
+  $('#exam-title').textContent = document.title;
+  $('#exam-meta').textContent = `${metadata.course || ''} · ${metadata.source_file || metadata.source_pdf || ''}`;
+  $('#grading-info').textContent = t('KI-Feedback ist optional. Verwendet wird die beim Erstellen gewählte Verbindung; eine abweichende Verbindung lässt sich in der App einstellen.', 'AI feedback is optional. It uses the connection selected for this exam unless overridden in the app.');
+  $('#mc-heading').textContent = t('Multiple-Choice-Fragen', 'Multiple-choice questions');
+  $('#mc-hint').textContent = t('Wähle alle richtigen Antworten. Falls keine passt, wähle „Keine Antwort ist richtig“.', 'Select every correct answer. If none is correct, select “None of these”.');
+  $('#open-heading').textContent = t('Offene Fragen', 'Open questions');
+  $('#open-hint').textContent = t('Formuliere deine Antwort. Du kannst sie selbst prüfen oder KI-Feedback anfordern.', 'Write your answer. Review it yourself or request AI feedback.');
+  $('#check-mc').textContent = t('Antworten prüfen', 'Check answers');
+  $('#grade-open').textContent = t('KI-Feedback anfordern', 'Request AI feedback');
+  $('#skip-open').textContent = t('Ohne KI selbst prüfen', 'Review without AI');
+  const warning = metadata.text_extraction_warning || metadata.coverage_warning;
+  if (warning) { $('#warning-box').hidden = false; $('#warning-box').textContent = warning; }
+  renderMcQuestions(); renderOpenQuestions();
 }
-
 function renderMcQuestions() {
-  const form = $("#mc-form");
-  form.innerHTML = asArray(exam.multiple_choice).map((question, questionIndex) => {
-    const options = asArray(question.options).map((option, optionIndex) => `
-      <li class="option" data-question-index="${questionIndex}" data-option-index="${optionIndex}">
-        <input id="mc-${questionIndex}-${optionIndex}" name="mc-${questionIndex}" type="checkbox" value="${optionIndex}">
-        <label for="mc-${questionIndex}-${optionIndex}">${escapeHtml(option.text)}</label>
-      </li>
-    `).join("");
-
-    return `
-      <article class="question-card" data-mc-question="${questionIndex}">
-        <p class="question-meta">Question ${questionIndex + 1} · ${escapeHtml(question.topic || "lecture concept")}</p>
-        <h3>${escapeHtml(question.question)}</h3>
-        <ul class="option-list">${options}</ul>
-        <div class="correction" id="mc-correction-${questionIndex}" hidden></div>
-      </article>
-    `;
-  }).join("");
+  $('#mc-form').innerHTML = asArray(exam.multiple_choice).map((question, index) => `
+    <article class="question-card" data-mc-question="${index}">
+      <p class="question-meta">${t('Frage', 'Question')} ${index + 1} · ${escapeHtml(question.topic || '')}</p>
+      <fieldset><legend>${escapeHtml(question.question)}</legend>
+      <ul class="option-list">${asArray(question.options).map((option, optionIndex) => `
+        <li class="option" data-question-index="${index}" data-option-index="${optionIndex}">
+          <input id="mc-${index}-${optionIndex}" name="mc-${index}" type="checkbox" value="${optionIndex}">
+          <label for="mc-${index}-${optionIndex}">${escapeHtml(option.text)}</label></li>`).join('')}
+        <li class="option"><input id="none-${index}" name="none-${index}" type="checkbox"><label for="none-${index}">${t('Keine Antwort ist richtig', 'None of these')}</label></li></ul></fieldset>
+      <div class="correction" id="mc-correction-${index}" hidden></div>${sourceDetails(question)}</article>`).join('');
 }
-
 function renderOpenQuestions() {
-  const form = $("#open-form");
-  form.innerHTML = asArray(exam.open_ended).map((question, questionIndex) => `
-    <article class="question-card" data-open-question="${questionIndex}">
-      <p class="question-meta">Question ${questionIndex + 1} · max ${Number(question.max_score || 100)} points</p>
-      <h3>${escapeHtml(question.question)}</h3>
-      <textarea id="open-${questionIndex}" placeholder="Type your answer here"></textarea>
-      <div class="grading-result" id="open-result-${questionIndex}" hidden></div>
-    </article>
-  `).join("");
+  $('#open-form').innerHTML = asArray(exam.open_ended).map((question, index) => `
+    <article class="question-card" data-open-question="${index}"><label for="open-${index}"><span class="question-meta">${t('Frage', 'Question')} ${index + 1}</span><span class="question-prompt">${escapeHtml(question.question)}</span></label>
+    <textarea id="open-${index}" placeholder="${t('Deine Antwort', 'Your answer')}"></textarea>
+    <details><summary>${t('Musterantwort anzeigen', 'Show expected answer')}</summary><p>${escapeHtml(question.expected_answer)}</p></details>
+    <div class="grading-result" id="open-result-${index}" hidden></div>${sourceDetails(question)}</article>`).join('');
 }
-
-function bindEvents() {
-  document.addEventListener("change", updateProgress);
-  document.addEventListener("input", updateProgress);
-  $("#check-mc").addEventListener("click", checkMcAnswers);
-  $("#grade-open").addEventListener("click", gradeOpenAnswers);
-  $("#skip-open").addEventListener("click", () => {
-    openGraded = true;
-    const summary = $("#open-summary");
-    summary.hidden = false;
-    summary.innerHTML = "<strong>Open-answer grading skipped.</strong><p>You can still review your written answers against the stored expected answers later.</p>";
-    updateScoreSummary();
-  });
+function selectedIndexes(index) {
+  return [...document.querySelectorAll(`input[name="mc-${index}"]:checked`)].map(input => Number(input.value));
 }
-
-function selectedIndexes(questionIndex) {
-  return [...document.querySelectorAll(`input[name="mc-${questionIndex}"]:checked`)].map((input) => Number(input.value));
-}
-
-function scoreMcQuestion(question, selected) {
-  const options = asArray(question.options);
-  const correctIndexes = options.map((option, index) => option.is_correct ? index : null).filter((value) => value !== null);
+function scoreMcQuestion(question, selected, noneSelected = false) {
+  const correctIndexes = asArray(question.options).map((option, index) => option.is_correct === true ? index : null).filter(value => value !== null);
   const selectedSet = new Set(selected);
   const correctSet = new Set(correctIndexes);
-  const correctSelections = selected.filter((index) => correctSet.has(index)).length;
-  const wrongSelections = selected.filter((index) => !correctSet.has(index)).length;
-  const missedCorrect = correctIndexes.filter((index) => !selectedSet.has(index)).length;
-  const raw = correctSelections - wrongSelections;
-  const denominator = Math.max(correctIndexes.length, 1);
-  const score = Math.max(0, raw) / denominator;
-  return { score, correctSelections, wrongSelections, missedCorrect, correctIndexes };
+  const correctSelections = selected.filter(index => correctSet.has(index)).length;
+  const wrongSelections = selected.filter(index => !correctSet.has(index)).length;
+  const missedCorrect = correctIndexes.filter(index => !selectedSet.has(index)).length;
+  const score = correctIndexes.length ? (noneSelected ? 0 : Math.max(0, correctSelections - wrongSelections) / correctIndexes.length) : (noneSelected && selected.length === 0 ? 1 : 0);
+  return {score, correctSelections, wrongSelections, missedCorrect, correctIndexes};
 }
-
 function checkMcAnswers() {
   const questions = asArray(exam.multiple_choice);
   let earned = 0;
-
-  questions.forEach((question, questionIndex) => {
-    const selected = selectedIndexes(questionIndex);
-    const result = scoreMcQuestion(question, selected);
+  questions.forEach((question, index) => {
+    const selected = selectedIndexes(index);
+    const result = scoreMcQuestion(question, selected, $(`#none-${index}`).checked);
     earned += result.score;
-
     asArray(question.options).forEach((option, optionIndex) => {
-      const optionElement = document.querySelector(`.option[data-question-index="${questionIndex}"][data-option-index="${optionIndex}"]`);
-      optionElement.classList.remove("correct-selected", "wrong-selected", "missed-correct");
-      if (selected.includes(optionIndex) && option.is_correct) optionElement.classList.add("correct-selected");
-      if (selected.includes(optionIndex) && !option.is_correct) optionElement.classList.add("wrong-selected");
-      if (!selected.includes(optionIndex) && option.is_correct) optionElement.classList.add("missed-correct");
+      const element = document.querySelector(`.option[data-question-index="${index}"][data-option-index="${optionIndex}"]`);
+      element.classList.toggle('correct-selected', selected.includes(optionIndex) && option.is_correct === true);
+      element.classList.toggle('wrong-selected', selected.includes(optionIndex) && option.is_correct !== true);
+      element.classList.toggle('missed-correct', !selected.includes(optionIndex) && option.is_correct === true);
     });
-
-    const correction = $(`#mc-correction-${questionIndex}`);
+    const correction = $(`#mc-correction-${index}`);
     correction.hidden = false;
-    correction.innerHTML = `
-      <strong>Score: ${Math.round(result.score * 100)}%</strong>
-      <div class="tag-list">
-        <span class="tag good">${result.correctSelections} selected correct</span>
-        <span class="tag bad">${result.wrongSelections} selected wrong</span>
-        <span class="tag missed">${result.missedCorrect} missed correct</span>
-      </div>
-      <p>${escapeHtml(question.explanation || "No explanation stored.")}</p>
-    `;
+    correction.innerHTML = `<strong>${Math.round(result.score * 100)}%</strong><p>${escapeHtml(question.explanation || '')}</p>`;
   });
-
   mcChecked = true;
-  const percent = questions.length ? Math.round((earned / questions.length) * 100) : 0;
-  const summary = $("#mc-summary");
-  summary.hidden = false;
-  summary.innerHTML = `<strong>Multiple-choice score: ${earned.toFixed(2)} / ${questions.length} (${percent}%)</strong>`;
-  updateScoreSummary();
+  $('#mc-summary').hidden = false;
+  $('#mc-summary').textContent = `${t('Ergebnis', 'Score')}: ${earned.toFixed(2)} / ${questions.length}`;
+  updateScoreSummary(); scheduleSave();
 }
-
+function renderList(items) {
+  return asArray(items).length ? `<ul>${items.map(item => `<li>${escapeHtml(item)}</li>`).join('')}</ul>` : '';
+}
+function renderOpenResult(index, result) {
+  const container = $(`#open-result-${index}`);
+  container.hidden = false;
+  if (result.error) { container.textContent = result.error; return; }
+  container.innerHTML = `<strong>${escapeHtml(result.score)} / 100 · ${escapeHtml(result.verdict)}</strong><p>${escapeHtml(result.feedback)}</p>${renderList(result.what_was_good)}${renderList(result.missing_key_points)}${renderList(result.conceptual_errors)}<details><summary>${t('Antwortvorschlag', 'Suggested answer')}</summary><p>${escapeHtml(result.model_answer || '')}</p></details>`;
+}
 async function callGrader(question, answer) {
-  const response = await fetch("/grade-open-answer", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      question: question.question,
-      student_answer: answer,
-      expected_answer: question.expected_answer,
-      key_concepts: asArray(question.key_concepts),
-      grading_rubric: resolveGradingRubric(question),
-      max_score: Number(question.max_score || 100)
-    })
-  });
-
+  const body = previewBase ? {exam_path: examPath, question_id: question.id, student_answer: answer} : {question: question.question, student_answer: answer, expected_answer: question.expected_answer, key_concepts: asArray(question.key_concepts), grading_rubric: resolveGradingRubric(question), max_score: 100};
+  const response = await fetch(previewBase ? `${previewBase}grade-open-answer` : '/grade-open-answer', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    throw new Error(data.error || `Grading server returned ${response.status}`);
-  }
-  if (data.error) {
-    throw new Error(data.error);
-  }
+  if (!response.ok || data.error) throw new Error(data.error || t('Bewertung nicht erreichbar. Öffne die Prüfung über die App.', 'Grading unavailable. Open this exam through the app.'));
   return data;
 }
-
-function renderList(items, emptyText) {
-  const values = asArray(items).filter(Boolean);
-  if (!values.length) return `<p>${escapeHtml(emptyText)}</p>`;
-  return `<ul>${values.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`;
-}
-
-function renderOpenResult(questionIndex, result) {
-  const container = $(`#open-result-${questionIndex}`);
-  container.hidden = false;
-
-  if (result.error) {
-    container.innerHTML = `
-      <strong class="bad">LLM grading unavailable.</strong>
-      <p>${escapeHtml(result.error)}</p>
-    `;
-    return;
-  }
-
-  const minorOrVagueIssues = asArray(result.minor_or_unimportant_issues).length
-    ? result.minor_or_unimportant_issues
-    : result.unsupported_or_vague_parts;
-
-  container.innerHTML = `
-    <strong>Punkte: ${Number(result.score || 0)} / ${Number(result.max_score || 100)} · ${escapeHtml(result.grade_band || "ohne Einstufung")}</strong>
-    <p>${escapeHtml(result.verdict || "")}</p>
-    <h4>Was gut war</h4>
-    ${renderList(result.what_was_good, "Keine besonderen Stärken gemeldet.")}
-    <h4>Was wirklich fehlt</h4>
-    ${renderList(result.missing_key_points, "Keine zentralen fehlenden Punkte gemeldet.")}
-    <h4>Fachliche Fehler</h4>
-    ${renderList(result.conceptual_errors, "Keine fachlichen Fehler gemeldet.")}
-    <h4>Unklare oder vage Stellen</h4>
-    ${renderList(minorOrVagueIssues, "Keine unklaren oder nur nebensächlichen Probleme gemeldet.")}
-    <h4>Feedback</h4>
-    <p>${escapeHtml(result.feedback || "")}</p>
-    <h4>Bessere Prüfungsantwort</h4>
-    <p>${escapeHtml(result.model_answer || "")}</p>
-  `;
-}
-
 async function gradeOpenAnswers() {
-  const button = $("#grade-open");
-  button.disabled = true;
-  button.textContent = "Grading...";
-  const questions = asArray(exam.open_ended);
-
-  for (let index = 0; index < questions.length; index += 1) {
-    const question = questions[index];
-    const answer = $(`#open-${index}`).value.trim();
-    if (!answer) {
-      const result = { score: 0, max_score: 100, grade_band: "0-19", verdict: "Keine Antwort abgegeben.", what_was_good: [], missing_key_points: asArray(question.key_concepts), conceptual_errors: [], minor_or_unimportant_issues: [], feedback: "Schreib zuerst eine Antwort, damit du sinnvolles Feedback bekommen kannst.", model_answer: question.expected_answer || "" };
-      openResults.set(index, result);
-      renderOpenResult(index, result);
-      continue;
+  const button = $('#grade-open'); button.disabled = true;
+  button.textContent = t('Wird bewertet …', 'Grading …');
+  try {
+    for (const [index, question] of asArray(exam.open_ended).entries()) {
+      const answer = $(`#open-${index}`).value.trim();
+      if (!answer) continue;
+      const saved = openResults.get(index);
+      if (saved?.answer === answer && typeof saved.score === 'number') continue;
+      try {
+        const result = {...await callGrader(question, answer), answer};
+        // A result belongs to the submitted answer, even if typing continued meanwhile.
+        if ($(`#open-${index}`).value.trim() !== answer) continue;
+        openResults.set(index, result); renderOpenResult(index, result); scheduleSave();
+      } catch (error) {
+        openResults.set(index, {answer, error: error.message}); renderOpenResult(index, openResults.get(index));
+      }
     }
-
-    try {
-      const result = await callGrader(question, answer);
-      openResults.set(index, result);
-      renderOpenResult(index, result);
-    } catch (error) {
-      const result = { error: `${error.message}. You can continue without LLM grading.`, score: null };
-      openResults.set(index, result);
-      renderOpenResult(index, result);
-      break;
+    openGraded = true; updateScoreSummary(); scheduleSave();
+  } finally { button.disabled = false; button.textContent = t('Fehlende Bewertungen anfordern', 'Request remaining feedback'); }
+}
+function updateScoreSummary() {
+  const graded = [...openResults.values()].filter(result => typeof result.score === 'number');
+  $('#open-summary').hidden = !openGraded;
+  $('#open-summary').textContent = `${t('Bewertete Antworten', 'Graded answers')}: ${graded.length} / ${asArray(exam.open_ended).length}${graded.length ? ` · Ø ${Math.round(graded.reduce((sum, result) => sum + result.score, 0) / graded.length)} / 100` : ''}`;
+  $('#score-summary').hidden = !mcChecked && !openGraded;
+  $('#score-summary').textContent = t('KI-Feedback dient der Übung und kann Fehler enthalten. Prüfe die Quellen bei Unklarheiten.', 'AI feedback is for practice and can contain errors. Review the sources when in doubt.');
+}
+function updateProgress(save = true) {
+  if (!exam) return;
+  const mc = asArray(exam.multiple_choice), open = asArray(exam.open_ended);
+  const answered = mc.filter((_, index) => selectedIndexes(index).length || $(`#none-${index}`).checked).length + open.filter((_, index) => $(`#open-${index}`).value.trim()).length;
+  $('#progress-count').textContent = `${answered} / ${mc.length + open.length} ${t('beantwortet', 'answered')}`;
+  $('#progress-bar').value = mc.length + open.length ? Math.round(answered / (mc.length + open.length) * 100) : 0;
+  if (save) scheduleSave();
+}
+function bindEvents() {
+  document.addEventListener('change', event => {
+    const match = event.target.id?.match(/^(?:mc|none)-(\d+)/);
+    if (match) {
+      const index = Number(match[1]);
+      if (event.target.id.startsWith('none-') && event.target.checked) document.querySelectorAll(`input[name="mc-${index}"]`).forEach(input => { input.checked = false; });
+      else if (event.target.checked) $(`#none-${index}`).checked = false;
+      mcChecked = false; $('#mc-summary').hidden = true; $(`#mc-correction-${index}`).hidden = true;
+      document.querySelectorAll(`.option[data-question-index="${index}"]`).forEach(item => item.classList.remove('correct-selected', 'wrong-selected', 'missed-correct'));
     }
-  }
-
-  openGraded = true;
-  button.disabled = false;
-  button.textContent = "Grade open answers with LLM";
-  const summary = $("#open-summary");
-  summary.hidden = false;
-  const graded = [...openResults.values()].filter((result) => typeof result.score === "number");
-  const average = graded.length ? Math.round(graded.reduce((sum, result) => sum + Number(result.score || 0), 0) / graded.length) : 0;
-  summary.innerHTML = `<strong>Open-answer grading: ${graded.length} graded · average ${average} / 100</strong>`;
+    updateProgress(); updateScoreSummary();
+  });
+  document.addEventListener('input', event => {
+    const match = event.target.id?.match(/^open-(\d+)$/);
+    if (match) { const index = Number(match[1]); openResults.delete(index); $(`#open-result-${index}`).hidden = true; }
+    updateProgress(); updateScoreSummary();
+  });
+  $('#check-mc').addEventListener('click', checkMcAnswers);
+  $('#grade-open').addEventListener('click', gradeOpenAnswers);
+  $('#skip-open').addEventListener('click', () => { document.querySelectorAll('#open-form details').forEach(details => { details.open = true; }); });
+}
+function attemptData() {
+  return {mc: asArray(exam.multiple_choice).map((_, index) => ({selected: selectedIndexes(index), none: $(`#none-${index}`).checked})), open: asArray(exam.open_ended).map((_, index) => $(`#open-${index}`).value), results: [...openResults], mcChecked, openGraded};
+}
+function restoreAttempt(attempt) {
+  asArray(attempt.mc).forEach((answer, index) => { asArray(answer.selected).forEach(option => { const input = $(`#mc-${index}-${option}`); if (input) input.checked = true; }); if ($(`#none-${index}`)) $(`#none-${index}`).checked = answer.none === true; });
+  asArray(attempt.open).forEach((answer, index) => { if ($(`#open-${index}`)) $(`#open-${index}`).value = String(answer); });
+  asArray(attempt.results).forEach(([index, result]) => { if ($(`#open-${index}`)?.value.trim() === result.answer) { openResults.set(index, result); renderOpenResult(index, result); } });
+  openGraded = attempt.openGraded === true;
+  if (attempt.mcChecked) checkMcAnswers();
   updateScoreSummary();
 }
-
-function updateProgress() {
-  if (!exam) return;
-  const mcTotal = asArray(exam.multiple_choice).length;
-  const openTotal = asArray(exam.open_ended).length;
-  const answeredMc = asArray(exam.multiple_choice).filter((_, index) => selectedIndexes(index).length > 0).length;
-  const answeredOpen = asArray(exam.open_ended).filter((_, index) => $(`#open-${index}`)?.value.trim()).length;
-  const total = mcTotal + openTotal;
-  const answered = answeredMc + answeredOpen;
-  $("#progress-count").textContent = `${answered} / ${total} answered`;
-  $("#progress-bar").value = total ? Math.round((answered / total) * 100) : 0;
+function scheduleSave() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(saveAttempt, 400);
 }
-
-function updateScoreSummary() {
-  if (!mcChecked && !openGraded) return;
-  const container = $("#score-summary");
-  container.hidden = false;
-  const parts = [];
-  if (mcChecked) {
-    const questions = asArray(exam.multiple_choice);
-    const earned = questions.reduce((sum, question, index) => sum + scoreMcQuestion(question, selectedIndexes(index)).score, 0);
-    parts.push(`MC: ${earned.toFixed(2)} / ${questions.length}`);
-  }
-  if (openGraded) {
-    const graded = [...openResults.values()].filter((result) => typeof result.score === "number");
-    if (graded.length) {
-      const avg = Math.round(graded.reduce((sum, result) => sum + Number(result.score || 0), 0) / graded.length);
-      parts.push(`Open average: ${avg} / 100`);
-    } else {
-      parts.push("Open grading skipped or unavailable");
-    }
-  }
-  container.innerHTML = `<strong>Score summary</strong><p>${escapeHtml(parts.join(" · "))}</p>`;
+async function saveAttempt() {
+  if (!fingerprint) return;
+  try {
+    const attempt = attemptData();
+    if (previewBase) {
+      const response = await fetch(`${previewBase}attempt`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({exam_path: examPath, fingerprint, attempt}), keepalive: true});
+      if (!response.ok) throw new Error();
+    } else localStorage.setItem(`exam-attempt:${fingerprint}`, JSON.stringify(attempt));
+    notice(t('Lernstand gespeichert.', 'Progress saved.'));
+  } catch { notice(t('Speichern fehlgeschlagen. Lass das Fenster geöffnet und versuche es erneut.', 'Saving failed. Keep this window open and try again.')); }
 }
-
-loadExam().catch((error) => {
-  document.body.innerHTML = `<main class="exam-shell"><section class="warning"><strong>Could not load exam.</strong><p>${escapeHtml(error.message)}</p></section></main>`;
-});
+window.addEventListener('pagehide', () => { if (fingerprint) { clearTimeout(saveTimer); void saveAttempt(); } });
+loadExam().catch(error => { document.body.innerHTML = `<main class="exam-shell"><p role="alert">${escapeHtml(error.message)}</p></main>`; });

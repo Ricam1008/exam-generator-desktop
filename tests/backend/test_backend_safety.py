@@ -198,7 +198,7 @@ class BackendSafetyTests(unittest.TestCase):
         self.assertIsNone(args.target_open)
         self.assertEqual((args.min_mc, args.max_mc), (None, None))
         self.assertEqual((args.min_open, args.max_open), (None, None))
-        self.assertTrue(args.allow_heuristic_fallback)
+        self.assertFalse(args.allow_heuristic_fallback)
         self.assertEqual(args.coverage_mode, "representative")
         self.assertEqual(args.model, "llama3.1:8b")
         self.assertEqual(args.max_parallel_chunks, 2)
@@ -1050,9 +1050,9 @@ class BackendSafetyTests(unittest.TestCase):
         generate_exams.attach_question_metadata(questions, "--- Page 2 ---\n[PAGE 2 TEXT]\nFormel und Tabelle [TABLE page=2 index=1]", "chunk-001")
 
         self.assertEqual(questions[0]["answer_mode"], "single_correct")
-        self.assertEqual(questions[0]["_meta"]["evidence_pages"], [2, 3])
-        self.assertEqual(questions[0]["_meta"]["source_pages"], [2, 3])
-        self.assertEqual(questions[0]["_meta"]["source_excerpt"], "P = MC")
+        self.assertEqual(questions[0]["_meta"]["evidence_pages"], [2])
+        self.assertEqual(questions[0]["_meta"]["source_pages"], [2])
+        self.assertIsNone(questions[0]["_meta"]["source_excerpt"])
         self.assertEqual(questions[0]["_meta"]["source_type"], "formula")
         self.assertEqual(questions[0]["_meta"]["chunk_page_range"], [2])
 
@@ -1189,7 +1189,7 @@ class BackendSafetyTests(unittest.TestCase):
 
     def test_job_log_writes_to_configured_log_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            job = Job(id="test", kind="example")
+            job = Job(id="test", kind="example", diagnostics=True)
             log_path = Path(temp) / "generation-test.log"
             cli.attach_job_log_path(job, log_path)
 
@@ -1211,20 +1211,20 @@ class BackendSafetyTests(unittest.TestCase):
             cli.attach_job_log_path(job, log_path)
 
             self.assertTrue(cli.request_job_cancel(job))
-            self.assertEqual(job.status, "canceled")
+            self.assertEqual(job.status, "stopping")
             self.assertTrue(job.cancel_requested)
-            self.assertEqual(job.message, "Canceled")
+            self.assertEqual(job.message, "Wird gestoppt …")
 
             text = log_path.read_text(encoding="utf-8")
-            self.assertIn("Stop requested", text)
-            self.assertIn("Job canceled", text)
+            self.assertIn("Stopp angefordert", text)
+            self.assertTrue(cli.STATE.events[job.id].is_set())
 
     def test_cancel_endpoint_returns_updated_job(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            class FakePostHandler:
+            class FakePostHandler(cli.Handler):
                 def __init__(self, path: str) -> None:
                     self.path = path
-                    self.headers = {"Content-Length": "0"}
+                    self.headers = {"Content-Length": "0", "Host": f"127.0.0.1:{cli.STATE.port}", "Authorization": "Bearer " + cli.STATE.token}
                     self.rfile = io.BytesIO()
                     self.status: int | None = None
                     self.headers_sent: list[tuple[str, str]] = []
@@ -1250,7 +1250,7 @@ class BackendSafetyTests(unittest.TestCase):
                 self.assertEqual(handler.status, 200)
                 self.assertTrue(body["ok"])
                 self.assertTrue(body["canceled"])
-                self.assertEqual(body["job"]["status"], "canceled")
+                self.assertEqual(body["job"]["status"], "stopping")
                 self.assertTrue(body["job"]["cancel_requested"])
             finally:
                 cli.STATE.jobs.pop(job.id, None)
@@ -1278,21 +1278,22 @@ class BackendSafetyTests(unittest.TestCase):
                     "open_count": 1,
                 }
 
-            try:
-                cli.generate_exams.write_exam_folder = fake_write_exam_folder  # type: ignore[assignment]
+            from unittest.mock import patch
+            from exam_backend import documents
+            def fake_extract(path, *args, **kwargs):
+                return {"text": "A useful lecture source with several concepts.", "blocks": [], "warnings": [], "fingerprint": documents.file_fingerprint(path)}
+            with patch.object(documents, "extract_document", side_effect=fake_extract), patch.object(cli.generate_exams, "write_exam_folder", side_effect=fake_write_exam_folder), patch.object(cli, "fallback_log_dir", return_value=tmp / "logs"):
                 cli.run_generation(job, {"input_path": str(source), "output_path": str(output), "mode": "all"})
-            finally:
-                cli.generate_exams.write_exam_folder = original_write_exam_folder  # type: ignore[assignment]
 
-            self.assertEqual(calls, ["one.pdf"])
+            self.assertEqual(len(calls), 1)
             self.assertEqual(job.status, "canceled")
-            self.assertTrue(any("Discarding late result for one.pdf after stop request" in line for line in job.logs))
+            self.assertEqual(list(output.glob("*/exam_index.html")), [])
 
     def test_run_generation_failure_writes_fallback_log_with_traceback(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             original_fallback_log_dir = cli.fallback_log_dir
             cli.fallback_log_dir = lambda: Path(temp)  # type: ignore[assignment]
-            job = Job(id="failed", kind="example")
+            job = Job(id="failed", kind="example", diagnostics=True)
 
             try:
                 cli.run_generation(job, {"mode": "example"})
@@ -1307,18 +1308,19 @@ class BackendSafetyTests(unittest.TestCase):
 
     def test_job_log_endpoint_returns_complete_text(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            class FakeHandler:
+            class FakeHandler(cli.Handler):
                 def __init__(self, path: str) -> None:
                     self.path = path
+                    self.headers = {"Host": f"127.0.0.1:{cli.STATE.port}", "Authorization": "Bearer " + cli.STATE.token}
                     self.status: int | None = None
-                    self.headers: list[tuple[str, str]] = []
+                    self.response_headers: list[tuple[str, str]] = []
                     self.wfile = io.BytesIO()
 
                 def send_response(self, status: int) -> None:
                     self.status = status
 
                 def send_header(self, key: str, value: str) -> None:
-                    self.headers.append((key, value))
+                    self.response_headers.append((key, value))
 
                 def end_headers(self) -> None:
                     return None
@@ -1337,7 +1339,7 @@ class BackendSafetyTests(unittest.TestCase):
                 missing = FakeHandler("/api/jobs/missing/log")
                 cli.Handler.do_GET(missing)  # type: ignore[arg-type]
                 self.assertEqual(missing.status, 404)
-                self.assertIn("Job not found", missing.wfile.getvalue().decode("utf-8"))
+                self.assertIn("Auftrag nicht gefunden", missing.wfile.getvalue().decode("utf-8"))
             finally:
                 cli.STATE.jobs.pop(job.id, None)
 
