@@ -18,7 +18,7 @@ impl BackendState {
         if let Ok(mut guard) = self.0.lock() {
             if let Some(mut backend) = guard.take() {
                 if let Some(stdin) = backend.child.stdin.as_mut() { let _ = stdin.write_all(b"shutdown\n"); }
-                let deadline = Instant::now() + Duration::from_secs(3);
+                let deadline = Instant::now() + Duration::from_secs(8);
                 while Instant::now() < deadline {
                     if backend.child.try_wait().ok().flatten().is_some() { return; }
                     std::thread::sleep(Duration::from_millis(50));

@@ -143,7 +143,7 @@ function renderOpenResult(index, result) {
   container.innerHTML = `<strong>${escapeHtml(result.score)} / 100 · ${escapeHtml(result.verdict)}</strong><p>${escapeHtml(result.feedback)}</p>${renderList(result.what_was_good)}${renderList(result.missing_key_points)}${renderList(result.conceptual_errors)}<details><summary>${t('Antwortvorschlag', 'Suggested answer')}</summary><p>${escapeHtml(result.model_answer || '')}</p></details>`;
 }
 async function callGrader(question, answer) {
-  const body = previewBase ? {exam_path: examPath, question_id: question.id, student_answer: answer} : {question: question.question, student_answer: answer, expected_answer: question.expected_answer, key_concepts: asArray(question.key_concepts), grading_rubric: resolveGradingRubric(question), max_score: 100};
+  const body = previewBase ? {exam_path: examPath, fingerprint, question_id: question.id, student_answer: answer} : {question: question.question, student_answer: answer, expected_answer: question.expected_answer, key_concepts: asArray(question.key_concepts), grading_rubric: resolveGradingRubric(question), max_score: 100};
   const response = await fetch(previewBase ? `${previewBase}grade-open-answer` : '/grade-open-answer', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
   const data = await response.json().catch(() => ({}));
   if (!response.ok || data.error) throw new Error(data.error || t('Bewertung nicht erreichbar. Öffne die Prüfung über die App.', 'Grading unavailable. Open this exam through the app.'));
@@ -221,16 +221,16 @@ function scheduleSave() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(saveAttempt, 400);
 }
-async function saveAttempt() {
+async function saveAttempt(keepalive = false) {
   if (!fingerprint) return;
   try {
     const attempt = attemptData();
     if (previewBase) {
-      const response = await fetch(`${previewBase}attempt`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({exam_path: examPath, fingerprint, attempt}), keepalive: true});
+      const response = await fetch(`${previewBase}attempt`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({exam_path: examPath, fingerprint, attempt}), keepalive});
       if (!response.ok) throw new Error();
     } else localStorage.setItem(`exam-attempt:${fingerprint}`, JSON.stringify(attempt));
     notice(t('Lernstand gespeichert.', 'Progress saved.'));
   } catch { notice(t('Speichern fehlgeschlagen. Lass das Fenster geöffnet und versuche es erneut.', 'Saving failed. Keep this window open and try again.')); }
 }
-window.addEventListener('pagehide', () => { if (fingerprint) { clearTimeout(saveTimer); void saveAttempt(); } });
+window.addEventListener('pagehide', () => { if (fingerprint) { clearTimeout(saveTimer); void saveAttempt(true); } });
 loadExam().catch(error => { document.body.innerHTML = `<main class="exam-shell"><p role="alert">${escapeHtml(error.message)}</p></main>`; });

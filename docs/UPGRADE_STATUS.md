@@ -1,13 +1,13 @@
-# Mac app upgrade — checkpoint 1
+# Mac app upgrade — checkpoint 2
 
-The upgrade is implemented in source and remains under integration verification.
+Implemented in source: German four-area workflow; Ollama, DeepSeek, compatible APIs and official ChatGPT sign-in; Keychain credentials; PDF/Office/text/image extraction; native OCR; source IDs/fingerprints; atomic output replacement; cancellation; scoped previews; and saved attempts.
 
-Implemented: German four-area interface, provider profiles, DeepSeek/custom APIs, official ChatGPT sign-in implementation, protected credential storage, local document extraction/OCR, per-run generation context, transactional outputs, source identity/fingerprints, scoped previews, and saved study attempts.
+Fresh verification: all 120 backend tests passed with normal macOS permissions, including native document tests and 18 real HTTP/subprocess integration tests. Frontend build and all four frontend tests passed. Rust check passed before the latest shutdown-deadline-only edit. Dependency audit reported zero findings.
 
-Fresh checks: 97 backend tests ran, 93 passed and four optional native-document tests skipped in the restricted unit run; those four native runtime tests passed separately with normal macOS access. Frontend build and two frontend tests passed. Rust check passed. The dependency audit reported zero findings.
+The standalone document backend passed 18/18 smoke checks after bundling missing latex2mathml resources. Native Mac app startup, source scan and extraction review were visually checked. Browser workflow with a local simulated AI verified custom counts, generation, none-correct scoring, grading, restored attempts and invalidation after answer edits. This was not a live paid-provider test.
 
-The bundled backend was built. Its initial launch check was blocked by the restricted process permission to bind a loopback socket; repeat with normal macOS access. No final app/DMG or release-readiness claim yet.
+The backend package was reduced from about 1.5 GB to 165 MB using Docling's model-free Office dependencies. Native OCR and Granite-Docling 258M were compared on the same six synthetic pages; native OCR was faster and had better text/order scores. Granite is not enabled or bundled. The measurement and model revision are in docs/verification/ocr-comparison.json. These simple fixtures do not establish performance on difficult lecture scans.
 
-Remaining verification and completion: integrated HTTP security and preview/attempt tests; default/fresh finals and partial-failure behavior; complete browser/native workflow and bounded visual review; packaged document tools and credential store; app/DMG build and smoke test. Enhanced Granite OCR and cloud-image processing are not enabled. Real ChatGPT eligibility and live paid inference were not tested.
+Remaining delivery checks: rebuild the latest source into the app/DMG, rerun standalone generation/Keychain smoke, validate final installer and reopen behavior, then refresh these notes. Real ChatGPT eligibility and real paid inference remain unverified. Cloud-image extraction is not offered.
 
-Original material and existing generated outputs are preserved. Model weights have not been downloaded. Build files and credentials are excluded from Git.
+Original material and existing outputs are preserved. Credentials, model weights, local state and build artifacts are excluded from Git.

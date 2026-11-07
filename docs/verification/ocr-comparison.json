@@ -1,0 +1,149 @@
+{
+  "fixture_version": 1,
+  "measured_at": "2026-11-07T12:42:21+0100",
+  "platform": "darwin",
+  "versions": {
+    "docling": "2.148.0",
+    "ocrmac": "1.0.1",
+    "pypdfium2": "5.15.0",
+    "pdfplumber": "0.11.10",
+    "pypdf": "7.0.0"
+  },
+  "engines": [
+    {
+      "status": "measured",
+      "engine": "native",
+      "initialization_seconds": 0.0,
+      "peak_rss_bytes": 142475264,
+      "local_model_bytes": 0,
+      "downloads_performed": false,
+      "rows": [
+        {
+          "file": "german.png",
+          "category": "german",
+          "seconds": 0.335,
+          "text": "Gedächtnis und Lernen\nDas Arbeitsgedächtnis verarbeitet neue Informationen.\nWiederholung unterstützt die langfristige Speicherung.\nAufmerksamkeit beeinflusst die Aufnahme von Inhalten.",
+          "word_recall": 1.0,
+          "character_similarity": 1.0,
+          "reading_order": 1.0
+        },
+        {
+          "file": "english.png",
+          "category": "english",
+          "seconds": 0.099,
+          "text": "Learning and attention\nWorking memory has limited capacity.\nRetrieval practice improves long term retention.\nThe study compares younger and older participants.",
+          "word_recall": 1.0,
+          "character_similarity": 1.0,
+          "reading_order": 1.0
+        },
+        {
+          "file": "table.png",
+          "category": "table",
+          "seconds": 0.08,
+          "text": "Tabelle: Reaktionszeiten\nGruppe Mittelwert Einheit\nKontrolle 420 ms\nTraining 360 ms\nDifferenz 60 ms",
+          "word_recall": 1.0,
+          "character_similarity": 1.0,
+          "reading_order": 1.0
+        },
+        {
+          "file": "formula.png",
+          "category": "formula",
+          "seconds": 0.056,
+          "text": "Statistik und Formeln\nMittelwert = Summe / Anzahl\nVarianz = 16\nStandardabweichung = 4\nStichprobe n = 25",
+          "word_recall": 1.0,
+          "character_similarity": 1.0,
+          "reading_order": 1.0
+        },
+        {
+          "file": "rotated.png",
+          "category": "rotated",
+          "seconds": 0.089,
+          "text": "Entwicklungspsychologie\nKinder lernen durch Beobachtung.\nSoziale Erfahrungen beeinflussen die Entwicklung.\nDie Untersuchung umfasst drei Altersgruppen.",
+          "word_recall": 1.0,
+          "character_similarity": 1.0,
+          "reading_order": 1.0
+        },
+        {
+          "file": "mixed.png",
+          "category": "mixed",
+          "seconds": 0.083,
+          "text": "Experiment zur Aufmerksamkeit\nPhase A: Lernmaterial lesen.\nPhase B: Fragen ohne Unterlagen beantworten.\nErgebnis: Wiederholtes Abrufen verbessert die Erinnerung.",
+          "word_recall": 1.0,
+          "character_similarity": 1.0,
+          "reading_order": 1.0
+        }
+      ]
+    },
+    {
+      "status": "measured",
+      "engine": "granite",
+      "initialization_seconds": 14.584,
+      "peak_rss_bytes": 2102394880,
+      "local_model_bytes": 524801183,
+      "downloads_performed": false,
+      "rows": [
+        {
+          "file": "german.png",
+          "category": "german",
+          "seconds": 16.806,
+          "text": "Gedächtnis und Lernen\n\nDas Arbeitsgedächtnis verarbeitet neue Informationen.\n\nWiederholung unterstützt die langfristige Speicherung.\n\nAufmerksamkeit beeinflusst die Aufnahme von Inhalten.",
+          "word_recall": 1.0,
+          "character_similarity": 1.0,
+          "reading_order": 1.0
+        },
+        {
+          "file": "english.png",
+          "category": "english",
+          "seconds": 12.389,
+          "text": "Learning and attention\n\nWorking memory has limited capacity.\n\nRetrieval practice improves long term retention.\n\nThe study compares younger and older participants.",
+          "word_recall": 1.0,
+          "character_similarity": 1.0,
+          "reading_order": 1.0
+        },
+        {
+          "file": "table.png",
+          "category": "table",
+          "seconds": 8.284,
+          "text": "| Gruppe    |   Mittelwert | Einheit   |\n|-----------|--------------|-----------|\n| Kontrolle |          420 | ms        |\n| Training  |          360 | ms        |\n| Differenz |           60 | ms        |\n| Differenz |           60 | ms        |",
+          "word_recall": 0.8571,
+          "character_similarity": 0.7872,
+          "reading_order": 0.75
+        },
+        {
+          "file": "formula.png",
+          "category": "formula",
+          "seconds": 16.289,
+          "text": "```\nStatistik und Formeln\n```\n\nMittelwert = Summe / Anzahl\n\nVarianz = 16\n\nStandardabweichung = 4\n\nStichprobe n = 25",
+          "word_recall": 1.0,
+          "character_similarity": 1.0,
+          "reading_order": 1.0
+        },
+        {
+          "file": "rotated.png",
+          "category": "rotated",
+          "seconds": 40.755,
+          "text": "Powered by TCPDF (www.tcpdf.org)\n\nKinder lernen durch Beobachtung.\n\nDie Untersuchung\n\nSoziale Erfahrungen beeinflussen die Änderung der Änderung.\n\nDie Untersuchung\n\nUntersuchung\n\nUntersuchung\n\nUntersuchung\n\nUntersuchung\n\nUntersuchung\n\nUntersuchung",
+          "word_recall": 0.6667,
+          "character_similarity": 0.3307,
+          "reading_order": 0.0
+        },
+        {
+          "file": "mixed.png",
+          "category": "mixed",
+          "seconds": 17.075,
+          "text": "Experiment zur Aufmerksamkeit\n\nPhase A: Lernmaterial lesen.\n\nPhase B: Fragen ohne Unterlagen beantworten.\n\nErgebnis: Wiederholtes Abrufen verbessert die Erinnerung.\n\n<!-- image -->",
+          "word_recall": 1.0,
+          "character_similarity": 0.981,
+          "reading_order": 1.0
+        }
+      ]
+    }
+  ],
+  "enhanced_qualified": false,
+  "model_preparation": {
+    "repository": "ibm-granite/granite-docling-258M",
+    "revision": "982fe3b40f2fa73c365bdb1bcacf6c81b7184bfe",
+    "downloaded_for_this_comparison": true,
+    "included_in_app": false
+  }
+}

@@ -56,6 +56,69 @@ class UpgradeTests(unittest.TestCase):
             self.assertEqual(len(list(g.discover_generated_exams(Path(third.result['project_root'])).values())[0]), 1)
         self.assertTrue(before)
         self.assertEqual(list(source.glob('exams')), [])
+    def test_fresh_final_uses_selected_extractions_without_deck_exams(self):
+        source = self.source()
+        (source / 'second.md').write_text('A second lecture discusses attention and memory. Retrieval is useful for learning.', encoding='utf-8')
+        def complete(profile_id, model, messages, **kwargs):
+            prompt = messages[-1]['content']
+            if 'coverage blueprint' in prompt:
+                return providers.ProviderResult(json.dumps({'major_topics': [{'topic': 'Lernen', 'exam_targets': ['Lernen erklären']}]}), {}, 'stop')
+            return self.fake_complete()
+        job = cli.Job(id='fresh-final', kind='finals')
+        with patch.object(providers, 'complete', side_effect=complete):
+            cli.run_generation(job, {'input_path': str(source), 'output_path': str(self.root / 'out'), 'mode': 'finals', 'profile_id': 'ollama', 'model': 'test', 'target_mode': 'manual', 'target_mc': 1, 'target_open': 1})
+        self.assertEqual(job.status, 'done', job.error)
+        exams = list(Path(job.result['project_root']).glob('*/exams/*/exam.json'))
+        self.assertEqual(len(exams), 1)
+        exam = json.loads(exams[0].read_text())
+        self.assertTrue(exam['metadata']['is_final_exam'])
+        self.assertEqual(len(exam['metadata']['included_sources']), 2)
+        self.assertEqual(len(exam['multiple_choice']), 1)
+        self.assertEqual(len(exam['open_ended']), 1)
+    def test_manual_open_only_and_mc_only(self):
+        source = self.source()
+        for mc, opened in [(0, 2), (2, 0)]:
+            with self.subTest(mc=mc, opened=opened), patch.object(providers, 'complete', side_effect=self.fake_complete):
+                job = cli.Job(id=f'only-{mc}', kind='all')
+                cli.run_generation(job, {'input_path': str(source), 'output_path': str(self.root / f'out-{mc}'), 'mode': 'all', 'profile_id': 'ollama', 'model': 'test', 'target_mode': 'manual', 'target_mc': mc, 'target_open': opened})
+                self.assertEqual(job.status, 'done', job.error)
+                exam = json.loads(next(Path(job.result['project_root']).glob('*/exams/*/exam.json')).read_text())
+                self.assertEqual(bool(exam['multiple_choice']), bool(mc))
+                self.assertEqual(bool(exam['open_ended']), bool(opened))
+    def test_terminal_provider_failure_keeps_completed_exam_as_partial(self):
+        source = self.source()
+        for name in ['second.txt', 'third.txt']:
+            (source / name).write_text('Another lecture has useful evidence and explains practice and learning.', encoding='utf-8')
+        response = self.fake_complete()
+        with patch.object(providers, 'complete', side_effect=[response, providers.ProviderError('balance', 'Limit erreicht')]):
+            job = self.run_job(source)
+        self.assertEqual(job.status, 'partial', job.error)
+        self.assertEqual(len(job.result['generated']), 1)
+        self.assertEqual(len(job.result['failed']), 1)
+        self.assertEqual(len(job.result['skipped']), 1)
+        self.assertEqual(len(list(Path(job.result['project_root']).glob('*/exams/*/exam.json'))), 1)
+    def test_output_roots_do_not_repoint_existing_workspace(self):
+        source = self.source()
+        with patch.object(providers, 'complete', side_effect=self.fake_complete):
+            first = self.run_job(source)
+            second = cli.Job(id='other-output', kind='all')
+            cli.run_generation(second, {'input_path': str(source), 'output_path': str(self.root / 'other-output'), 'mode': 'all', 'profile_id': 'ollama', 'model': 'test'})
+        self.assertEqual(first.status, 'done', first.error)
+        self.assertEqual(second.status, 'done', second.error)
+        self.assertNotEqual(first.result['workspace_id'], second.result['workspace_id'])
+        self.assertEqual(cli.STATE.workspaces[first.result['workspace_id']]['root'], first.result['project_root'])
+        self.assertEqual(cli.STATE.workspaces[second.result['workspace_id']]['root'], second.result['project_root'])
+    def test_registry_count_updates_and_corruption_is_not_overwritten(self):
+        source = self.source()
+        with patch.object(providers, 'complete', side_effect=self.fake_complete):
+            first = self.run_job(source)
+            (source / 'more.md').write_text('Another lecture explains useful concepts and practice.', encoding='utf-8')
+            second = self.run_job(source)
+        self.assertEqual(second.status, 'done', second.error)
+        self.assertEqual(cli.load_registry()['workspaces'][first.result['workspace_id']]['exam_count'], 2)
+        cli.settings_path().write_text('{broken', encoding='utf-8')
+        with self.assertRaises(ValueError): cli.save_registry()
+        self.assertEqual(cli.settings_path().read_text(), '{broken')
     def test_cancel_during_provider_does_not_publish(self):
         source = self.source()
         job = cli.Job(id='cancel', kind='all')

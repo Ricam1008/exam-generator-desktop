@@ -73,6 +73,7 @@ class State:
         self.selected_model = DEFAULT_MODEL
         self.lock = threading.RLock()
         self.events: dict[str, threading.Event] = {}
+        self.workers: dict[str, threading.Thread] = {}
         self.workspaces: dict[str, dict] = {}
         self.preview_tokens: dict[str, dict] = {}
         self.token = secrets.token_urlsafe(32)
@@ -554,19 +555,30 @@ def settings_path() -> Path:
     return Path.home() / '.exam-generator-desktop' / 'workspaces.json'
 
 
-def load_registry():
+def registry_data():
     try:
         data = json.loads(settings_path().read_text(encoding='utf-8'))
-        STATE.workspaces.update(data.get('workspaces', {}))
-        return data
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return {'workspaces': {}, 'grading_profile_id': None}
+    except (OSError, ValueError) as exc:
+        raise ValueError('Die Arbeitsbereichsliste konnte nicht gelesen werden. Sie wurde nicht überschrieben.') from exc
+    if not isinstance(data, dict) or not isinstance(data.get('workspaces'), dict):
+        raise ValueError('Die Arbeitsbereichsliste ist beschädigt. Sie wurde nicht überschrieben.')
+    return data
+
+
+def load_registry():
+    with STATE.lock:
+        data = registry_data()
+        STATE.workspaces.update(data['workspaces'])
+        return data
 
 
 def save_registry(data=None):
-    data = data or load_registry()
-    data['workspaces'] = STATE.workspaces
-    runtime.atomic_json(settings_path(), data)
+    with STATE.lock:
+        data = registry_data() if data is None else data
+        data['workspaces'] = copy.deepcopy(STATE.workspaces)
+        runtime.atomic_json(settings_path(), data)
 
 
 def scan_documents(payload):
@@ -582,6 +594,12 @@ def scan_documents(payload):
 
 
 def generation_options(payload):
+    extraction_modes = payload.get('extraction_modes', {})
+    assignments = payload.get('course_assignments', {})
+    if not isinstance(extraction_modes, dict) or any(not isinstance(k, str) or v not in {'auto', 'ocr'} for k, v in extraction_modes.items()):
+        raise ValueError('Ungültige Einstellungen für die Texterkennung.')
+    if not isinstance(assignments, dict) or any(not isinstance(k, str) or not isinstance(v, str) or not v.strip() or len(v) > 200 for k, v in assignments.items()):
+        raise ValueError('Ungültige Lehrveranstaltungszuordnung.')
     language = payload.get('language', 'de')
     difficulty = payload.get('difficulty', 'balanced')
     coverage = payload.get('coverage_mode', 'auto')
@@ -634,7 +652,10 @@ def start_job(payload):
             if STATE.jobs[key].status not in {'running', 'stopping'}:
                 STATE.jobs.pop(key, None)
                 STATE.events.pop(key, None)
-        threading.Thread(target=run_generation, args=(job, snapshot), daemon=True).start()
+                STATE.workers.pop(key, None)
+        worker = threading.Thread(target=run_generation, args=(job, snapshot), daemon=True)
+        STATE.workers[job.id] = worker
+        worker.start()
     return job
 
 
@@ -658,7 +679,7 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
         if not sources:
             raise ValueError('Keine ausgewählten Dokumente gefunden.')
         src_root = Path(input_path).expanduser().resolve()
-        workspace_id = hashlib.sha256(str(src_root).encode()).hexdigest()[:16]
+        workspace_id = hashlib.sha256((str(src_root) + '\0' + str(output)).encode()).hexdigest()[:16]
         destination = output / f'{slugify(src_root.name)}--{workspace_id}'
         if destination.is_symlink():
             raise ValueError('Der Arbeitsbereich darf kein symbolischer Link sein.')
@@ -671,7 +692,7 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
         attach_job_log_path(job, generation_log_path(job, staging))
         model = payload.get('model') or DEFAULT_MODEL
         profile_id = payload.get('profile_id') or 'ollama'
-        settings = dict(options, profile_id=profile_id, model=model, profile_snapshot=payload.get('profile_snapshot'), extraction_mode=payload.get('extraction_mode', 'auto'))
+        settings = dict(options, profile_id=profile_id, model=model, profile_snapshot=payload.get('profile_snapshot'), extraction_modes=payload.get('extraction_modes', {}))
         signature = hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()
         manifest_path = staging / 'workspace.json'
         try:
@@ -690,7 +711,7 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
                     # A scan is a snapshot, not permission to substitute changed content.
                     if generate_exams.pdf_file_hash(Path(source['path'])) != source['fingerprint']:
                         raise ValueError('Datei wurde seit dem Einlesen geändert. Bitte erneut einlesen.')
-                    doc = documents.extract_document(Path(source['path']), staging / '.exam-generator-cache', cancel_event=event, mode=payload.get('extraction_mode', 'auto'))
+                    doc = documents.extract_document(Path(source['path']), staging / '.exam-generator-cache', cancel_event=event, mode=payload.get('extraction_modes', {}).get(source['id'], 'auto'))
                     runtime.check_cancel()
                     doc.update({k: source[k] for k in ('id', 'name', 'fingerprint', 'path')})
                     course = payload.get('course_assignments', {}).get(source['id'], source['course'])
@@ -699,6 +720,7 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
                     course_dir = staging / (slugify(course) + '--' + hashlib.sha256(course.encode()).hexdigest()[:8])
                     course_dir.mkdir(exist_ok=True)
                     synthetic = course_dir / ('source-' + source['id'] + Path(source['name']).suffix.lower())
+                    doc['course'] = course
                     context['documents'][str(synthetic)] = doc
                     extracted.append((source, doc, course_dir, synthetic))
                     manifest['sources'][source['id']] = dict(source, course=course)
@@ -734,6 +756,7 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
                 try:
                     if options['mode'] == 'finals':
                         args = final_args(staging, overwrite=True, model=model)
+                        args.course_label = manifest['sources'][source['id']]['course']
                         if options['target_mode'] == 'manual':
                             args.target_mc, args.target_open = options['target_mc'], options['target_open']
                         args.source_entries = [dict(source_pdf=item[0]['name'], exam_folder=item[0]['id'], text=item[1]['text'], words=generate_exams.count_words(item[1]['text']), warning=' '.join(item[1].get('warnings', [])) or None, pages_total=item[1].get('page_count') or 0, visuals_detected=0) for item in items]

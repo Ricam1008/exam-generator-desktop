@@ -4,7 +4,8 @@ from __future__ import annotations
 import base64
 from dataclasses import dataclass
 import hashlib
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
+from .http_server import LoopbackServer
 import json
 import secrets
 import threading
@@ -214,7 +215,7 @@ def start(profile_id: str) -> dict[str, Any]:
                 self.end_headers()
                 self.wfile.write(data)
 
-        server = ThreadingHTTPServer(("127.0.0.1", 0), Callback)
+        server = LoopbackServer(("127.0.0.1", 0), Callback)
         server.daemon_threads = True
         verifier = secrets.token_urlsafe(48)
         attempt = Attempt(profile_id, secrets.token_urlsafe(32), secrets.token_urlsafe(32), verifier, f"http://127.0.0.1:{server.server_port}/auth/callback", profile.get("client_id") or "dynamic_agent_client", profile.get("subject") or "", time.time() + ATTEMPT_SECONDS, server)

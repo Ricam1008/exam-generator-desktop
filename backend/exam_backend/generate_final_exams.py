@@ -552,7 +552,7 @@ def write_final_exam(args: argparse.Namespace, course_dir: Path, debug: DebugLog
         print(f"SKIP no source entries: {course_dir}", flush=True)
         return None
 
-    course = course_dir.name
+    course = getattr(args, "course_label", course_dir.name)
     aggregate = aggregate_source(entries)
     total_words = count_words(aggregate)
     weak_count = sum(1 for entry in entries if entry["warning"] or entry["words"] < 800)

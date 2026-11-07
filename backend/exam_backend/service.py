@@ -10,7 +10,8 @@ import secrets
 import threading
 import time
 from http.cookies import SimpleCookie
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
+from .http_server import LoopbackServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -104,6 +105,9 @@ class Handler(BaseHTTPRequestHandler):
                 return cli.json_response(self, 404, {'error': 'Nicht gefunden.'})
             cli.json_response(self, 200, data)
         except Exception as exc:
+            if os.environ.get('EXAM_GENERATOR_DEBUG') == '1':
+                import traceback
+                traceback.print_exc()
             cli.json_response(self, 400, {'error': cli.redact_log(str(exc))})
 
     def do_POST(self):
@@ -173,6 +177,9 @@ class Handler(BaseHTTPRequestHandler):
                 return cli.json_response(self, 404, {'error': 'Nicht gefunden.'})
             cli.json_response(self, 200, data)
         except Exception as exc:
+            if os.environ.get('EXAM_GENERATOR_DEBUG') == '1':
+                import traceback
+                traceback.print_exc()
             cli.json_response(self, 400, {'error': cli.redact_log(str(exc))})
 
     def launch(self, key):
@@ -210,14 +217,17 @@ class Handler(BaseHTTPRequestHandler):
         workspace = cli.STATE.workspaces.get(wid)
         if not workspace:
             return cli.json_response(self, 404, {'error': 'Arbeitsbereich nicht gefunden.'})
-        root = Path(workspace['root']).resolve()
+        workspace_path = Path(workspace['root'])
+        if workspace_path.is_symlink():
+            return cli.json_response(self, 403, {'error': 'Der Arbeitsbereich wurde verschoben. Bitte in der App erneut öffnen.'})
+        root = workspace_path.resolve()
         try:
             if rel in {'attempt', 'grade-open-answer'}:
                 payload = cli.read_json(self) if method == 'POST' else parse_qs(parsed.query)
                 exam_path = payload.get('exam_path', '')
                 if isinstance(exam_path, list):
                     exam_path = exam_path[0]
-                if not isinstance(exam_path, str) or not ARTIFACT.fullmatch(exam_path) or not exam_path.endswith('/exam.json'):
+                if not isinstance(exam_path, str) or not ARTIFACT.fullmatch(exam_path) or not exam_path.endswith('/exam.json') or any(part.startswith('.') for part in Path(exam_path).parts):
                     raise ValueError('Ungültige Prüfung.')
                 target = (root / exam_path).resolve()
                 target.relative_to(root)
@@ -245,6 +255,8 @@ class Handler(BaseHTTPRequestHandler):
                     return cli.json_response(self, 200, {'fingerprint': fingerprint, 'attempt': saved.get('attempt') if saved.get('fingerprint') == fingerprint else None})
                 if method != 'POST':
                     return cli.json_response(self, 405, {'error': 'POST erforderlich.'})
+                if payload.get('fingerprint') != fingerprint:
+                    return cli.json_response(self, 409, {'error': 'Die Prüfung wurde geändert. Bitte neu öffnen, bevor du eine Bewertung anforderst.'})
                 question = next((q for q in exam.get('open_ended', []) if q['id'] == payload.get('question_id')), None)
                 if question is None:
                     raise ValueError('Frage nicht gefunden.')
@@ -253,15 +265,16 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError('Antwort ist ungültig oder zu lang.')
                 from . import providers, local_server
                 metadata = exam.get('metadata', {})
-                profile_id = cli.load_registry().get('grading_profile_id') or metadata.get('provider_id') or 'ollama'
+                grading_override = cli.load_registry().get('grading_profile_id')
+                profile_id = grading_override or metadata.get('provider_id') or 'ollama'
                 profile = next(p for p in providers.list_profiles() if p['id'] == profile_id)
-                model = profile.get('model') if cli.load_registry().get('grading_profile_id') else metadata.get('model') or profile.get('model')
+                model = profile.get('model') if grading_override else metadata.get('model') or profile.get('model')
                 rubric = question.get('grading_rubric') or exam.get('rubric_templates', {}).get(question.get('rubric_template')) or {}
                 body = dict(question=question['question'], student_answer=answer, expected_answer=question.get('expected_answer'), key_concepts=question.get('key_concepts', []), grading_rubric=rubric)
                 prompt = local_server.TUTOR_EVALUATOR_SYSTEM_PROMPT
                 if metadata.get('language') == 'en':
                     prompt += '\nOUTPUT REQUIREMENT: Return all feedback in English.'
-                result = providers.complete(profile_id, model, [{'role': 'system', 'content': prompt}, {'role': 'user', 'content': local_server.build_user_prompt(body)}], timeout=180, temperature=0, profile_snapshot=None if cli.load_registry().get('grading_profile_id') else metadata.get('profile_snapshot'))
+                result = providers.complete(profile_id, model, [{'role': 'system', 'content': prompt}, {'role': 'user', 'content': local_server.build_user_prompt(body)}], timeout=180, temperature=0, profile_snapshot=None if grading_override else metadata.get('profile_snapshot'))
                 if result.finish_reason in {'length', 'incomplete', 'max_tokens'}:
                     raise ValueError('Bewertung wurde abgeschnitten. Bitte erneut versuchen.')
                 data = local_server.normalize_grading_result(local_server.extract_json_object(result.text))
@@ -280,12 +293,15 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         except Exception as exc:
+            if os.environ.get('EXAM_GENERATOR_DEBUG') == '1':
+                import traceback
+                traceback.print_exc()
             cli.json_response(self, 400, {'error': cli.redact_log(str(exc))})
 
 
 def serve(port):
     cli.load_registry()
-    server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
+    server = LoopbackServer(('127.0.0.1', port), Handler)
     server.daemon_threads = True
     cli.STATE.port = server.server_address[1]
     print(json.dumps({'event': 'ready', 'url': f'http://127.0.0.1:{cli.STATE.port}', 'port': cli.STATE.port, 'token': cli.STATE.token}), flush=True)
@@ -306,4 +322,7 @@ def serve(port):
         for event in cli.STATE.events.values():
             event.set()
         server.server_close()
+        deadline = time.monotonic() + 5
+        for worker in list(cli.STATE.workers.values()):
+            worker.join(max(0, deadline - time.monotonic()))
     return 0

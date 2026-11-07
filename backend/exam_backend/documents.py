@@ -95,7 +95,7 @@ def _installed(module: str) -> bool:
 
 def _version(package: str) -> str:
     try:
-        return importlib.metadata.version(package)
+        return importlib.metadata.version('docling-slim' if package == 'docling' else package)
     except importlib.metadata.PackageNotFoundError:
         return 'missing'
 

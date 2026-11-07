@@ -69,12 +69,12 @@ def create_fixtures(directory: Path) -> None:
 
 def granite_runtime(model_path: Path):
     import torch
-    from transformers import AutoProcessor, AutoModelForVision2Seq
+    from transformers import AutoProcessor, AutoModelForImageTextToText
     from docling_core.types.doc import DoclingDocument
     from docling_core.types.doc.document import DocTagsDocument
     processor=AutoProcessor.from_pretrained(str(model_path),local_files_only=True,trust_remote_code=False)
     device='mps' if torch.backends.mps.is_available() else 'cpu'
-    model=AutoModelForVision2Seq.from_pretrained(str(model_path),local_files_only=True,trust_remote_code=False,torch_dtype=torch.float32).to(device)
+    model=AutoModelForImageTextToText.from_pretrained(str(model_path),local_files_only=True,trust_remote_code=False,torch_dtype=torch.float32).to(device)
     model.eval()
     def recognize(image):
         messages=[{'role':'user','content':[{'type':'image'},{'type':'text','text':'Convert this page to docling.'}]}]

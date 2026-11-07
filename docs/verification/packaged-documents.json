@@ -1,0 +1,167 @@
+{
+  "backend_sha256": "585ce019ca55bd531e6b0e5fbf420905d1a1e5a0018e0a72a3f0c58cb0458ed5",
+  "started_at": "2026-11-07T12:47:30+0100",
+  "isolated_home": true,
+  "offline_models": true,
+  "checks": [
+    {
+      "name": "bundled_document_tools",
+      "ok": true,
+      "missing": []
+    },
+    {
+      "name": "discovery_all_formats",
+      "ok": true,
+      "expected_count": 12,
+      "actual_count": 12
+    },
+    {
+      "name": "lecture.png",
+      "ok": true,
+      "seconds": 14.153,
+      "method": "macOS Vision",
+      "block_count": 1,
+      "warnings": []
+    },
+    {
+      "name": "lecture.jpg",
+      "ok": true,
+      "seconds": 0.076,
+      "method": "macOS Vision",
+      "block_count": 1,
+      "warnings": []
+    },
+    {
+      "name": "lecture.jpeg",
+      "ok": true,
+      "seconds": 0.079,
+      "method": "macOS Vision",
+      "block_count": 1,
+      "warnings": []
+    },
+    {
+      "name": "lecture.tif",
+      "ok": true,
+      "seconds": 0.142,
+      "method": "macOS Vision",
+      "block_count": 2,
+      "warnings": []
+    },
+    {
+      "name": "lecture.tiff",
+      "ok": true,
+      "seconds": 0.074,
+      "method": "macOS Vision",
+      "block_count": 1,
+      "warnings": []
+    },
+    {
+      "name": "lecture.webp",
+      "ok": true,
+      "seconds": 3.807,
+      "method": "macOS Vision",
+      "block_count": 1,
+      "warnings": []
+    },
+    {
+      "name": "rotated.png",
+      "ok": true,
+      "seconds": 0.095,
+      "method": "macOS Vision",
+      "block_count": 1,
+      "warnings": []
+    },
+    {
+      "name": "mixed.PDF",
+      "ok": true,
+      "seconds": 0.42,
+      "method": "PDF native + macOS Vision",
+      "block_count": 2,
+      "warnings": []
+    },
+    {
+      "name": "lecture.docx",
+      "ok": true,
+      "seconds": 33.995,
+      "method": "Docling + macOS Vision",
+      "block_count": 4,
+      "warnings": []
+    },
+    {
+      "name": "lecture.pptx",
+      "ok": true,
+      "seconds": 0.085,
+      "method": "Docling + macOS Vision",
+      "block_count": 2,
+      "warnings": []
+    },
+    {
+      "name": "lecture.txt",
+      "ok": true,
+      "seconds": 0.007,
+      "method": "Text",
+      "block_count": 2,
+      "warnings": []
+    },
+    {
+      "name": "lecture.md",
+      "ok": true,
+      "seconds": 0.007,
+      "method": "Text",
+      "block_count": 2,
+      "warnings": []
+    },
+    {
+      "name": "all_originals_preserved_before_controlled_edit",
+      "ok": true,
+      "changed": []
+    },
+    {
+      "name": "cache_and_source_change",
+      "ok": true
+    },
+    {
+      "name": "originals_preserved",
+      "ok": true,
+      "changed": []
+    },
+    {
+      "name": "no_model_weights_downloaded",
+      "ok": true
+    }
+  ],
+  "tools": {
+    "formats": [
+      "docx",
+      "jpeg",
+      "jpg",
+      "markdown",
+      "md",
+      "pdf",
+      "png",
+      "pptx",
+      "tif",
+      "tiff",
+      "txt",
+      "webp"
+    ],
+    "office_ready": true,
+    "ocr_ready": true,
+    "pdf_ocr_ready": true,
+    "pdf_ready": true,
+    "enhanced_ready": false,
+    "enhanced_reason": "Granite-Docling bleibt bis zum bestandenen lokalen Qualitätsvergleich deaktiviert.",
+    "downloads_required": false,
+    "detail": "Dokumentwerkzeuge werden mit der App installiert. OCR verarbeitet Bilder lokal; es werden keine Seiten hochgeladen.",
+    "versions": {
+      "docling": "2.148.0",
+      "ocrmac": "1.0.1",
+      "pypdfium2": "5.15.0",
+      "pdfplumber": "0.11.10",
+      "pypdf": "7.0.0"
+    }
+  },
+  "backend_exit_code": 0,
+  "backend_stderr_tail": "",
+  "ok": true
+}

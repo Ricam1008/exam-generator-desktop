@@ -244,7 +244,7 @@ class ProviderTests(unittest.TestCase):
             def serve_forever(self): pass
             def shutdown(self): pass
             def server_close(self): pass
-        with patch.object(oauth, "ThreadingHTTPServer", Server):
+        with patch.object(oauth, "LoopbackServer", Server):
             first = oauth.start("chatgpt")
             query = parse_qs(urlsplit(first["authorization_url"]).query)
             attempt = oauth.ATTEMPTS["chatgpt"]
