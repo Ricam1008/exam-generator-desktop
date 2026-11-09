@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      EXAM_GENERATOR_DATA_DIR: ${{ runner.temp }}/exam-generator-tests
+      EXAM_GENERATOR_DATA_DIR: /tmp/exam-generator-tests
       HF_HUB_OFFLINE: '1'
       TRANSFORMERS_OFFLINE: '1'
     steps:
