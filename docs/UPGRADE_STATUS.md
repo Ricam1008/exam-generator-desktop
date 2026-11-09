@@ -1,4 +1,4 @@
-# Mac app upgrade — checkpoint 3
+# Mac app upgrade — development delivery
 
 Implemented in source: German four-area workflow; Ollama, DeepSeek, compatible APIs and official ChatGPT sign-in; Keychain credentials; PDF/Office/text/image extraction; native OCR; source IDs/fingerprints; atomic output replacement; cancellation; scoped previews; and saved attempts.
 
@@ -10,6 +10,10 @@ The backend package was reduced from about 1.5 GB to 165 MB using Docling's mode
 
 The final standalone generation/Keychain smoke passed all eight checks: protected dummy-key storage and restart, model list/test, generation, reuse, changed source, fresh finals, saved attempts, grading and cleanup. The harness now isolates app data without replacing macOS HOME, which is needed to find the login Keychain. No Keychain reset is needed.
 
-Remaining delivery checks: finish the app/DMG build, validate the final installer and reopen behavior, then refresh these notes. Real ChatGPT eligibility and real paid inference remain unverified. Cloud-image extraction is not offered.
+The Apple Silicon app and DMG were built from the final sources. DMG checksum and strict deep signature verification passed. No Apple Developer identity is present: this is an unsigned development build with a local ad-hoc resource seal, not a notarized release. The DMG was mounted read-only, its app copied to a temporary install directory and launched successfully. Bundled backend hashes match the standalone smoke reports. The DMG is about 96 MB; the app about 198 MB.
+
+Native checks covered startup, synthetic Markdown import/extraction, four task areas, keyboard navigation and scrollable forms at normal and minimum window sizes. Native automation captures retained the initial tab background while the selected accessibility state changed; browser DOM/style checks show the correct selected tab. Real pointer appearance needs a final human check before wider release. This is recorded rather than claimed fixed.
+
+Real ChatGPT eligibility and real paid inference remain unverified. OCR quality on difficult real lecture material remains open. A separate clean physical Mac without development tools was not available; the frozen backend smoke instead removed developer paths and used an empty working directory. Cloud-image extraction is not offered. Delivery hashes and checks are recorded in `docs/verification/mac-delivery.json`.
 
 Original material and existing outputs are preserved. Credentials, model weights, local state and build artifacts are excluded from Git.

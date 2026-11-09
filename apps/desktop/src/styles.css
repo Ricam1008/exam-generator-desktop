@@ -34,7 +34,7 @@ p+p { margin-top:8px; }
 .status-dot.ok { background:var(--good); }
 .tabs { display:flex; gap:4px; border-bottom:1px solid #bdcac2; margin-bottom:24px; }
 .tabs button { min-height:48px; padding:10px 20px; background:transparent; color:var(--muted); border:0; border-bottom:3px solid transparent; border-radius:6px 6px 0 0; }
-.tabs button[aria-selected="true"] { border-bottom-color:var(--accent); color:var(--accent-dark); background:#e8f2ed; }
+.tabs button.selected { border-bottom-color:var(--accent); color:var(--accent-dark); background:#e8f2ed; }
 .tabs button:hover:not(:disabled) { background:#edf2ef; color:var(--ink); border-bottom-color:#a4b7ac; }
 .workspace { padding:24px; background:var(--panel); border:1px solid var(--line); border-radius:12px; min-height:410px; }
 .workspace:focus:not(:focus-visible) { outline:none; }

@@ -59,7 +59,7 @@ npm ci
 npm run build
 ```
 
-Für den Entwicklungsstart muss `.venv/bin/python` die Backend-Abhängigkeiten enthalten. Alternativ zuerst den gebündelten Dienst bauen. Der Rust-Launcher erkennt den lokalen Dienst bzw. die gebündelte Version und verwendet einen freien lokalen Port.
+Für den Entwicklungsstart muss `.venv-package/bin/python` oder `.venv/bin/python` die Backend-Abhängigkeiten enthalten. Alternativ zuerst den gebündelten Dienst bauen. Der Rust-Launcher erkennt den lokalen Dienst bzw. die gebündelte Version und verwendet einen freien lokalen Port.
 
 Mac-Paket aus dem Repository-Hauptordner bauen:
 
@@ -69,7 +69,7 @@ cd apps/desktop
 npm run package:mac
 ```
 
-Die Ausgabe liegt unter `apps/desktop/src-tauri/target/release/bundle/`. Ohne Apple-Developer-Zertifikat ist das Paket eine lokale Entwicklungsversion und kein notarisiertes öffentliches Release.
+Die Ausgabe liegt unter `apps/desktop/src-tauri/target/release/bundle/`. Ohne `APPLE_SIGNING_IDENTITY` verwendet der Build eine lokale Ad-hoc-Signatur. Diese versiegelt das Paket, ersetzt aber kein Apple-Developer-Zertifikat und keine Notarisierung für ein öffentliches Release.
 
 ## Prüfen
 

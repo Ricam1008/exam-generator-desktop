@@ -1,0 +1,29 @@
+{
+  "verified_at": "2026-11-09T03:23:13.467022+00:00",
+  "version": "0.2.0",
+  "architecture": "arm64",
+  "build_type": "unsigned development build (local ad-hoc seal; no Apple Developer identity or notarization)",
+  "backend_sha256": "e50b58721e783b33a95f4d284c4187f74b6eac661219ecbe99343164be6f559f",
+  "app_executable_sha256": "73fa4aa09bae166ebd897d1326fbc272ea3d46aca10e5153aba68f825d7b4744",
+  "dmg_sha256": "12c85041552d02224d35f4db16063e0896e10353931b3092044fbe8d5a16a85e",
+  "dmg_bytes": 90235353,
+  "backend_tests": 123,
+  "frontend_tests": 4,
+  "packaged_document_checks": 18,
+  "packaged_generation_checks": 8,
+  "frontend_build": "pass",
+  "rust_check": "pass",
+  "npm_audit_vulnerabilities": 0,
+  "codesign_deep_strict": "pass",
+  "dmg_checksum": "valid",
+  "dmg_mount_copy_and_launch": "pass",
+  "native_import_and_extraction_review": "pass (synthetic Markdown)",
+  "native_window_checks": "normal 1120x780 and minimum about 860x640; four areas and scrollable forms checked",
+  "browser_tab_dom_and_styles": "correct selected class and aria state",
+  "remaining_acceptance_checks": [
+    "Real ChatGPT account eligibility and paid-provider inference were not exercised.",
+    "OCR fixtures are synthetic; difficult real lecture scans need review.",
+    "Native automation screenshots retain the initial tab background despite correct selected accessibility state and correct browser DOM; confirm appearance with real pointer interaction before wider release.",
+    "No clean physical Mac without development tools was available; frozen backend ran with empty cwd and developer paths removed instead."
+  ]
+}
