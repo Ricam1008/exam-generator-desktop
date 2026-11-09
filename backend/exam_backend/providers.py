@@ -42,6 +42,9 @@ class ProviderResult:
 
 
 def settings_dir() -> Path:
+    # Isolate app state in tests without changing HOME, which macOS Keychain needs.
+    if directory := os.environ.get("EXAM_GENERATOR_DATA_DIR"):
+        return Path(directory).expanduser().resolve()
     return Path.home() / ".exam-generator-desktop"
 
 

@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 cd "$(dirname "$0")/.."
-PYINSTALLER_CONFIG_DIR=/private/tmp/exam-pyinstaller "${EXAM_BUILD_PYTHON:-.venv-package/bin/python}" -m PyInstaller --noconfirm --clean --onedir --name exam-backend-v2 \
+PYINSTALLER_CONFIG_DIR="$PWD/backend/build/pyinstaller-cache" "${EXAM_BUILD_PYTHON:-.venv-package/bin/python}" -m PyInstaller --noconfirm --clean --onedir --name exam-backend-v2 \
   --distpath backend/sidecar-bin --workpath backend/build/v2 \
   --paths backend --add-data backend/exam_backend/templates:exam_backend/templates \
   --collect-all docling --collect-all docling_core \

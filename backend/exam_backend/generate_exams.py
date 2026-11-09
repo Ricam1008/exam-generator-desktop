@@ -1603,14 +1603,17 @@ def normalize_mc_items(raw_questions: Any, existing: set[str]) -> list[dict[str,
         signature = question_signature(question_text)
         if signature in existing:
             continue
+        raw_options = ensure_list(raw.get("options"))
+        if not 4 <= len(raw_options) <= 6:
+            continue
         options = []
-        for option in ensure_list(raw.get("options"))[:6]:
+        for option in raw_options:
             if not isinstance(option, dict):
                 continue
             option_text = str(option.get("text") or "").strip()
             if option_text:
                 options.append({"text": option_text, "is_correct": strict_boolean(option.get("is_correct"))})
-        if len(options) < 4:
+        if len(options) < 4 or len({o["text"].casefold() for o in options}) != len(options):
             continue
         normalized = {
             "id": "",
@@ -1680,18 +1683,21 @@ def normalize_exam(
     for index, question in enumerate(mc_source, start=1):
         if not isinstance(question, dict):
             continue
+        raw_options = ensure_list(question.get("options"))
+        if not 4 <= len(raw_options) <= 6:
+            continue
         options = []
-        for option in ensure_list(question.get("options"))[:6]:
+        for option in raw_options:
             if not isinstance(option, dict):
                 continue
             text = str(option.get("text", "")).strip()
             if not text:
                 continue
             options.append({"text": text, "is_correct": strict_boolean(option.get("is_correct"))})
-        if len(options) < 4:
+        if len(options) < 4 or len({o["text"].casefold() for o in options}) != len(options):
             continue
         normalized_mc = {
-            "id": str(question.get("id") or f"mc-{index:03d}"),
+            "id": f"mc-{index:03d}",
             "topic": str(question.get("topic") or ""),
             "question": str(question.get("question") or "").strip(),
             "options": options,
@@ -1714,7 +1720,7 @@ def normalize_exam(
         if rubric_template not in RUBRIC_TEMPLATES:
             rubric_template = DEFAULT_RUBRIC_TEMPLATE
         normalized_open = {
-            "id": str(question.get("id") or f"open-{index:03d}"),
+            "id": f"open-{index:03d}",
             "topic": str(question.get("topic") or ""),
             "question_type": "open_ended",
             "question": str(question.get("question") or "").strip(),
@@ -2626,7 +2632,7 @@ def write_exam_folder(
                 exam = normalize_exam(model_exam, course, pdf_path.name, extraction_warning, word_count)
                 exam["multiple_choice"] = exam["multiple_choice"][:target_mc]
                 exam["open_ended"] = exam["open_ended"][:target_open]
-                if not exam["multiple_choice"] and not exam["open_ended"]:
+                if (target_mc > 0 and not exam["multiple_choice"]) or (target_open > 0 and not exam["open_ended"]):
                     raise ValueError("Die KI hat keine Fragen der gewählten Art erzeugt.")
                 attach_question_metadata(exam["multiple_choice"], prompt_text, "representative-001")
                 attach_question_metadata(exam["open_ended"], prompt_text, "representative-001")
@@ -2790,7 +2796,7 @@ def write_index_pages(root: Path) -> None:
             )
         body = (
             f"    <h1>{escape_html(course_label)}</h1>\n"
-            f"    <p>{len(exams)} Prüfung{'s' if len(exams) != 1 else ''}</p>\n"
+            f"    <p>{len(exams)} Prüfung{'en' if len(exams) != 1 else ''}</p>\n"
             f"    <ul>\n      " + "\n      ".join(items) + "\n    </ul>\n"
         )
         exams_dir.mkdir(exist_ok=True)
@@ -2798,12 +2804,13 @@ def write_index_pages(root: Path) -> None:
         root_href = rel_href(root, exams_dir / "index.html")
         course_links.append(
             f'<li><a href="{escape_html(root_href)}">{escape_html(course_label)}</a>'
-            f'<span class="meta">{len(exams)} Prüfung{"s" if len(exams) != 1 else ""}</span></li>'
+            f'<span class="meta">{len(exams)} Prüfung{"en" if len(exams) != 1 else ""}</span></li>'
         )
 
+    total_exams = sum(len(exams) for exams in courses.values())
     root_body = (
         "    <h1>Deine Prüfungen</h1>\n"
-        f"    <p>{sum(len(exams) for exams in courses.values())} Prüfungen aus {len(courses)} Lehrveranstaltungen.</p>\n"
+        f"    <p>{total_exams} Prüfung{'en' if total_exams != 1 else ''} aus {len(courses)} Lehrveranstaltung{'en' if len(courses) != 1 else ''}.</p>\n"
         "    <ul>\n      " + "\n      ".join(course_links) + "\n    </ul>\n"
     )
     (root / "exam_index.html").write_text(html_page("Deine Prüfungen", root_body), encoding="utf-8")

@@ -29,7 +29,7 @@ from urllib import error, parse, request
 PACKAGE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(PACKAGE_DIR))
 
-from exam_backend import generate_exams, generate_final_exams, local_server, runtime
+from exam_backend import generate_exams, generate_final_exams, local_server, runtime, providers
 
 if __name__ == "__main__":
     sys.modules["exam_backend.cli"] = sys.modules[__name__]
@@ -45,7 +45,7 @@ def now_iso() -> str:
 
 
 def metrics_path() -> Path:
-    return Path.home() / ".exam-generator-desktop" / "generation_metrics.json"
+    return providers.settings_dir() / "generation_metrics.json"
 
 
 @dataclass
@@ -106,7 +106,7 @@ def slugify(value: str) -> str:
 
 
 def fallback_log_dir() -> Path:
-    return Path.home() / ".exam-generator-desktop" / "logs"
+    return providers.settings_dir() / "logs"
 
 
 def generation_log_path(job: Job, base_dir: Path) -> Path:
@@ -552,7 +552,7 @@ def final_args(root: Path, overwrite: bool = False, model: str = DEFAULT_MODEL) 
 
 
 def settings_path() -> Path:
-    return Path.home() / '.exam-generator-desktop' / 'workspaces.json'
+    return providers.settings_dir() / 'workspaces.json'
 
 
 def registry_data():
@@ -770,6 +770,17 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
                     runtime.check_cancel()
                     if not result:
                         raise ValueError('Keine Prüfung erzeugt.')
+                    previous_path = entry.get('path')
+                    if isinstance(previous_path, str):
+                        previous = (staging / previous_path).resolve()
+                        try:
+                            relative = previous.relative_to(staging.resolve())
+                        except ValueError:
+                            raise ValueError('Ungültiger Prüfungsort im Arbeitsbereich.')
+                        if previous != exam_dir.resolve() and previous.is_dir() and len(relative.parts) == 3 and relative.parts[1] == 'exams' and not any(part.startswith('.') for part in relative.parts):
+                            history = staging / '.history'
+                            history.mkdir(exist_ok=True)
+                            os.replace(previous, history / (source['id'] + '-' + uuid.uuid4().hex))
                     manifest['exams'][key] = {'fingerprint': fingerprint, 'settings': signature, 'path': str(exam_dir.relative_to(staging)), 'provider_id': profile_id, 'model': model}
                     summary['generated'].append(source['name'] if options['mode'] != 'finals' else course_dir.name)
                 except runtime.Canceled:

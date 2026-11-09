@@ -145,7 +145,7 @@ class Handler(BaseHTTPRequestHandler):
                 source = next((s for s in scan['sources'] if s['id'] == payload.get('source_id')), None)
                 if not source:
                     raise ValueError('Dokument nicht gefunden. Material erneut einlesen.')
-                cache = Path.home() / '.exam-generator-desktop' / 'extraction-cache'
+                cache = providers.settings_dir() / 'extraction-cache'
                 data = documents.extract_document(Path(source['path']), cache, mode=payload.get('mode', 'auto'))
             elif path == '/api/generate':
                 data = {'job_id': cli.start_job(payload).id}

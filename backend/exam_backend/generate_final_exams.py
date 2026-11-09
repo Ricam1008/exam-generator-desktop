@@ -597,7 +597,7 @@ def write_final_exam(args: argparse.Namespace, course_dir: Path, debug: DebugLog
 
     exam = {
         "metadata": {
-            "title": f"Final Exam - {course}",
+            "title": f"{'Final exam' if (runtime.CONTEXT.get() or {}).get('language') == 'en' else 'Gesamtprüfung'} – {course}",
             "course": course,
             "source_pdf": "Final exam from all course source decks",
             "generated_date": dt.date.today().isoformat(),

@@ -47,8 +47,10 @@ fn start_backend(app: tauri::AppHandle, state: tauri::State<BackendState>) -> Re
         command = Command::new(bundled);
     } else if cfg!(debug_assertions) {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
-        let python = root.join(".venv/bin/python");
-        command = Command::new(if python.is_file() { python } else { PathBuf::from("python3") });
+        let packaged_python = root.join(".venv-package/bin/python");
+        let dev_python = root.join(".venv/bin/python");
+        let python = if packaged_python.is_file() { packaged_python } else if dev_python.is_file() { dev_python } else { PathBuf::from("python3") };
+        command = Command::new(python);
         command.arg("-m").arg("exam_backend.cli").env("PYTHONPATH", root.join("backend"));
     } else {
         return Err("Der gebündelte Dienst fehlt. Bitte die App erneut installieren.".into());

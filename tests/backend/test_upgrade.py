@@ -1,6 +1,7 @@
 """Cross-module regressions for the upgrade's data and output boundaries."""
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -9,6 +10,16 @@ import unittest
 from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'backend'))
 from exam_backend import cli, runtime, providers, generate_exams as g
+
+
+class StateDirectoryTests(unittest.TestCase):
+    def test_isolated_app_state_preserves_home_for_keychain(self):
+        home = Path.home()
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {'EXAM_GENERATOR_DATA_DIR': directory}):
+            self.assertEqual(providers.settings_dir(), Path(directory).resolve())
+            self.assertEqual(cli.metrics_path().parent, providers.settings_dir())
+            self.assertEqual(cli.fallback_log_dir().parent, providers.settings_dir())
+            self.assertEqual(Path.home(), home)
 
 
 class UpgradeTests(unittest.TestCase):
@@ -119,6 +130,27 @@ class UpgradeTests(unittest.TestCase):
         cli.settings_path().write_text('{broken', encoding='utf-8')
         with self.assertRaises(ValueError): cli.save_registry()
         self.assertEqual(cli.settings_path().read_text(), '{broken')
+    def test_course_reassignment_has_one_current_exam_and_preserves_history(self):
+        source = self.source()
+        with patch.object(providers, 'complete', side_effect=self.fake_complete):
+            first = self.run_job(source)
+            source_id = cli.scan_documents({'input_path': str(source)})['sources'][0]['id']
+            job = cli.Job(id='reassigned', kind='all')
+            cli.run_generation(job, {'input_path': str(source), 'output_path': str(self.root / 'out'), 'mode': 'all', 'profile_id': 'ollama', 'model': 'test', 'course_assignments': {source_id: 'Neuer Kurs'}})
+        self.assertEqual(job.status, 'done', job.error)
+        workspace = Path(job.result['project_root'])
+        exams = g.discover_generated_exams(workspace)
+        self.assertEqual(sum(len(items) for items in exams.values()), 1)
+        self.assertEqual(next(iter(exams.values()))[0]['course'], 'Neuer Kurs')
+        self.assertEqual(len(list((workspace / '.history').glob('*/exam.json'))), 1)
+    def test_generated_ids_are_unique_and_oversized_option_lists_are_not_truncated(self):
+        raw = json.loads(self.fake_complete().text)
+        raw['open_ended'] *= 2
+        for question in raw['open_ended']: question['id'] = 'duplicate'
+        exam = g.normalize_exam(raw, 'Course', 'lecture.txt', None, 100)
+        self.assertEqual([q['id'] for q in exam['open_ended']], ['open-001', 'open-002'])
+        raw['multiple_choice'][0]['options'].extend([{'text': f'extra-{i}', 'is_correct': True} for i in range(3)])
+        self.assertEqual(g.normalize_mc_items(raw['multiple_choice'], set()), [])
     def test_cancel_during_provider_does_not_publish(self):
         source = self.source()
         job = cli.Job(id='cancel', kind='all')

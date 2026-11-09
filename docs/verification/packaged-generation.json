@@ -1,0 +1,30 @@
+{
+  "timestamp": "2026-11-09T03:12:57.883662+00:00",
+  "backend": "exam-backend-v2 (Apple Silicon, bundled)",
+  "status": "pass",
+  "checks": [
+    "packed backend starts with isolated app state and empty cwd; macOS HOME is preserved",
+    "new dummy credential is protected and absent from API/settings output",
+    "same packed binary reads dummy Keychain credential after restart; model list/test succeed",
+    "real packed generation publishes2 MC/1 open; originals stay unchanged",
+    "unchanged source reuses output; changed source regenerates without duplicate backup exams",
+    "fresh course final generates from source without deck-exam prerequisite",
+    "scoped preview restores attempts and grades through saved profile; stale grading is blocked",
+    "dummy profile removed through packed API"
+  ],
+  "uses_synthetic_sources": true,
+  "uses_dummy_credentials_only": true,
+  "authorized_local_requests": 8,
+  "provider_flows": [
+    "connection-test",
+    "final-blueprint",
+    "final-mc",
+    "final-open",
+    "generation",
+    "grading",
+    "models"
+  ],
+  "remote_ai_requests": 0,
+  "keychain_entry_removed": true,
+  "backend_sha256": "e50b58721e783b33a95f4d284c4187f74b6eac661219ecbe99343164be6f559f"
+}
