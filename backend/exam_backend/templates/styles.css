@@ -316,3 +316,12 @@ button.secondary {
     font-size: 2rem;
   }
 }
+
+fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
+legend, .question-prompt { font-size: 1.15rem; font-weight: 650; line-height: 1.5; padding: 0; }
+.question-prompt, label .question-meta { display: block; }
+.source-details { margin-top: 16px; }
+summary { cursor: pointer; text-underline-offset: 3px; }
+blockquote { margin: 12px 0; padding: 0; color: #42564e; white-space: pre-wrap; }
+:focus-visible { outline: 3px solid #0f766e; outline-offset: 3px; }
+#save-status { font-size: .9rem; }

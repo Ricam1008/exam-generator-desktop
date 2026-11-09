@@ -1,382 +1,110 @@
 # Exam Generator Desktop
 
-A simple local desktop app for generating study exams from university PDF folders.
+Eine lokale Mac-App zum Erstellen und Bearbeiten von Übungsprüfungen aus Lernmaterial. Die Oberfläche ist auf Deutsch; Prüfungen können auf Deutsch oder Englisch erstellt werden.
 
-The app is intentionally small: choose a folder with PDFs, choose an output folder, generate exams, and open the local exam index.
+## Mac-App verwenden
 
-This repository is separate from the production exam workspace. Do not commit PDFs or generated exams.
+Die aktuelle Entwicklungsversion wird als Apple-Silicon-`.app` und `.dmg` gebaut. Sie enthält den Python-Dienst und die Dokumentwerkzeuge. Für die installierte App sind Python, Node und Rust nicht erforderlich.
 
-## What This App Does
+1. Die App öffnen und unter **Einstellungen** eine KI-Verbindung einrichten.
+2. Unter **Material** einen Ordner oder einzelne Dateien auswählen und **Material prüfen** anklicken.
+3. Auswahl und Lehrveranstaltungen prüfen. **Inhalt prüfen** zeigt den tatsächlich erkannten Text; bei PDFs lässt sich lokale OCR ausdrücklich erneut ausführen.
+4. Unter **Prüfung erstellen** Quellen, Sprache, Schwierigkeit, Abdeckung und Fragenanzahl festlegen. Zuerst eine kurze Beispielprüfung erstellen.
+5. Unter **Lernen** Prüfungen öffnen, Antworten eingeben und bei Bedarf KI-Feedback anfordern. Lernstände werden lokal gespeichert; eine geänderte Antwort verliert ihre alte Bewertung.
 
-- Scans folders for lecture PDFs.
-- Generates one example exam, all deck exams, or course final exams.
-- Uses Ollama for AI question generation and open-answer grading.
-- Writes generated exams into a separate output folder.
-- Keeps input folders read-only.
-- Shows a rough generation-time estimate after scanning a folder.
+## Vorbereitung und parallele Verarbeitung
 
-## Screenshots
+Die Generierung verarbeitet höchstens zwei Prüfungen gleichzeitig. Bei Gesamtprüfungen entstehen nach dem gemeinsamen Prüfungsplan Multiple-Choice- und offene Fragen parallel, mit insgesamt bis zu vier gleichzeitigen KI-Anfragen. Anfragelimits und Antwortzeiten des Anbieters beeinflussen die tatsächliche Beschleunigung.
 
-Startup/status view:
+Vor dem Start zeigt die Vorbereitung die Anzahl geplanter Prüfungen. **Material analysieren** liest die Auswahl lokal und zeigt Seiten, Folien, Wörter, eingebettete Rasterbilder, Tabellen, Quellen pro Prüfung und Leseprobleme. Unveränderte Prüfungen werden als wiederverwendbar ausgewiesen. Bei fehlenden Messungen bleibt die Dauer ausdrücklich „noch nicht kalibriert“; vorhandene Messungen oder eine optionale synthetische Modellstichprobe liefern einen vorläufigen Zeitbereich. Cloud-Ausführung startet mit einer Empfehlung für zwei Prüfungen und vier Anfragen; lokale oder unbekannte Ausführung zunächst mit einer Prüfung und einer Anfrage. Beides lässt sich innerhalb dieser Grenzen einstellen.
 
-![Exam Generator status screen](docs/screenshots/status.png)
+Die ausdrücklich gestartete **Modellstichprobe** verwendet künstliche deutsche Quelldaten, prüft bekannte Antwortschlüssel und kann den Durchsatz mit einer und zwei Anfragen vergleichen. Sie kann bei Cloud-Anbietern Kosten verursachen. Die erzeugten Fragen bleiben zur eigenen Prüfung sichtbar: gültiges JSON oder bestandene Faktenaufgaben bestätigen weder Sprachqualität noch fachlichen Anspruch. Es werden keine Modelle automatisch geladen oder gewechselt.
 
-Folder review after scanning PDFs:
+## Denktiefe und Tokenverbrauch
 
-![Exam Generator folder review](docs/screenshots/folder-review.png)
+Für DeepSeek lässt sich unter **Prüfung erstellen → Denktiefe (DeepSeek)** zwischen **Aus, Niedrig, Hoch und Maximal** wählen. **Niedrig** ist der Standard und bleibt als persönliche Auswahl gespeichert. DeepSeek behandelt „Medium“ wie „Hoch“, daher gibt es dafür keine eigene Auswahl. Die Einstellung gilt auch für Modellstichproben; Laufzeitmessungen und Stichprobenergebnisse werden je Denktiefe getrennt. Neu erstellte Prüfungen speichern die Denktiefe für spätere Bewertungen über dieselbe Verbindung. Niedrig ist ein sparsamer Ausgangspunkt, keine bestätigte Qualitätsgleichheit mit Hoch.
 
-## Current Install Status
+Stabile Quellen- und Prüfungsplan-Präfixe verbessern die Möglichkeit von Anbieter-Cache-Treffern, ohne den Quelleninhalt oder die geforderte Fragenqualität zu kürzen. Neue Läufe speichern gemeldete Eingabe-, Ausgabe-, Denk- und Cache-Tokenzahlen unter `usage/` im Arbeitsbereich. Diese Angaben sind keine Rechnung; bei Fehlern oder fehlenden Anbieterfeldern kann die Abrechnung zusätzliche Tokens enthalten.
 
-This is currently a developer-style install from GitHub, not yet a polished one-click installer.
+Unterstützte Eingaben: PDF, DOCX, PPTX, TXT, Markdown, PNG, JPEG, TIFF und WebP. PDF-Seiten, PowerPoint-Folien und Text-/Word-Abschnitte bleiben als Quellenstellen erhalten, soweit die Extraktion sie liefert. Word-Seitenzahlen werden nicht erfunden.
 
-That means you need to install a few dependencies once:
+## KI-Verbindungen
 
-- Git
-- Python 3
-- Node.js
-- Rust/Tauri build tools
-- Ollama
-- At least one Ollama model
+- **Ollama:** installierte Modelle auswählen oder einen Modellnamen eingeben. Ollama muss separat laufen. Ein Ollama-Modell kann lokal oder in der Cloud arbeiten.
+- **DeepSeek:** eigenen API-Schlüssel speichern und ein verfügbares Modell auswählen.
+- **Kompatible API:** die vollständige API-Basisadresse und den Modellnamen eintragen, beispielsweise einschließlich `/v1`, wenn der Anbieter das verlangt.
+- **ChatGPT:** die offizielle Anmeldung im Browser nutzen. Abo-Zugriff und Modellverfügbarkeit hängen vom Konto und der Freigabe ab. Eine vollständige Testantwort bestätigt den Zugriff; die Modellliste allein tut das nicht.
 
-After setup, the app can be started from the project folder.
+Zugangsdaten werden im macOS-Schlüsselbund gespeichert. Die App wechselt bei Fehlern nicht automatisch zu einem anderen Anbieter oder einer anderen Abrechnung. Eine abweichende KI-Verbindung für offene Antworten kann ausdrücklich gewählt werden.
 
-## Mac Installation
+Ausgewählte Quellentexte werden erst bei der Generierung an die gewählte KI gesendet. Lokale Texterkennung lädt keine Seiten hoch. Cloud-OCR ist nicht Bestandteil dieser Version.
 
-### 1. Install Ollama
+## Originale, Ergebnisse und Datenschutz
 
-Download and install Ollama:
+- Originaldateien bleiben unverändert. Die App prüft die tatsächlich aufgelösten Ausgabeorte einschließlich symbolischer Links.
+- Geänderte Quellen werden neu erkannt; Dateinamen allein dienen nicht als Identität.
+- Neue Ergebnisse werden vollständig vorbereitet, bevor sie gültige Ausgaben ersetzen. Vorherige Arbeitsbereiche bleiben als versteckte Sicherung im Ausgabeordner erhalten. Umgruppierte Prüfungen bleiben zusätzlich in `.history` verfügbar.
+- Ein Stopp beendet weitere Anfragen und verwirft unvollständige Ausgaben. Bereits angenommene Cloud-Anfragen können trotzdem berechnet werden.
+- Normale Protokolle enthalten keine vollständigen Quellen oder KI-Antworten. Die ausdrücklich aktivierbare Diagnose kann diese Inhalte enthalten.
+- Die lokale Steuerungs-API erfordert einen Sitzungsschlüssel. Browser-Prüfungen erhalten nur einen auf ihren Arbeitsbereich begrenzten Zugriff.
+- Quellen, erzeugte Prüfungen, Zugangsdaten, Modellgewichte und Build-Dateien gehören nicht ins Git-Repository.
 
-https://ollama.com
+OCR und KI können Fehler machen. Quellenhinweise belegen eine überprüfte Textstelle, nicht die fachliche Richtigkeit jeder generierten Frage. Die gemessenen OCR-Ergebnisse in `docs/verification` stammen aus synthetischen Testseiten, nicht aus einem repräsentativen Vorlesungskorpus.
 
-Open Terminal and install the default model:
+## Entwicklung und Build
 
-```bash
-ollama pull gemma4:31b-cloud
+Getestet: Apple Silicon, Python 3.12, Node 22 und Tauri 2. Windows ist kein geprüftes Release-Ziel.
+
+Ein isoliertes Python-Umfeld mit `uv` anlegen und die gepinnten Mac-Abhängigkeiten installieren:
+
+```sh
+uv venv --python 3.12 .venv-package
+uv pip sync --python .venv-package/bin/python backend/requirements-mac.lock
+uv pip install --python .venv-package/bin/python --no-deps -e backend
 ```
 
-Check that Ollama is running:
+Die normale Dokumentverarbeitung verwendet Docling Slim und macOS Vision. Sie benötigt keine großen Sprachmodelle. Der optionale OCR-Vergleich erfordert ein separates Umfeld mit den `benchmark`-Abhängigkeiten und einen ausdrücklich heruntergeladenen lokalen Granite-Snapshot.
 
-```bash
-ollama serve
-```
+Frontend und Desktop-App:
 
-If it says Ollama is already running, that is fine.
-
-### 2. Install Apple Command Line Tools
-
-```bash
-xcode-select --install
-```
-
-If it says they are already installed, that is fine.
-
-### 3. Install Python 3
-
-Download Python 3 from:
-
-https://www.python.org/downloads/
-
-Then check:
-
-```bash
-python3 --version
-```
-
-### 4. Install Node.js
-
-Download the LTS version from:
-
-https://nodejs.org
-
-Then check:
-
-```bash
-node --version
-npm --version
-```
-
-### 5. Install Rust
-
-Go to:
-
-https://rustup.rs
-
-Run the install command shown there, then restart Terminal.
-
-Check:
-
-```bash
-cargo --version
-```
-
-### 6. Download The App
-
-```bash
-mkdir -p ~/Projects
-cd ~/Projects
-git clone https://github.com/Ricam1008/exam-generator-desktop.git
-cd exam-generator-desktop
-```
-
-If the repository is private, the GitHub account must have access first.
-
-### 7. Install The Python PDF Dependencies
-
-```bash
-python3 -m pip install --user pypdf pdfplumber
-```
-
-### 8. Install App Dependencies
-
-```bash
+```sh
 cd apps/desktop
-npm install
-```
-
-### 9. Start The App
-
-```bash
-npm run tauri dev
-```
-
-The Exam Generator window should open.
-
-## Windows Installation
-
-Windows is supported by the chosen app stack, but the current setup is still more developer-style than installer-style.
-
-### 1. Install Ollama
-
-Download and install Ollama:
-
-https://ollama.com
-
-Open PowerShell and install the default model:
-
-```powershell
-ollama pull gemma4:31b-cloud
-```
-
-Check that Ollama is running:
-
-```powershell
-ollama serve
-```
-
-If it says Ollama is already running, that is fine.
-
-### 2. Install Python
-
-Download Python from:
-
-https://www.python.org/downloads/windows/
-
-During installation, enable:
-
-```text
-Add python.exe to PATH
-```
-
-Then check:
-
-```powershell
-python --version
-```
-
-### 3. Install Node.js
-
-Download the LTS version from:
-
-https://nodejs.org
-
-Then check:
-
-```powershell
-node --version
-npm --version
-```
-
-### 4. Install Rust
-
-Download and run `rustup-init.exe` from:
-
-https://rustup.rs
-
-Restart PowerShell, then check:
-
-```powershell
-cargo --version
-```
-
-### 5. Install Git
-
-Download Git from:
-
-https://git-scm.com/download/win
-
-### 6. Download The App
-
-```powershell
-cd $env:USERPROFILE
-mkdir Projects
-cd Projects
-git clone https://github.com/Ricam1008/exam-generator-desktop.git
-cd exam-generator-desktop
-```
-
-If the repository is private, the GitHub account must have access first.
-
-### 7. Install The Python PDF Dependencies
-
-```powershell
-python -m pip install --user pypdf pdfplumber
-```
-
-### 8. Install App Dependencies
-
-```powershell
-cd apps\desktop
-npm install
-```
-
-### 9. Start The App
-
-```powershell
-npm run tauri dev
-```
-
-If the app opens but says the backend cannot start, the most likely cause is a Python command-name mismatch on Windows. The current app starts the backend with `python3`; some Windows installations only provide `python` or `py`. This is fixable in the app code, but for now use macOS as the smoother path or ask for the Windows compatibility patch.
-
-## Using The App
-
-1. Make sure Ollama is running.
-2. Start the app.
-3. Choose an Ollama model in the Status area.
-4. Select an input folder containing PDFs.
-5. Select a separate output folder.
-6. Click `Scan folder`.
-7. Review the detected PDFs and time estimate.
-8. Click `Generate example` first.
-9. If the example works, click `Generate all` or `Generate finals`.
-10. Click `Open exam index` when generation is done.
-
-Recommended output folder:
-
-```text
-Documents/Exam Generator Output
-```
-
-## Safety Rules
-
-- Input folders are treated as read-only.
-- Generated exams are written to the selected output folder.
-- Do not use the original PDF/course folder as the output folder.
-- Existing output is skipped by default unless overwrite behavior is explicitly enabled in the app.
-- Do not commit PDFs, generated exams, logs, or local output folders to GitHub.
-
-## Troubleshooting
-
-### Ollama Is Not Reachable
-
-Start Ollama:
-
-```bash
-ollama serve
-```
-
-On Windows PowerShell:
-
-```powershell
-ollama serve
-```
-
-### Model Is Missing
-
-Install the default model:
-
-```bash
-ollama pull gemma4:31b-cloud
-```
-
-On Windows PowerShell:
-
-```powershell
-ollama pull gemma4:31b-cloud
-```
-
-### PDF Extractor Is Missing
-
-On Mac:
-
-```bash
-python3 -m pip install --user pypdf pdfplumber
-```
-
-On Windows:
-
-```powershell
-python -m pip install --user pypdf pdfplumber
-```
-
-### App Dependencies Are Missing
-
-From the app folder:
-
-```bash
-cd apps/desktop
-npm install
-```
-
-On Windows PowerShell:
-
-```powershell
-cd apps\desktop
-npm install
-```
-
-### The App Seems Stuck While Generating
-
-Long Ollama calls can take a while, especially for large PDFs.
-
-The Progress section shows:
-
-- elapsed time
-- last backend activity
-- time since last update
-- recent log messages
-
-If an example exam has no update for more than 10 minutes, quit the app and try again with another PDF or a smaller/faster model.
-
-## Developer Checks
-
-Run backend tests:
-
-```bash
-python3 -m unittest tests.backend.test_backend_safety -v
-```
-
-Build the frontend:
-
-```bash
-cd apps/desktop
+npm ci
 npm run build
 ```
 
-Build the desktop app:
+Für den Entwicklungsstart muss `.venv-package/bin/python` oder `.venv/bin/python` die Backend-Abhängigkeiten enthalten. Alternativ zuerst den gebündelten Dienst bauen. Der Rust-Launcher erkennt den lokalen Dienst bzw. die gebündelte Version und verwendet einen freien lokalen Port.
 
-```bash
+Mac-Paket aus dem Repository-Hauptordner bauen:
+
+```sh
+sh scripts/build-mac-backend.sh
 cd apps/desktop
-npm run tauri build
+npm run package:mac
 ```
 
-## Notes For Future Packaging
+Die Ausgabe liegt unter `apps/desktop/src-tauri/target/release/bundle/`. Ohne `APPLE_SIGNING_IDENTITY` verwendet der Build eine lokale Ad-hoc-Signatur. Diese versiegelt das Paket, ersetzt aber kein Apple-Developer-Zertifikat und keine Notarisierung für ein öffentliches Release.
 
-The current setup is good enough for development and personal use.
+## Prüfen
 
-For non-technical users, the next step should be a proper packaged release:
+Vom Repository-Hauptordner, mit normalem macOS-Zugriff für OCR und temporäre lokale HTTP-Listener:
 
-- macOS `.dmg`
-- Windows installer or portable `.exe`
-- bundled Python backend
-- clearer Windows Python detection
-- short setup guide for Ollama and model installation
+```sh
+EXAM_DOCUMENT_RUNTIME_TESTS=1 .venv-package/bin/python -m unittest discover -s tests/backend -v
+node --test tests/frontend/*.test.cjs
+npm --prefix apps/desktop run build
+cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml --locked --offline
+```
+
+Eigenständige Tests des gebündelten Dienstes:
+
+```sh
+.venv-package/bin/python scripts/smoke_packaged_documents.py backend/sidecar-bin/exam-backend-v2/exam-backend-v2
+.venv-package/bin/python scripts/smoke_packaged_generation.py --backend backend/sidecar-bin/exam-backend-v2/exam-backend-v2 --report /tmp/exam-packaged-generation.json
+```
+
+Der zweite Test verwendet einen lokalen simulierten KI-Anbieter und einen einmaligen Dummy-Schlüssel im Schlüsselbund. Er liest keine vorhandenen Zugangsdaten und löscht seinen eigenen Testeintrag wieder. Er ersetzt keinen Live-Test mit einem echten Anbieter oder ChatGPT-Konto.
+
+Die [GitHub-Checks](.github/workflows/checks.yml) prüfen Backend und Frontend ohne echte KI-Anfragen. Native OCR und das Mac-Paket werden zusätzlich auf macOS verifiziert.
+
+Weitere Dokumentation: [Prüfstand](docs/UPGRADE_STATUS.md), [Planung und Laufzeit](docs/PREFLIGHT_PLAN.md), [Laufzeit und Kosten](docs/PERFORMANCE.md), [Sicherheitsgrenzen](docs/SAFETY.md) und [Beitragen](CONTRIBUTING.md).

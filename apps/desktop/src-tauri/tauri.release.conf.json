@@ -1,0 +1,7 @@
+{
+  "bundle": {
+    "resources": {
+      "../../../backend/sidecar-bin/exam-backend-v2": "bin/exam-backend-v2/"
+    }
+  }
+}

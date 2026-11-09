@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import contextvars
+from exam_backend import runtime
 import concurrent.futures
 import datetime as dt
 import hashlib
@@ -251,7 +253,7 @@ SOURCE_TEXT>>>"""
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate local static exam apps from PDF slide decks.")
-    parser.add_argument("--root", required=True, help="Root folder containing course folders.")
+    parser.add_argument("--root", required=True, help="Root folder containing Lehrveranstaltungen.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing exam folders.")
     parser.add_argument("--only-folder", help="Generate only PDFs inside a folder with this name.")
     parser.add_argument("--limit", type=int, help="Generate at most this many exams. Useful for the first inspection pass.")
@@ -312,7 +314,7 @@ def matches_only_folder(pdf_path: Path, root: Path, only_folder: str | None) -> 
 
 def find_pdfs(root: Path, only_folder: str | None) -> list[Path]:
     pdfs = []
-    for pdf in sorted(root.rglob("*.pdf")):
+    for pdf in sorted((p for p in root.rglob("*") if p.suffix.lower() == ".pdf")):
         if is_inside_exams(pdf):
             continue
         if matches_only_folder(pdf, root, only_folder):
@@ -444,7 +446,6 @@ def extract_pdf_text(pdf_path: Path, debug: DebugLogger | None = None) -> tuple[
         ("pdfplumber", extract_with_pdfplumber),
         ("pypdf", extract_with_pypdf),
         ("pdftotext", extract_with_pdftotext),
-        ("strings fallback", extract_with_strings),
     ]
     last_error = None
     last_page_count: int | None = None
@@ -612,8 +613,6 @@ def preprocessing_cache_key(pdf_path: Path, args: argparse.Namespace, source_has
         "source_file_hash": source_hash,
         "generator_version": GENERATOR_VERSION,
         "extraction_mode": str(getattr(args, "extraction_mode", "auto")),
-        "model_name": str(getattr(args, "model", DEFAULT_MODEL)),
-        "prompt_version": PROMPT_VERSION,
     }
 
 
@@ -739,6 +738,16 @@ def positive_int(value: Any) -> int | None:
     return parsed if parsed > 0 else None
 
 
+def nonnegative_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
 def clamp_optional(value: int, minimum: int | None, maximum: int | None) -> int:
     if minimum is not None:
         value = max(minimum, value)
@@ -783,8 +792,8 @@ def resolve_target_plan(
     formulas = formula_marker_count(text)
     formula_density = round(formulas / max(1, word_count) * 1000, 4)
     target_mode = str(getattr(args, "target_mode", "auto") or "auto").strip()
-    target_mc = positive_int(getattr(args, "target_mc", None))
-    target_open = positive_int(getattr(args, "target_open", None))
+    target_mc = nonnegative_int(getattr(args, "target_mc", None))
+    target_open = nonnegative_int(getattr(args, "target_open", None))
     min_mc = positive_int(getattr(args, "min_mc", None))
     max_mc = positive_int(getattr(args, "max_mc", None))
     min_open = positive_int(getattr(args, "min_open", None))
@@ -907,8 +916,8 @@ def scaled_retry_counts(mc: int, open_count: int, attempt: int, args: argparse.N
     if attempt <= 0:
         return mc, open_count
     factor = 0.85 if attempt == 1 else 0.7
-    retry_mc = max(1, int(round(mc * factor)))
-    retry_open = max(1, int(round(open_count * factor)))
+    retry_mc = max(1, int(round(mc * factor))) if mc else 0
+    retry_open = max(1, int(round(open_count * factor))) if open_count else 0
     return (
         clamp_optional(retry_mc, None, positive_int(getattr(args, "max_mc", None))),
         clamp_optional(retry_open, None, positive_int(getattr(args, "max_open", None))),
@@ -975,14 +984,25 @@ def attach_question_metadata(questions: list[dict[str, Any]], source_text: str, 
                 for page in ensure_list(existing.get("evidence_pages", existing.get("source_pages")))
                 if isinstance(page, int) or (isinstance(page, str) and page.isdigit())
             ]
-            merged["evidence_pages"] = sorted({page for page in evidence_pages if page > 0})
+            merged["evidence_pages"] = sorted({page for page in evidence_pages if page > 0 and page in meta["chunk_page_range"]})
             merged["source_pages"] = list(merged["evidence_pages"])
             excerpt = existing.get("source_excerpt")
-            merged["source_excerpt"] = str(excerpt).strip()[:500] if excerpt else None
+            merged["source_excerpt"] = str(excerpt).strip()[:500] if excerpt and str(excerpt).strip() in source_text else None
             source_type = str(existing.get("source_type") or "unknown").strip()
             if source_type in {"text", "formula", "table", "diagram", "mixed", "unknown"}:
                 merged["source_type"] = source_type
             merged["visual_required"] = bool(existing.get("visual_required", False))
+        references = []
+        excerpt = merged.get("source_excerpt")
+        if excerpt:
+            for document in (runtime.CONTEXT.get() or {}).get("documents", {}).values():
+                for block in document.get("blocks", []):
+                    if excerpt in block.get("text", "") and block.get("locator"):
+                        references.append({"source_id": document.get("id"), "source_name": document.get("name"), "locator": block["locator"]})
+        merged["source_refs"] = references if len(references) == 1 else []
+        if len((runtime.CONTEXT.get() or {}).get("documents", {})) > 1 and not merged["source_refs"]:
+            merged["evidence_pages"] = []
+            merged["source_pages"] = []
         question["_meta"] = merged
 
 
@@ -1384,6 +1404,10 @@ def format_audit_summary(audit: dict[str, Any]) -> str:
 
 
 def post_ollama(endpoint: str, model: str, prompt: str, timeout: int) -> str:
+    runtime.check_cancel()
+    response = runtime.complete([{"role": "system", "content": GENERATION_SYSTEM_PROMPT}, {"role": "user", "content": prompt}], timeout)
+    if response is not None:
+        return response
     payload = {
         "model": model,
         "stream": False,
@@ -1490,6 +1514,7 @@ def call_json_with_retries(
 ) -> dict[str, Any]:
     last_error: Exception | None = None
     for attempt in range(max(0, args.retries) + 1):
+        runtime.check_cancel()
         retry_prompt = prompt
         if attempt:
             retry_prompt += (
@@ -1558,6 +1583,12 @@ def question_signature(text: str) -> str:
     return text[:180]
 
 
+def strict_boolean(value: Any) -> bool:
+    if type(value) is not bool:
+        raise ValueError("Antwortschlüssel muss echte JSON-Wahrheitswerte enthalten.")
+    return value
+
+
 def normalize_mc_items(raw_questions: Any, existing: set[str]) -> list[dict[str, Any]]:
     questions = []
     if not isinstance(raw_questions, list):
@@ -1572,14 +1603,17 @@ def normalize_mc_items(raw_questions: Any, existing: set[str]) -> list[dict[str,
         signature = question_signature(question_text)
         if signature in existing:
             continue
+        raw_options = ensure_list(raw.get("options"))
+        if not 4 <= len(raw_options) <= 6:
+            continue
         options = []
-        for option in ensure_list(raw.get("options"))[:6]:
+        for option in raw_options:
             if not isinstance(option, dict):
                 continue
             option_text = str(option.get("text") or "").strip()
             if option_text:
-                options.append({"text": option_text, "is_correct": bool(option.get("is_correct", False))})
-        if len(options) < 4:
+                options.append({"text": option_text, "is_correct": strict_boolean(option.get("is_correct"))})
+        if len(options) < 4 or len({o["text"].casefold() for o in options}) != len(options):
             continue
         normalized = {
             "id": "",
@@ -1590,7 +1624,7 @@ def normalize_mc_items(raw_questions: Any, existing: set[str]) -> list[dict[str,
         }
         answer_mode = str(raw.get("answer_mode") or "").strip()
         if answer_mode in {"single_correct", "multiple_correct"}:
-            normalized["answer_mode"] = answer_mode
+            normalized["answer_mode"] = "single_correct" if sum(o["is_correct"] for o in options) == 1 else "multiple_correct"
         if isinstance(raw.get("_meta"), dict):
             normalized["_meta"] = raw["_meta"]
         questions.append(normalized)
@@ -1649,18 +1683,21 @@ def normalize_exam(
     for index, question in enumerate(mc_source, start=1):
         if not isinstance(question, dict):
             continue
+        raw_options = ensure_list(question.get("options"))
+        if not 4 <= len(raw_options) <= 6:
+            continue
         options = []
-        for option in ensure_list(question.get("options"))[:6]:
+        for option in raw_options:
             if not isinstance(option, dict):
                 continue
             text = str(option.get("text", "")).strip()
             if not text:
                 continue
-            options.append({"text": text, "is_correct": bool(option.get("is_correct", False))})
-        if len(options) < 4:
+            options.append({"text": text, "is_correct": strict_boolean(option.get("is_correct"))})
+        if len(options) < 4 or len({o["text"].casefold() for o in options}) != len(options):
             continue
         normalized_mc = {
-            "id": str(question.get("id") or f"mc-{index:03d}"),
+            "id": f"mc-{index:03d}",
             "topic": str(question.get("topic") or ""),
             "question": str(question.get("question") or "").strip(),
             "options": options,
@@ -1668,7 +1705,7 @@ def normalize_exam(
         }
         answer_mode = str(question.get("answer_mode") or "").strip()
         if answer_mode in {"single_correct", "multiple_correct"}:
-            normalized_mc["answer_mode"] = answer_mode
+            normalized_mc["answer_mode"] = "single_correct" if sum(o["is_correct"] for o in options) == 1 else "multiple_correct"
         if isinstance(question.get("_meta"), dict):
             normalized_mc["_meta"] = question["_meta"]
         mc_questions.append(normalized_mc)
@@ -1683,7 +1720,7 @@ def normalize_exam(
         if rubric_template not in RUBRIC_TEMPLATES:
             rubric_template = DEFAULT_RUBRIC_TEMPLATE
         normalized_open = {
-            "id": str(question.get("id") or f"open-{index:03d}"),
+            "id": f"open-{index:03d}",
             "topic": str(question.get("topic") or ""),
             "question_type": "open_ended",
             "question": str(question.get("question") or "").strip(),
@@ -1700,7 +1737,7 @@ def normalize_exam(
 
     today = dt.date.today().isoformat()
     title = Path(source_pdf).stem
-    if not mc_questions or not open_questions:
+    if not mc_questions and not open_questions:
         raise ValueError("The model response did not contain usable MC and open-ended questions.")
     for question in mc_questions:
         if not question["question"] or not question["explanation"]:
@@ -2002,6 +2039,7 @@ def generate_chunk_data(
     debug: DebugLogger | None = None,
     fallback: bool = False,
 ) -> dict[str, Any]:
+    runtime.check_cancel()
     chunk_id = f"chunk-{index:03d}"
     local_warnings: list[str] = []
     local_timing = new_timing()
@@ -2068,6 +2106,7 @@ def chunk_results_parallel(
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_parallel_chunks) as executor:
         futures = {
             executor.submit(
+                contextvars.copy_context().run,
                 generate_chunk_data,
                 course,
                 source_pdf,
@@ -2384,7 +2423,7 @@ def generate_full_coverage_exam(
     )
 
     too_many_failed = failed_chunks > len(chunks) // 2
-    if processed_chunks == 0 or too_many_failed or not mc_questions or not open_questions:
+    if processed_chunks == 0 or too_many_failed or (target_mc > 0 and not mc_questions) or (target_open > 0 and not open_questions):
         raise RuntimeError(
             f"Full-coverage generation failed for {source_pdf}: processed {processed_chunks}/{len(chunks)} chunks, "
             f"generated {len(mc_questions)} MC and {len(open_questions)} open questions."
@@ -2500,7 +2539,7 @@ def write_exam_folder(
     overall_started = time.perf_counter()
     timing = new_timing()
     course_dir = pdf_path.parent
-    course = course_dir.name
+    course = (runtime.source_document(pdf_path) or {}).get("course", course_dir.name)
     exams_dir = course_dir / "exams"
     exam_dir = exams_dir / slugify(pdf_path.stem)
 
@@ -2508,19 +2547,26 @@ def write_exam_folder(
         print(f"SKIP existing: {exam_dir}", flush=True)
         return None
 
-    cache_payload, cache_key, cache_path = load_preprocessing_cache(root, pdf_path, args, debug=debug, progress=progress)
-    if cache_payload:
-        text = str(cache_payload.get("extracted_text") or "")
-        extraction_warning = cache_payload.get("extraction_warning")
-        if extraction_warning is not None:
-            extraction_warning = str(extraction_warning)
-        page_count_value = cache_payload.get("page_count")
-        page_count = int(page_count_value) if isinstance(page_count_value, int) else None
+    runtime.check_cancel()
+    document = runtime.source_document(pdf_path)
+    if document:
+        text = document["text"]
+        extraction_warning = " ".join(document.get("warnings", [])) or None
+        page_count = document.get("page_count")
     else:
-        extraction_started = time.perf_counter()
-        text, extraction_warning, page_count = extract_pdf_text(pdf_path, debug=debug)
-        add_seconds(timing, "extraction_seconds", extraction_started)
-        write_preprocessing_cache(cache_path, cache_key, text, extraction_warning, page_count, chunk_text(text), debug=debug)
+        cache_payload, cache_key, cache_path = load_preprocessing_cache(root, pdf_path, args, debug=debug, progress=progress)
+        if cache_payload:
+            text = str(cache_payload.get("extracted_text") or "")
+            extraction_warning = cache_payload.get("extraction_warning")
+            if extraction_warning is not None:
+                extraction_warning = str(extraction_warning)
+            page_count_value = cache_payload.get("page_count")
+            page_count = int(page_count_value) if isinstance(page_count_value, int) else None
+        else:
+            extraction_started = time.perf_counter()
+            text, extraction_warning, page_count = extract_pdf_text(pdf_path, debug=debug)
+            add_seconds(timing, "extraction_seconds", extraction_started)
+            write_preprocessing_cache(cache_path, cache_key, text, extraction_warning, page_count, chunk_text(text), debug=debug)
     word_count = count_words(text)
     if progress:
         pages = page_count if page_count is not None else "unknown"
@@ -2584,6 +2630,10 @@ def write_exam_folder(
                     audit_warnings=audit_warnings,
                 )
                 exam = normalize_exam(model_exam, course, pdf_path.name, extraction_warning, word_count)
+                exam["multiple_choice"] = exam["multiple_choice"][:target_mc]
+                exam["open_ended"] = exam["open_ended"][:target_open]
+                if (target_mc > 0 and not exam["multiple_choice"]) or (target_open > 0 and not exam["open_ended"]):
+                    raise ValueError("Die KI hat keine Fragen der gewählten Art erzeugt.")
                 attach_question_metadata(exam["multiple_choice"], prompt_text, "representative-001")
                 attach_question_metadata(exam["open_ended"], prompt_text, "representative-001")
                 exam = apply_coverage_metadata(exam, "representative", 1, 1, 0, None)
@@ -2634,20 +2684,17 @@ def write_exam_folder(
             target_planning=target_planning,
         )
 
-    if exam_dir.exists() and args.overwrite:
-        shutil.rmtree(exam_dir)
-    exam_dir.mkdir(parents=True, exist_ok=True)
-    write_started = time.perf_counter()
+    runtime.check_cancel()
+    ctx = runtime.CONTEXT.get() or {}
+    exam["metadata"].update({"language": ctx.get("language", "de"), "provider_id": ctx.get("profile_id"), "model": ctx.get("model", args.model), "profile_snapshot": ctx.get("profile_snapshot")})
+    if ctx.get('reasoning_effort') is not None:
+        exam['metadata']['reasoning_effort'] = ctx['reasoning_effort']
+    if document:
+        exam["metadata"].update({"source_id": document.get("id"), "source_file": document.get("name", pdf_path.name), "source_fingerprint": document.get("fingerprint"), "source_pdf": document.get("name", pdf_path.name)})
+        exam["metadata"]["title"] = Path(document.get("name", pdf_path.name)).stem
+        exam["source_blocks"] = document.get("blocks", [])
     timing["total_seconds"] = round(time.perf_counter() - overall_started, 4)
-    (exam_dir / "index.html").write_text(render_exam_html(template_dir, exam), encoding="utf-8")
-    (exam_dir / "exam.json").write_text(json.dumps(exam, ensure_ascii=False, indent=2), encoding="utf-8")
-    (exam_dir / "source.txt").write_text(text, encoding="utf-8")
-    add_seconds(timing, "write_seconds", write_started)
-    timing["total_seconds"] = round(time.perf_counter() - overall_started, 4)
-    if isinstance(exam.get("audit"), dict):
-        exam["audit"]["timing"] = timing
-    (exam_dir / "index.html").write_text(render_exam_html(template_dir, exam), encoding="utf-8")
-    (exam_dir / "exam.json").write_text(json.dumps(exam, ensure_ascii=False, indent=2), encoding="utf-8")
+    runtime.publish_exam(exam_dir, exam, text, lambda data: render_exam_html(template_dir, data))
     if debug:
         debug(f"AUDIT SUMMARY: {pdf_path.name}", format_audit_summary(exam["audit"]))
         debug(f"TIMING SUMMARY: {pdf_path.name}", format_timing_summary(timing))
@@ -2669,6 +2716,8 @@ def write_exam_folder(
 def discover_generated_exams(root: Path) -> dict[Path, list[dict[str, Any]]]:
     courses: dict[Path, list[dict[str, Any]]] = {}
     for exam_json in sorted(root.rglob("exams/*/exam.json")):
+        if any(part.startswith(".") for part in exam_json.relative_to(root).parts):
+            continue
         try:
             data = json.loads(exam_json.read_text(encoding="utf-8"))
         except Exception:
@@ -2691,7 +2740,7 @@ def discover_generated_exams(root: Path) -> dict[Path, list[dict[str, Any]]]:
 
 def html_page(title: str, body: str) -> str:
     return f"""<!doctype html>
-<html lang="en">
+<html lang="de">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -2737,34 +2786,36 @@ def write_index_pages(root: Path) -> None:
     course_links = []
     for course_dir, exams in sorted(courses.items(), key=lambda item: item[0].name.casefold()):
         exams_dir = course_dir / "exams"
+        course_label = str(exams[0].get("course") or course_dir.name)
         items = []
         for exam in sorted(exams, key=lambda item: item["source_pdf"].casefold()):
             href = rel_href(exams_dir, exam["exam_dir"] / "index.html")
-            warning = f'<span class="warning">Warning: {escape_html(exam["warning"])}</span>' if exam.get("warning") else ""
+            warning = f'<span class="warning">Hinweis: {escape_html(exam["warning"])}</span>' if exam.get("warning") else ""
             items.append(
                 f'<li><a href="{escape_html(href)}">{escape_html(exam["title"])}</a>'
-                f'<span class="meta">Source: {escape_html(exam["source_pdf"])} · '
-                f'{exam["mc_count"]} MC · {exam["open_count"]} open</span>{warning}</li>'
+                f'<span class="meta">Quelle: {escape_html(exam["source_pdf"])} · '
+                f'{exam["mc_count"]} MC · {exam["open_count"]} offen</span>{warning}</li>'
             )
         body = (
-            f"    <h1>{escape_html(course_dir.name)}</h1>\n"
-            f"    <p>{len(exams)} generated exam{'s' if len(exams) != 1 else ''}</p>\n"
+            f"    <h1>{escape_html(course_label)}</h1>\n"
+            f"    <p>{len(exams)} Prüfung{'en' if len(exams) != 1 else ''}</p>\n"
             f"    <ul>\n      " + "\n      ".join(items) + "\n    </ul>\n"
         )
         exams_dir.mkdir(exist_ok=True)
-        (exams_dir / "index.html").write_text(html_page(f"{course_dir.name} exams", body), encoding="utf-8")
+        (exams_dir / "index.html").write_text(html_page(f"{course_label} – Prüfungen", body), encoding="utf-8")
         root_href = rel_href(root, exams_dir / "index.html")
         course_links.append(
-            f'<li><a href="{escape_html(root_href)}">{escape_html(course_dir.name)}</a>'
-            f'<span class="meta">{len(exams)} generated exam{"s" if len(exams) != 1 else ""}</span></li>'
+            f'<li><a href="{escape_html(root_href)}">{escape_html(course_label)}</a>'
+            f'<span class="meta">{len(exams)} Prüfung{"en" if len(exams) != 1 else ""}</span></li>'
         )
 
+    total_exams = sum(len(exams) for exams in courses.values())
     root_body = (
-        "    <h1>Generated exam index</h1>\n"
-        f"    <p>{sum(len(exams) for exams in courses.values())} generated exams across {len(courses)} course folders.</p>\n"
+        "    <h1>Deine Prüfungen</h1>\n"
+        f"    <p>{total_exams} Prüfung{'en' if total_exams != 1 else ''} aus {len(courses)} Lehrveranstaltung{'en' if len(courses) != 1 else ''}.</p>\n"
         "    <ul>\n      " + "\n      ".join(course_links) + "\n    </ul>\n"
     )
-    (root / "exam_index.html").write_text(html_page("Generated exam index", root_body), encoding="utf-8")
+    (root / "exam_index.html").write_text(html_page("Deine Prüfungen", root_body), encoding="utf-8")
 
 
 def main() -> int:

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -150,11 +151,15 @@ def extract_json_object(text: str) -> dict[str, Any]:
 
 
 def normalize_grading_result(result: dict[str, Any]) -> dict[str, Any]:
-    score = result.get("score", 0)
+    score = result.get("score")
     try:
+        if isinstance(score, bool) or not math.isfinite(float(score)):
+            raise ValueError()
         score = max(0, min(100, int(round(float(score)))))
-    except (TypeError, ValueError):
-        score = 0
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("Die KI hat keine gültige Punktzahl geliefert. Bitte erneut bewerten.") from exc
+    if not str(result.get("feedback") or result.get("verdict") or "").strip():
+        raise ValueError("Die Bewertung enthält keine Rückmeldung. Bitte erneut versuchen.")
 
     return {
         "score": score,

@@ -4,17 +4,20 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import contextvars
 import datetime as dt
 import json
 import re
 import shutil
 import textwrap
+import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
-import generate_exams
+from exam_backend import generate_exams, runtime
 
 
 DEFAULT_ENDPOINT = "http://localhost:11434/api/chat"
@@ -145,6 +148,10 @@ def selected_source_for_batch(chunks: list[str], batch_index: int, window: int =
 
 
 def post_ollama(endpoint: str, model: str, system_prompt: str, user_prompt: str, timeout: int) -> str:
+    runtime.check_cancel()
+    response = runtime.complete([{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}], timeout, 0.18)
+    if response is not None:
+        return response
     payload = {
         "model": model,
         "stream": False,
@@ -182,9 +189,11 @@ def call_json(
     context: str,
     debug: DebugLogger | None = None,
     audit_warnings: list[str] | None = None,
+    output_tokens: int = 2000,
 ) -> dict[str, Any]:
     last_error: Exception | None = None
     for attempt in range(max(0, args.retries) + 1):
+        runtime.check_cancel()
         prompt = user_prompt
         if attempt:
             prompt += (
@@ -199,7 +208,9 @@ def call_json(
                     f"Ollama request: {context} attempt {attempt + 1}",
                     f"endpoint={args.endpoint}\nmodel={args.model}\ntimeout={args.timeout}\n\nSYSTEM PROMPT:\n{FINAL_SYSTEM_PROMPT}\n\nUSER PROMPT:\n{prompt}",
                 )
-            raw = post_ollama(args.endpoint, args.model, FINAL_SYSTEM_PROMPT, prompt, args.timeout)
+            phase = 'blueprint' if 'blueprint' in context else 'mc' if ' MC ' in context else 'open'
+            with runtime.request_context(phase=phase, output_reserve=output_tokens):
+                raw = post_ollama(args.endpoint, args.model, FINAL_SYSTEM_PROMPT, prompt, args.timeout)
             if debug:
                 debug(f"Ollama raw response: {context} attempt {attempt + 1}", raw)
             return parse_json(raw, debug=debug, context=f"{context} attempt {attempt + 1}", audit_warnings=audit_warnings)
@@ -252,7 +263,7 @@ SOURCE CHUNK:
 <<<SOURCE
 {chunk}
 SOURCE>>>"""
-        data = call_json(args, prompt, f"{course} blueprint chunk {index}", debug=debug, audit_warnings=audit_warnings)
+        data = call_json(args, prompt, f"{course} blueprint chunk {index}", debug=debug, audit_warnings=audit_warnings, output_tokens=1600)
         chunk_blueprints.append(data)
         print(f"BLUEPRINT {course}: chunk {index}/{len(chunks)}", flush=True)
 
@@ -266,7 +277,7 @@ SOURCE>>>"""
 
 
 def blueprint_text(blueprint: dict[str, Any], max_chars: int = 26000) -> str:
-    text = json.dumps(blueprint, ensure_ascii=False, indent=2)
+    text = json.dumps(blueprint, ensure_ascii=False, separators=(',', ':'))
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + "\n... [blueprint truncated for prompt length]"
@@ -278,86 +289,25 @@ def question_signature(text: str) -> str:
     return text[:180]
 
 
-def normalize_mc(raw_questions: Any, existing: set[str]) -> list[dict[str, Any]]:
-    normalized = []
-    if not isinstance(raw_questions, list):
-        return normalized
-    for raw in raw_questions:
-        if not isinstance(raw, dict):
-            continue
-        question_text = str(raw.get("question", "")).strip()
-        explanation = str(raw.get("explanation", "")).strip()
-        if not question_text or not explanation:
-            continue
-        signature = question_signature(question_text)
-        if signature in existing:
-            continue
-        options = []
-        for option in raw.get("options", []):
-            if not isinstance(option, dict):
-                continue
-            option_text = str(option.get("text", "")).strip()
-            if not option_text:
-                continue
-            options.append({"text": option_text, "is_correct": bool(option.get("is_correct", False))})
-        if len(options) < 4:
-            continue
-        normalized.append(
-            {
-                "id": "",
-                "topic": str(raw.get("topic", "")).strip(),
-                "question": question_text,
-                "options": options[:6],
-                "explanation": explanation,
-            }
-        )
-        existing.add(signature)
-    return normalized
-
-
-def normalize_open(raw_questions: Any, existing: set[str]) -> list[dict[str, Any]]:
-    normalized = []
-    if not isinstance(raw_questions, list):
-        return normalized
-    for raw in raw_questions:
-        if not isinstance(raw, dict):
-            continue
-        question_text = str(raw.get("question", "")).strip()
-        expected = str(raw.get("expected_answer", "")).strip()
-        if not question_text or not expected:
-            continue
-        signature = question_signature(question_text)
-        if signature in existing:
-            continue
-        rubric = raw.get("grading_rubric")
-        if not isinstance(rubric, dict):
-            rubric = {
-                "90-100": "Excellent, precise, complete, and well structured.",
-                "76-89": "Good answer with minor gaps.",
-                "61-75": "Solid answer with noticeable gaps.",
-                "41-60": "On topic but incomplete or imprecise.",
-                "21-40": "Partially relevant with major conceptual gaps.",
-                "0-20": "Mostly wrong, vague, or empty.",
-            }
-        concepts = raw.get("key_concepts")
-        if not isinstance(concepts, list):
-            concepts = []
-        normalized.append(
-            {
-                "id": "",
-                "question": question_text,
-                "expected_answer": expected,
-                "key_concepts": [str(item) for item in concepts if str(item).strip()],
-                "grading_rubric": rubric,
-                "max_score": 100,
-            }
-        )
-        existing.add(signature)
-    return normalized
+normalize_mc = generate_exams.normalize_mc_items
+normalize_open = generate_exams.normalize_open_items
 
 
 def mc_prompt(course: str, blueprint: dict[str, Any], source_excerpt: str, count: int, batch_index: int, existing_stems: list[str]) -> str:
-    return f"""Generate {count} very hard final-exam multiple-choice questions.
+    # Stable source/blueprint prefixes can be reused by provider prompt caches.
+    return f"""Course: {course}
+
+COURSE BLUEPRINT:
+<<<BLUEPRINT
+{blueprint_text(blueprint)}
+BLUEPRINT>>>
+
+SOURCE EXCERPT FOR THIS BATCH:
+<<<SOURCE
+{source_excerpt}
+SOURCE>>>
+
+Generate {count} very hard final-exam multiple-choice questions.
 
 Course: {course}
 Batch: {batch_index}
@@ -399,6 +349,12 @@ Return JSON only:
     }}
   ]
 }}
+"""
+
+
+def open_prompt(course: str, blueprint: dict[str, Any], source_excerpt: str, count: int, batch_index: int, existing_stems: list[str]) -> str:
+    # Stable source/blueprint prefixes can be reused by provider prompt caches.
+    return f"""Course: {course}
 
 COURSE BLUEPRINT:
 <<<BLUEPRINT
@@ -408,11 +364,9 @@ BLUEPRINT>>>
 SOURCE EXCERPT FOR THIS BATCH:
 <<<SOURCE
 {source_excerpt}
-SOURCE>>>"""
+SOURCE>>>
 
-
-def open_prompt(course: str, blueprint: dict[str, Any], source_excerpt: str, count: int, batch_index: int, existing_stems: list[str]) -> str:
-    return f"""Generate {count} very hard final-exam open-ended questions.
+Generate {count} very hard final-exam open-ended questions.
 
 Course: {course}
 Batch: {batch_index}
@@ -450,16 +404,7 @@ Return JSON only:
     }}
   ]
 }}
-
-COURSE BLUEPRINT:
-<<<BLUEPRINT
-{blueprint_text(blueprint)}
-BLUEPRINT>>>
-
-SOURCE EXCERPT FOR THIS BATCH:
-<<<SOURCE
-{source_excerpt}
-SOURCE>>>"""
+"""
 
 
 def generate_mc(
@@ -480,7 +425,7 @@ def generate_mc(
         remaining = target - len(questions)
         count = min(args.mc_batch_size, remaining)
         data = None
-        while count >= 5:
+        while count >= 1:
             excerpt = selected_source_for_batch(source_chunks, batch_index - 1)
             stems = [question["question"] for question in questions]
             try:
@@ -490,10 +435,11 @@ def generate_mc(
                     f"{course} MC batch {batch_index} ({count})",
                     debug=debug,
                     audit_warnings=audit_warnings,
+                    output_tokens=count * 220,
                 )
                 break
             except RuntimeError as exc:
-                smaller = max(5, count // 2)
+                smaller = max(1, count // 2)
                 if smaller == count:
                     print(f"MC {course}: abandoning batch {batch_index} after JSON failures: {exc}", flush=True)
                     if audit_warnings is not None:
@@ -545,7 +491,7 @@ def generate_open(
         remaining = target - len(questions)
         count = min(args.open_batch_size, remaining)
         data = None
-        while count >= 2:
+        while count >= 1:
             excerpt = selected_source_for_batch(source_chunks, batch_index + 3)
             stems = [question["question"] for question in questions]
             try:
@@ -555,10 +501,11 @@ def generate_open(
                     f"{course} open batch {batch_index} ({count})",
                     debug=debug,
                     audit_warnings=audit_warnings,
+                    output_tokens=count * 400,
                 )
                 break
             except RuntimeError as exc:
-                smaller = max(2, count // 2)
+                smaller = max(1, count // 2)
                 if smaller == count:
                     print(f"OPEN {course}: abandoning batch {batch_index} after JSON failures: {exc}", flush=True)
                     if audit_warnings is not None:
@@ -608,18 +555,20 @@ def adaptive_targets(args: argparse.Namespace, entries: list[dict[str, Any]], to
     return mc, open_count, warning
 
 
-def write_final_exam(args: argparse.Namespace, course_dir: Path, debug: DebugLogger | None = None) -> dict[str, Any] | None:
+def write_final_exam(args: argparse.Namespace, course_dir: Path, debug: DebugLogger | None = None, progress: Callable[[str], None] | None = None) -> dict[str, Any] | None:
     final_dir = course_dir / "exams" / "final-exam"
     if final_dir.exists() and not args.overwrite:
         print(f"SKIP existing final: {final_dir}", flush=True)
         return None
 
-    entries = source_entries(course_dir)
+    entries = getattr(args, "source_entries", None)
+    if entries is None:
+        entries = source_entries(course_dir)
     if not entries:
         print(f"SKIP no source entries: {course_dir}", flush=True)
         return None
 
-    course = course_dir.name
+    course = getattr(args, "course_label", course_dir.name)
     aggregate = aggregate_source(entries)
     total_words = count_words(aggregate)
     weak_count = sum(1 for entry in entries if entry["warning"] or entry["words"] < 800)
@@ -648,11 +597,36 @@ def write_final_exam(args: argparse.Namespace, course_dir: Path, debug: DebugLog
                 indent=2,
             ),
         )
+    if progress:
+        progress('Prüfungsplan erstellen')
     blueprint = build_blueprint(args, course, entries, aggregate, debug=debug, audit_warnings=audit_warnings)
 
-    mc_questions = generate_mc(args, course, blueprint, source_chunks, target_mc, debug=debug, audit_warnings=audit_warnings)
-    open_questions = generate_open(args, course, blueprint, source_chunks, target_open, debug=debug, audit_warnings=audit_warnings)
-    if not mc_questions or not open_questions:
+    question_cancel = threading.Event()
+    mc_warnings, open_warnings = [], []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        try:
+            # Child requests share usage and sources, but can stop without canceling other exams.
+            token = runtime.CONTEXT.set(dict(runtime.CONTEXT.get() or {}, cancel_event=question_cancel))
+            try:
+                if progress:
+                    progress('MC- und offene Fragen erstellen')
+                mc_future = executor.submit(contextvars.copy_context().run, generate_mc, args, course, blueprint, source_chunks, target_mc, debug=debug, audit_warnings=mc_warnings)
+                open_future = executor.submit(contextvars.copy_context().run, generate_open, args, course, blueprint, source_chunks, target_open, debug=debug, audit_warnings=open_warnings)
+            finally:
+                runtime.CONTEXT.reset(token)
+            pending = {mc_future, open_future}
+            while pending:
+                runtime.check_cancel()
+                done, pending = concurrent.futures.wait(pending, timeout=0.1, return_when=concurrent.futures.FIRST_COMPLETED)
+                for future in done:
+                    future.result()
+        except BaseException:
+            question_cancel.set()
+            raise
+    mc_questions, open_questions = mc_future.result(), open_future.result()
+    audit_warnings.extend(mc_warnings)
+    audit_warnings.extend(open_warnings)
+    if (target_mc > 0 and not mc_questions) or (target_open > 0 and not open_questions):
         raise RuntimeError(f"Final exam for {course} did not produce usable questions.")
 
     warnings = [target_warning] if target_warning else []
@@ -664,7 +638,7 @@ def write_final_exam(args: argparse.Namespace, course_dir: Path, debug: DebugLog
 
     exam = {
         "metadata": {
-            "title": f"Final Exam - {course}",
+            "title": f"{'Final exam' if (runtime.CONTEXT.get() or {}).get('language') == 'en' else 'Gesamtprüfung'} – {course}",
             "course": course,
             "source_pdf": "Final exam from all course source decks",
             "generated_date": dt.date.today().isoformat(),
@@ -706,13 +680,13 @@ def write_final_exam(args: argparse.Namespace, course_dir: Path, debug: DebugLog
     if debug:
         debug(f"AUDIT SUMMARY: final exam {course}", generate_exams.format_audit_summary(exam["audit"]))
 
-    if final_dir.exists() and args.overwrite:
-        shutil.rmtree(final_dir)
-    final_dir.mkdir(parents=True, exist_ok=True)
+    runtime.check_cancel()
+    ctx = runtime.CONTEXT.get() or {}
+    exam["metadata"].update({"language": ctx.get("language", "de"), "provider_id": ctx.get("profile_id"), "model": ctx.get("model", args.model), "profile_snapshot": ctx.get("profile_snapshot")})
+    if ctx.get('reasoning_effort') is not None:
+        exam['metadata']['reasoning_effort'] = ctx['reasoning_effort']
     template_dir = Path(__file__).resolve().parent / "templates"
-    (final_dir / "index.html").write_text(generate_exams.render_exam_html(template_dir, exam), encoding="utf-8")
-    (final_dir / "exam.json").write_text(json.dumps(exam, ensure_ascii=False, indent=2), encoding="utf-8")
-    (final_dir / "source.txt").write_text(aggregate, encoding="utf-8")
+    runtime.publish_exam(final_dir, exam, aggregate, lambda data: generate_exams.render_exam_html(template_dir, data))
     print(f"WROTE FINAL {final_dir}", flush=True)
     return {
         "course": course,
