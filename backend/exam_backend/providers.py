@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import ipaddress
 import json
 import os
@@ -20,6 +20,7 @@ PROFILE_LOCK = threading.RLock()
 DEFAULT_PROFILE = {"id": "ollama", "kind": "ollama", "name": "Ollama", "base_url": "http://127.0.0.1:11434", "model": ""}
 DEFAULT_PROFILES = [DEFAULT_PROFILE, {"id": "deepseek", "kind": "deepseek", "name": "DeepSeek", "base_url": "https://api.deepseek.com", "model": "deepseek-flash"}, {"id": "chatgpt", "kind": "chatgpt", "name": "ChatGPT", "base_url": "https://api.openai.com/v1", "model": ""}]
 MAX_RESPONSE_BYTES = 12 * 1024 * 1024
+DEFAULT_REASONING_EFFORT = 'low'
 
 
 class ProviderError(RuntimeError):
@@ -34,11 +35,18 @@ class GenerationCanceled(ProviderError):
         super().__init__("canceled", "Vorgang abgebrochen.")
 
 
+def validate_reasoning_effort(value):
+    if not isinstance(value, str) or value not in {'off', 'low', 'high', 'max'}:
+        raise ProviderError('settings', 'DeepSeek-Denktiefe muss off, low, high oder max sein. Medium entspricht bei DeepSeek high.')
+    return value
+
+
 @dataclass
 class ProviderResult:
     text: str
     usage: dict[str, Any]
     finish_reason: str
+    timing: dict[str, Any] = field(default_factory=dict)
 
 
 def settings_dir() -> Path:
@@ -295,19 +303,31 @@ def list_models(profile_id: str) -> list[str]:
     return sorted({item[key] for item in payload.get(field, []) if isinstance(item, dict) and isinstance(item.get(key), str)})
 
 
-def _request(profile, model, messages, temperature):
+def _request(profile, model, messages, temperature, max_output_tokens=None, reasoning_effort=DEFAULT_REASONING_EFFORT):
     headers = {"Content-Type": "application/json", **_credentials(profile)}
     if profile["kind"] == "chatgpt":
         instructions = "\n\n".join(str(m["content"]) for m in messages if m["role"] in {"system", "developer"})
         payload = {"model": model, "store": False, "stream": True, "input": [m for m in messages if m["role"] not in {"system", "developer"}]}
         if instructions:
             payload["instructions"] = instructions
+        if max_output_tokens is not None:
+            payload['max_output_tokens'] = max_output_tokens
         return profile["base_url"] + "/responses", headers, payload
     if profile["kind"] == "ollama":
-        return profile["base_url"] + "/api/chat", headers, {"model": model, "messages": messages, "stream": True, "format": "json", "options": {"temperature": temperature}}
+        options = {"temperature": temperature}
+        if max_output_tokens is not None:
+            options['num_predict'] = max_output_tokens
+        return profile["base_url"] + "/api/chat", headers, {"model": model, "messages": messages, "stream": True, "format": "json", "options": options}
     payload = {"model": model, "messages": messages, "stream": True, "temperature": temperature}
+    if max_output_tokens is not None:
+        payload['max_tokens'] = max_output_tokens
     if profile["kind"] == "deepseek":
+        effort = validate_reasoning_effort(reasoning_effort)
+        payload['thinking'] = {'type': 'disabled' if effort == 'off' else 'enabled'}
+        if effort != 'off':
+            payload['reasoning_effort'] = effort
         payload["stream_options"] = {"include_usage": True}
+        payload['response_format'] = {'type': 'json_object'}
     return profile["base_url"] + "/chat/completions", headers, payload
 
 
@@ -348,6 +368,7 @@ async def _stream(url, headers, payload, kind, timeout):
     pieces = []
     usage: dict[str, Any] = {}
     finish = ""
+    timing = {}
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=min(timeout, 15)), follow_redirects=False, trust_env=False) as client:
             async with client.stream("POST", url, headers=headers, json=payload) as response:
@@ -371,6 +392,7 @@ async def _stream(url, headers, payload, kind, timeout):
                         if event.get("done"):
                             finish = event.get("done_reason") or "stop"
                             usage = {k: event[k] for k in ("prompt_eval_count", "eval_count") if k in event}
+                            timing = {k: event[k] for k in ('total_duration', 'load_duration', 'prompt_eval_duration', 'eval_duration', 'prompt_eval_cached_count') if type(event.get(k)) in (int, float) and event[k] >= 0}
                     elif kind == "chatgpt":
                         event_type = event.get("type")
                         if event_type == "response.output_text.delta":
@@ -408,10 +430,10 @@ async def _stream(url, headers, payload, kind, timeout):
     text = "".join(pieces).strip()
     if not text:
         raise ProviderError("response", "Die KI hat keine verwertbare Antwort geliefert.")
-    return ProviderResult(text, usage, finish)
+    return ProviderResult(text, usage, finish, timing)
 
 
-def complete(profile_id: str, model: str, messages: list[dict[str, Any]], timeout: int = 600, cancel_event=None, temperature: float = 0.25, profile_snapshot: dict[str, Any] | None = None) -> ProviderResult:
+def complete(profile_id: str, model: str, messages: list[dict[str, Any]], timeout: int = 600, cancel_event=None, temperature: float = 0.25, profile_snapshot: dict[str, Any] | None = None, max_output_tokens: int | None = None, reasoning_effort: str = DEFAULT_REASONING_EFFORT) -> ProviderResult:
     if cancel_event is not None and cancel_event.is_set():
         raise GenerationCanceled()
     profile = dict(profile_snapshot) if profile_snapshot is not None else get_profile(profile_id)
@@ -425,7 +447,9 @@ def complete(profile_id: str, model: str, messages: list[dict[str, Any]], timeou
         raise ProviderError("model", "Bitte zuerst ein KI-Modell auswählen.")
     if not isinstance(messages, list) or any(not isinstance(m, dict) or m.get("role") not in {"system", "developer", "user", "assistant"} or not isinstance(m.get("content"), (str, list)) for m in messages):
         raise ProviderError("request", "Die KI-Nachrichten sind ungültig.")
-    url, headers, payload = _request(profile, selected, messages, temperature)
+    if max_output_tokens is not None and (type(max_output_tokens) is not int or not 1 <= max_output_tokens <= 32768):
+        raise ProviderError('request', 'Ungültige Ausgabegrenze.')
+    url, headers, payload = _request(profile, selected, messages, temperature, max_output_tokens, reasoning_effort)
     deadline = time.monotonic() + timeout
     for attempt in range(3):
         try:
@@ -447,10 +471,10 @@ def complete(profile_id: str, model: str, messages: list[dict[str, Any]], timeou
     raise AssertionError("unreachable")
 
 
-def test_profile(profile_id: str, model: str | None = None) -> dict[str, Any]:
+def test_profile(profile_id: str, model: str | None = None, reasoning_effort: str = DEFAULT_REASONING_EFFORT) -> dict[str, Any]:
     selected = model or get_profile(profile_id).get("model") or ""
     try:
-        result = complete(profile_id, selected, [{"role": "user", "content": 'Return exactly this JSON object: {"ok":true}'}], timeout=30, temperature=0)
+        result = complete(profile_id, selected, [{"role": "user", "content": 'Return exactly this JSON object: {"ok":true}'}], timeout=30, temperature=0, reasoning_effort=reasoning_effort)
         if not isinstance(json.loads(result.text), dict):
             raise ValueError()
         return {"ok": True, "profile_id": profile_id, "model": selected, "detail": "Das Modell hat eine vollständige Antwort geliefert.", "usage": result.usage}

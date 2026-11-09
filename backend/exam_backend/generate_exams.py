@@ -2687,6 +2687,8 @@ def write_exam_folder(
     runtime.check_cancel()
     ctx = runtime.CONTEXT.get() or {}
     exam["metadata"].update({"language": ctx.get("language", "de"), "provider_id": ctx.get("profile_id"), "model": ctx.get("model", args.model), "profile_snapshot": ctx.get("profile_snapshot")})
+    if ctx.get('reasoning_effort') is not None:
+        exam['metadata']['reasoning_effort'] = ctx['reasoning_effort']
     if document:
         exam["metadata"].update({"source_id": document.get("id"), "source_file": document.get("name", pdf_path.name), "source_fingerprint": document.get("fingerprint"), "source_pdf": document.get("name", pdf_path.name)})
         exam["metadata"]["title"] = Path(document.get("name", pdf_path.name)).stem

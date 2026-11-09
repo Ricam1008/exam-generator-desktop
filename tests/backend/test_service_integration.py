@@ -118,6 +118,88 @@ class LoopbackServiceTests(unittest.TestCase):
         status, _, payload = self.request('GET', '/api/health', auth=True)
         self.assertEqual(status, 200)
         self.assertTrue(payload['ok'])
+
+    def finish_job(self, payload):
+        job_id = payload['job_id']
+        self.state.workers[job_id].join(4)
+        self.assertFalse(self.state.workers[job_id].is_alive(), 'Test job did not finish')
+        status, _, result = self.request('GET', '/api/jobs/' + job_id, auth=True)
+        self.assertEqual(status, 200)
+        return result
+
+    def preflight_payload(self):
+        root = self.root / 'material'
+        root.mkdir()
+        (root / 'lecture.txt').write_text('Lernen verbindet Begriffe mit Belegen. Übung verbessert den Abruf.', encoding='utf-8')
+        status, _, scan = self.request('POST', '/api/scan', {'input_path': str(root)}, auth=True)
+        self.assertEqual(status, 200)
+        return {'input_path': str(root), 'output_path': str(self.root / 'output'), 'source_ids': [s['id'] for s in scan['sources']], 'profile_id': 'deepseek', 'model': 'test-model', 'mode': 'finals', 'target_mode': 'manual', 'target_mc': 1, 'target_open': 1}
+
+    def test_preflight_api_has_no_inference_and_generation_reuses_its_plan(self):
+        payload = self.preflight_payload()
+        self.assertEqual(self.request('POST', '/api/preflight', payload)[0], 401)
+        with patch.object(providers, 'complete', side_effect=AssertionError('No inference during analysis')):
+            status, _, response = self.request('POST', '/api/preflight', payload, auth=True)
+            self.assertEqual(status, 200, response)
+            job = self.finish_job(response)
+        self.assertEqual(job['kind'], 'preflight')
+        self.assertEqual(job['status'], 'done', job['error'])
+        self.assertEqual(job['result']['counts']['new'], 1)
+        self.assertNotIn('text', job['result']['material']['documents'][0])
+        def complete(*args, **kwargs):
+            self.assertEqual(kwargs['reasoning_effort'], 'low')
+            return providers.ProviderResult(json.dumps({'major_topics': ['Lernen'], 'multiple_choice': [{'question': 'Was fördert Lernen?', 'explanation': 'Übung verbessert den Abruf.', 'options': [{'text': str(i), 'is_correct': i == 0} for i in range(4)]}], 'open_ended': [{'question': 'Erkläre Lernen.', 'expected_answer': 'Begriffe mit Belegen verbinden.', 'key_concepts': ['Lernen']}]}), {}, 'stop')
+        payload['analysis_id'] = job['result']['analysis_id']
+        with patch.object(providers, 'complete', side_effect=complete):
+            status, _, response = self.request('POST', '/api/generate', payload, auth=True)
+            self.assertEqual(status, 200, response)
+            generated = self.finish_job(response)
+        self.assertEqual(generated['status'], 'done', generated['error'])
+        self.assertEqual(len(generated['result']['generated']), 1)
+        self.assertEqual(generated['workload']['completed'], 1)
+        usage_file = next((Path(generated['result']['project_root']) / 'usage').glob('*.json'))
+        usage = json.loads(usage_file.read_text())
+        self.assertEqual(usage['requests_with_reported_usage'], 0)
+        self.assertIsNone(usage['totals']['reasoning_tokens'])
+        self.assertTrue(usage['totals']['incomplete'])
+        self.assertEqual(usage['reasoning_effort'], 'low')
+        exam_file = next(Path(generated['result']['project_root']).glob('*/exams/*/exam.json'))
+        self.assertEqual(json.loads(exam_file.read_text())['metadata']['reasoning_effort'], 'low')
+        payload.pop('analysis_id')
+        payload.update(max_parallel_exams=1, max_active_requests=1)
+        with patch.object(providers, 'complete', side_effect=AssertionError('Concurrency changes must reuse exams')):
+            _, _, response = self.request('POST', '/api/preflight', payload, auth=True)
+            reused = self.finish_job(response)
+        self.assertEqual(reused['result']['counts']['reused'], 1)
+        self.assertEqual(reused['result']['estimate']['high_seconds'], 0)
+        payload['reasoning_effort'] = 'high'
+        with patch.object(providers, 'complete', side_effect=AssertionError('No inference during analysis')):
+            _, _, response = self.request('POST', '/api/preflight', payload, auth=True)
+            changed_effort = self.finish_job(response)
+        self.assertEqual(changed_effort['result']['counts']['new'], 1)
+        self.assertEqual(changed_effort['result']['counts']['reused'], 0)
+
+    def test_calibration_api_uses_public_fixture_and_returns_reviewable_sample(self):
+        from exam_backend import model_checks
+        from test_model_checks import ModelChecksTests
+        fixture = ModelChecksTests()
+        def complete(profile, model, messages, **kwargs):
+            self.assertEqual(kwargs['reasoning_effort'], 'max')
+            prompt = messages[-1]['content']
+            self.assertIn(model_checks.FIXTURE, prompt)
+            kind = 'blueprint' if 'topics (Liste)' in prompt else 'mc' if 'multiple_choice' in prompt else 'open'
+            return providers.ProviderResult(json.dumps(fixture.response(kind)), {}, 'stop')
+        with patch.object(providers, 'complete', side_effect=complete) as provider:
+            status, _, response = self.request('POST', '/api/calibrate', {'profile_id': 'deepseek', 'model': 'test-model', 'reasoning_effort': 'max'}, auth=True)
+            self.assertEqual(status, 200, response)
+            job = self.finish_job(response)
+        self.assertEqual(job['kind'], 'calibration')
+        self.assertEqual(job['status'], 'done', job['error'])
+        self.assertEqual(provider.call_count, 3)
+        self.assertEqual(job['result']['suitability']['sample_count'], 10)
+        self.assertEqual(job['result']['suitability']['reasoning_effort'], 'max')
+        self.assertEqual(job['result']['sample']['source'], model_checks.FIXTURE)
+        self.assertTrue(job['result']['sample']['mc']['multiple_choice'][0]['options'])
         cookie, _, _ = self.preview_cookie()
         self.assertEqual(self.request('GET', '/api/profiles', cookie=cookie)[0], 401)
         self.assertEqual(self.request('GET', '/preview/first/exam_index.html', auth=True)[0], 403)

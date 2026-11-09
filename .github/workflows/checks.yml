@@ -1,0 +1,49 @@
+name: Source checks
+
+on:
+  push:
+    branches: [main, 'codex/**']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      EXAM_GENERATOR_DATA_DIR: ${{ runner.temp }}/exam-generator-tests
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
+      - name: Install source-test dependencies
+        run: python -m pip install -e ./backend Pillow
+      - name: Run backend tests with simulated providers
+        run: python -m unittest discover -s tests/backend -v
+
+  frontend:
+    name: Frontend tests and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - name: Install locked frontend dependencies
+        run: npm --prefix apps/desktop ci
+      - name: Run frontend tests
+        run: node --test tests/frontend/*.test.cjs
+      - name: Type-check and build the frontend
+        run: npm --prefix apps/desktop run build

@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import contextvars
 import datetime as dt
 import json
 import re
 import shutil
 import textwrap
+import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -186,6 +189,7 @@ def call_json(
     context: str,
     debug: DebugLogger | None = None,
     audit_warnings: list[str] | None = None,
+    output_tokens: int = 2000,
 ) -> dict[str, Any]:
     last_error: Exception | None = None
     for attempt in range(max(0, args.retries) + 1):
@@ -204,7 +208,9 @@ def call_json(
                     f"Ollama request: {context} attempt {attempt + 1}",
                     f"endpoint={args.endpoint}\nmodel={args.model}\ntimeout={args.timeout}\n\nSYSTEM PROMPT:\n{FINAL_SYSTEM_PROMPT}\n\nUSER PROMPT:\n{prompt}",
                 )
-            raw = post_ollama(args.endpoint, args.model, FINAL_SYSTEM_PROMPT, prompt, args.timeout)
+            phase = 'blueprint' if 'blueprint' in context else 'mc' if ' MC ' in context else 'open'
+            with runtime.request_context(phase=phase, output_reserve=output_tokens):
+                raw = post_ollama(args.endpoint, args.model, FINAL_SYSTEM_PROMPT, prompt, args.timeout)
             if debug:
                 debug(f"Ollama raw response: {context} attempt {attempt + 1}", raw)
             return parse_json(raw, debug=debug, context=f"{context} attempt {attempt + 1}", audit_warnings=audit_warnings)
@@ -257,7 +263,7 @@ SOURCE CHUNK:
 <<<SOURCE
 {chunk}
 SOURCE>>>"""
-        data = call_json(args, prompt, f"{course} blueprint chunk {index}", debug=debug, audit_warnings=audit_warnings)
+        data = call_json(args, prompt, f"{course} blueprint chunk {index}", debug=debug, audit_warnings=audit_warnings, output_tokens=1600)
         chunk_blueprints.append(data)
         print(f"BLUEPRINT {course}: chunk {index}/{len(chunks)}", flush=True)
 
@@ -271,7 +277,7 @@ SOURCE>>>"""
 
 
 def blueprint_text(blueprint: dict[str, Any], max_chars: int = 26000) -> str:
-    text = json.dumps(blueprint, ensure_ascii=False, indent=2)
+    text = json.dumps(blueprint, ensure_ascii=False, separators=(',', ':'))
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + "\n... [blueprint truncated for prompt length]"
@@ -288,7 +294,20 @@ normalize_open = generate_exams.normalize_open_items
 
 
 def mc_prompt(course: str, blueprint: dict[str, Any], source_excerpt: str, count: int, batch_index: int, existing_stems: list[str]) -> str:
-    return f"""Generate {count} very hard final-exam multiple-choice questions.
+    # Stable source/blueprint prefixes can be reused by provider prompt caches.
+    return f"""Course: {course}
+
+COURSE BLUEPRINT:
+<<<BLUEPRINT
+{blueprint_text(blueprint)}
+BLUEPRINT>>>
+
+SOURCE EXCERPT FOR THIS BATCH:
+<<<SOURCE
+{source_excerpt}
+SOURCE>>>
+
+Generate {count} very hard final-exam multiple-choice questions.
 
 Course: {course}
 Batch: {batch_index}
@@ -330,6 +349,12 @@ Return JSON only:
     }}
   ]
 }}
+"""
+
+
+def open_prompt(course: str, blueprint: dict[str, Any], source_excerpt: str, count: int, batch_index: int, existing_stems: list[str]) -> str:
+    # Stable source/blueprint prefixes can be reused by provider prompt caches.
+    return f"""Course: {course}
 
 COURSE BLUEPRINT:
 <<<BLUEPRINT
@@ -339,11 +364,9 @@ BLUEPRINT>>>
 SOURCE EXCERPT FOR THIS BATCH:
 <<<SOURCE
 {source_excerpt}
-SOURCE>>>"""
+SOURCE>>>
 
-
-def open_prompt(course: str, blueprint: dict[str, Any], source_excerpt: str, count: int, batch_index: int, existing_stems: list[str]) -> str:
-    return f"""Generate {count} very hard final-exam open-ended questions.
+Generate {count} very hard final-exam open-ended questions.
 
 Course: {course}
 Batch: {batch_index}
@@ -381,16 +404,7 @@ Return JSON only:
     }}
   ]
 }}
-
-COURSE BLUEPRINT:
-<<<BLUEPRINT
-{blueprint_text(blueprint)}
-BLUEPRINT>>>
-
-SOURCE EXCERPT FOR THIS BATCH:
-<<<SOURCE
-{source_excerpt}
-SOURCE>>>"""
+"""
 
 
 def generate_mc(
@@ -421,6 +435,7 @@ def generate_mc(
                     f"{course} MC batch {batch_index} ({count})",
                     debug=debug,
                     audit_warnings=audit_warnings,
+                    output_tokens=count * 220,
                 )
                 break
             except RuntimeError as exc:
@@ -486,6 +501,7 @@ def generate_open(
                     f"{course} open batch {batch_index} ({count})",
                     debug=debug,
                     audit_warnings=audit_warnings,
+                    output_tokens=count * 400,
                 )
                 break
             except RuntimeError as exc:
@@ -539,7 +555,7 @@ def adaptive_targets(args: argparse.Namespace, entries: list[dict[str, Any]], to
     return mc, open_count, warning
 
 
-def write_final_exam(args: argparse.Namespace, course_dir: Path, debug: DebugLogger | None = None) -> dict[str, Any] | None:
+def write_final_exam(args: argparse.Namespace, course_dir: Path, debug: DebugLogger | None = None, progress: Callable[[str], None] | None = None) -> dict[str, Any] | None:
     final_dir = course_dir / "exams" / "final-exam"
     if final_dir.exists() and not args.overwrite:
         print(f"SKIP existing final: {final_dir}", flush=True)
@@ -581,10 +597,35 @@ def write_final_exam(args: argparse.Namespace, course_dir: Path, debug: DebugLog
                 indent=2,
             ),
         )
+    if progress:
+        progress('Prüfungsplan erstellen')
     blueprint = build_blueprint(args, course, entries, aggregate, debug=debug, audit_warnings=audit_warnings)
 
-    mc_questions = generate_mc(args, course, blueprint, source_chunks, target_mc, debug=debug, audit_warnings=audit_warnings)
-    open_questions = generate_open(args, course, blueprint, source_chunks, target_open, debug=debug, audit_warnings=audit_warnings)
+    question_cancel = threading.Event()
+    mc_warnings, open_warnings = [], []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        try:
+            # Child requests share usage and sources, but can stop without canceling other exams.
+            token = runtime.CONTEXT.set(dict(runtime.CONTEXT.get() or {}, cancel_event=question_cancel))
+            try:
+                if progress:
+                    progress('MC- und offene Fragen erstellen')
+                mc_future = executor.submit(contextvars.copy_context().run, generate_mc, args, course, blueprint, source_chunks, target_mc, debug=debug, audit_warnings=mc_warnings)
+                open_future = executor.submit(contextvars.copy_context().run, generate_open, args, course, blueprint, source_chunks, target_open, debug=debug, audit_warnings=open_warnings)
+            finally:
+                runtime.CONTEXT.reset(token)
+            pending = {mc_future, open_future}
+            while pending:
+                runtime.check_cancel()
+                done, pending = concurrent.futures.wait(pending, timeout=0.1, return_when=concurrent.futures.FIRST_COMPLETED)
+                for future in done:
+                    future.result()
+        except BaseException:
+            question_cancel.set()
+            raise
+    mc_questions, open_questions = mc_future.result(), open_future.result()
+    audit_warnings.extend(mc_warnings)
+    audit_warnings.extend(open_warnings)
     if (target_mc > 0 and not mc_questions) or (target_open > 0 and not open_questions):
         raise RuntimeError(f"Final exam for {course} did not produce usable questions.")
 
@@ -642,6 +683,8 @@ def write_final_exam(args: argparse.Namespace, course_dir: Path, debug: DebugLog
     runtime.check_cancel()
     ctx = runtime.CONTEXT.get() or {}
     exam["metadata"].update({"language": ctx.get("language", "de"), "provider_id": ctx.get("profile_id"), "model": ctx.get("model", args.model), "profile_snapshot": ctx.get("profile_snapshot")})
+    if ctx.get('reasoning_effort') is not None:
+        exam['metadata']['reasoning_effort'] = ctx['reasoning_effort']
     template_dir = Path(__file__).resolve().parent / "templates"
     runtime.publish_exam(final_dir, exam, aggregate, lambda data: generate_exams.render_exam_html(template_dir, data))
     print(f"WROTE FINAL {final_dir}", flush=True)

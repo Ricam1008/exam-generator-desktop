@@ -80,6 +80,29 @@ pre { margin:12px 0; padding:16px; white-space:pre-wrap; overflow-wrap:anywhere;
 .generation-summary strong { font-size:1.05rem; }
 .generation-summary p { margin-top:10px; }
 .generation-summary button { margin:20px 16px 0 0; }
+.preparation-controls { margin-top:28px; padding-top:24px; border-top:1px solid var(--line); }
+.preparation-controls>.section-heading { margin-bottom:8px; }
+.concurrency-controls { border:0; padding:0; margin:22px 0; }
+.concurrency-controls legend { font-weight:650; margin-bottom:14px; }
+.preparation-summary { margin-top:22px; padding:20px; background:#f5f8f6; border:1px solid var(--line); border-radius:8px; }
+.preparation-summary>p,.preparation-summary>details { margin-top:12px; }
+.material-statistics { display:grid; grid-template-columns:repeat(auto-fit,minmax(125px,1fr)); gap:16px; margin:20px 0; }
+.material-statistics dt { color:var(--muted); font-size:.85rem; }
+.material-statistics dd { margin:3px 0 0; font-weight:650; font-variant-numeric:tabular-nums; }
+.preparation-estimate { margin:22px 0 16px; }
+.preparation-estimate .muted { font-size:.85rem; margin-top:6px; }
+.preparation-pending { margin:18px 0; color:var(--muted); }
+.suitability { margin-top:20px; }
+.suitability h4 { font-size:1rem; margin:0; }
+.planned-exams { padding-left:20px; }
+.planned-exams>li { margin:14px 0; overflow-wrap:anywhere; }
+.planned-exams>li>span { display:block; color:var(--muted); font-size:.88rem; margin:4px 0; }
+.planned-exams ul { padding-left:20px; font-size:.87rem; }
+.calibration-controls { margin-top:22px; }
+.calibration-controls>p { margin:10px 0; }
+.calibration-controls>button { margin-top:10px; }
+.sample-review { margin-top:20px; }
+.sample-review h4 { margin:18px 0 8px; }
 .library-list { list-style:none; padding:0; margin:0; }
 .library-list li { display:flex; justify-content:space-between; align-items:center; gap:24px; padding:22px 0; border-top:1px solid var(--line); }
 .library-list h3 { overflow-wrap:anywhere; }

@@ -132,7 +132,7 @@ class Handler(BaseHTTPRequestHandler):
             elif path == '/api/models':
                 data = {'models': providers.list_models(payload.get('profile_id', 'ollama'))}
             elif path == '/api/test-model':
-                data = providers.test_profile(payload.get('profile_id', 'ollama'), payload.get('model'))
+                data = providers.test_profile(payload.get('profile_id', 'ollama'), payload.get('model'), payload.get('reasoning_effort', providers.DEFAULT_REASONING_EFFORT))
             elif path == '/api/oauth/start':
                 data = oauth.start('chatgpt')
                 data['url'] = data.get('authorization_url')
@@ -149,6 +149,10 @@ class Handler(BaseHTTPRequestHandler):
                 data = documents.extract_document(Path(source['path']), cache, mode=payload.get('mode', 'auto'))
             elif path == '/api/generate':
                 data = {'job_id': cli.start_job(payload).id}
+            elif path == '/api/preflight':
+                data = {'job_id': cli.start_job(payload, 'preflight').id}
+            elif path == '/api/calibrate':
+                data = {'job_id': cli.start_job(payload, 'calibration').id}
             elif path.startswith('/api/jobs/') and path.endswith('/cancel'):
                 key = path[len('/api/jobs/'):-len('/cancel')]
                 job = cli.STATE.jobs.get(key)
@@ -274,7 +278,8 @@ class Handler(BaseHTTPRequestHandler):
                 prompt = local_server.TUTOR_EVALUATOR_SYSTEM_PROMPT
                 if metadata.get('language') == 'en':
                     prompt += '\nOUTPUT REQUIREMENT: Return all feedback in English.'
-                result = providers.complete(profile_id, model, [{'role': 'system', 'content': prompt}, {'role': 'user', 'content': local_server.build_user_prompt(body)}], timeout=180, temperature=0, profile_snapshot=None if grading_override else metadata.get('profile_snapshot'))
+                effort = providers.DEFAULT_REASONING_EFFORT if grading_override else metadata.get('reasoning_effort', providers.DEFAULT_REASONING_EFFORT)
+                result = providers.complete(profile_id, model, [{'role': 'system', 'content': prompt}, {'role': 'user', 'content': local_server.build_user_prompt(body)}], timeout=180, temperature=0, profile_snapshot=None if grading_override else metadata.get('profile_snapshot'), reasoning_effort=effort)
                 if result.finish_reason in {'length', 'incomplete', 'max_tokens'}:
                     raise ValueError('Bewertung wurde abgeschnitten. Bitte erneut versuchen.')
                 data = local_server.normalize_grading_result(local_server.extract_json_object(result.text))

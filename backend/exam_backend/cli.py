@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import contextvars
 import copy
 import hashlib
 import os
@@ -29,7 +31,7 @@ from urllib import error, parse, request
 PACKAGE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(PACKAGE_DIR))
 
-from exam_backend import generate_exams, generate_final_exams, local_server, runtime, providers
+from exam_backend import generate_exams, generate_final_exams, local_server, runtime, providers, planning
 
 if __name__ == "__main__":
     sys.modules["exam_backend.cli"] = sys.modules[__name__]
@@ -64,6 +66,8 @@ class Job:
     log_url: str | None = None
     cancel_requested: bool = False
     diagnostics: bool = False
+    workload: dict | None = None
+    estimate: dict | None = None
 
 
 class State:
@@ -75,6 +79,7 @@ class State:
         self.events: dict[str, threading.Event] = {}
         self.workers: dict[str, threading.Thread] = {}
         self.workspaces: dict[str, dict] = {}
+        self.analyses: dict[str, dict] = {}
         self.preview_tokens: dict[str, dict] = {}
         self.token = secrets.token_urlsafe(32)
         self.port = 8766
@@ -144,12 +149,13 @@ def append_job_log_file(job: Job, text: str) -> None:
 
 
 def job_log(job: Job, message: str) -> None:
-    job.updated_at = now_iso()
-    stamp = dt.datetime.now().strftime("%H:%M:%S")
-    line = f"{stamp} {redact_log(message)}"
-    job.logs.append(line)
-    job.logs[:] = job.logs[-200:]
-    append_job_log_file(job, f"{line}\n")
+    with STATE.lock:
+        job.updated_at = now_iso()
+        stamp = dt.datetime.now().strftime("%H:%M:%S")
+        line = f"{stamp} {redact_log(message)}"
+        job.logs.append(line)
+        job.logs[:] = job.logs[-200:]
+        append_job_log_file(job, f"{line}\n")
 
 
 def redact_log(text: str) -> str:
@@ -162,7 +168,8 @@ def job_debug(job: Job, title: str, content: str) -> None:
         return
     content = redact_log(content)
     stamp = dt.datetime.now().astimezone().isoformat(timespec="seconds")
-    append_job_log_file(job, f"\n--- {stamp} {title} ---\n{content}\n--- END {title} ---\n")
+    with STATE.lock:
+        append_job_log_file(job, f"\n--- {stamp} {title} ---\n{content}\n--- END {title} ---\n")
 
 
 def text_response(handler: BaseHTTPRequestHandler, status: int, body: str) -> None:
@@ -594,6 +601,12 @@ def scan_documents(payload):
 
 
 def generation_options(payload):
+    planning.request_limits(payload)
+    if 'reasoning_effort' in payload:
+        try:
+            providers.validate_reasoning_effort(payload['reasoning_effort'])
+        except providers.ProviderError as exc:
+            raise ValueError(str(exc)) from exc
     extraction_modes = payload.get('extraction_modes', {})
     assignments = payload.get('course_assignments', {})
     if not isinstance(extraction_modes, dict) or any(not isinstance(k, str) or v not in {'auto', 'ocr'} for k, v in extraction_modes.items()):
@@ -619,19 +632,19 @@ def generation_options(payload):
     return result
 
 
-def start_job(payload):
+def start_job(payload, activity='generation'):
     snapshot = copy.deepcopy(payload)
     generation_options(snapshot)
+    with STATE.lock:
+        if any(j.status in {'running', 'stopping'} for j in STATE.jobs.values()):
+            raise ValueError('Ein Auftrag läuft bereits. Bitte warten oder stoppen.')
     # Reject overlap before creating a log, workspace, or permission probe.
-    ensure_separate_output(snapshot.get('input_path', ''), snapshot.get('output_path') or str(DEFAULT_OUTPUT_DIR))
-    scan = scan_documents(snapshot)
-    selected = snapshot.get('source_ids')
-    if not isinstance(selected, list) or not selected or any(not isinstance(x, str) for x in selected):
-        raise ValueError('Bitte mindestens ein Dokument auswählen.')
-    known = {s['id'] for s in scan['sources']}
-    if not set(selected) <= known:
-        raise ValueError('Die Materialauswahl hat sich geändert. Bitte erneut einlesen.')
-    snapshot['_sources'] = [s for s in scan['sources'] if s['id'] in selected]
+    if activity != 'calibration':
+        ensure_separate_output(snapshot.get('input_path', ''), snapshot.get('output_path') or str(DEFAULT_OUTPUT_DIR))
+        scan = scan_documents(snapshot)
+        if not snapshot.get('source_ids'):
+            raise ValueError('Bitte mindestens ein Dokument auswählen.')
+        snapshot['_sources'] = planning.selected_sources(scan['sources'], snapshot)
     from . import providers
     profiles = providers.list_profiles()
     profile = next((p for p in profiles if p['id'] == snapshot.get('profile_id', 'ollama')), None)
@@ -645,7 +658,7 @@ def start_job(payload):
     with STATE.lock:
         if any(j.status in {'running', 'stopping'} for j in STATE.jobs.values()):
             raise ValueError('Ein Auftrag läuft bereits. Bitte warten oder stoppen.')
-        job = Job(id=uuid.uuid4().hex, kind=snapshot.get('mode', 'example'), diagnostics=snapshot.get('diagnostics') is True)
+        job = Job(id=uuid.uuid4().hex, kind=snapshot.get('mode', 'example') if activity == 'generation' else activity, diagnostics=snapshot.get('diagnostics') is True)
         STATE.jobs[job.id] = job
         STATE.events[job.id] = threading.Event()
         for key in list(STATE.jobs)[:-40]:
@@ -653,10 +666,148 @@ def start_job(payload):
                 STATE.jobs.pop(key, None)
                 STATE.events.pop(key, None)
                 STATE.workers.pop(key, None)
-        worker = threading.Thread(target=run_generation, args=(job, snapshot), daemon=True)
+        worker = threading.Thread(target={'generation': run_generation, 'preflight': run_preflight, 'calibration': run_calibration}[activity], args=(job, snapshot), daemon=True)
         STATE.workers[job.id] = worker
         worker.start()
     return job
+
+
+def run_preflight(job, payload):
+    from . import documents, model_checks
+    event = STATE.events.setdefault(job.id, threading.Event())
+    try:
+        options = generation_options(payload)
+        sources = planning.selected_sources(payload.get('_sources') or scan_documents(payload)['sources'], payload)
+        if not sources:
+            raise ValueError('Bitte Material auswählen.')
+        ensure_separate_output(payload['input_path'], payload.get('output_path') or str(DEFAULT_OUTPUT_DIR))
+        _, destination = planning.workspace(payload)
+        manifest = planning.manifest_at(destination)
+        settings = planning.content_settings(payload, options)
+        signature = hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()
+        profile = payload.get('profile_snapshot') or providers.get_profile(settings['profile_id'])
+        job.message = 'Modellmetadaten prüfen (keine KI-Anfrage)'
+        execution = model_checks.probe(profile, settings['model'], payload.get('location_override', 'auto'))
+        benchmark = load_calibration(payload, execution)
+        limits = planning.request_limits(payload, execution, benchmark)
+        extracted, descriptions = [], []
+        started = time.perf_counter()
+        with runtime.generation_context(cancel_event=event):
+            for index, source in enumerate(sources):
+                runtime.check_cancel()
+                course = payload.get('course_assignments', {}).get(source['id'], source['course'])
+                description = {k: source[k] for k in ('id', 'name', 'relative_path', 'fingerprint', 'size_bytes') if k in source}
+                description.update(course=course, words=0, characters=0, warnings=[])
+                job.message = f'Material analysieren: {source["name"]}'
+                job_log(job, job.message)
+                job.progress = int(index / len(sources) * 85)
+                try:
+                    if generate_exams.pdf_file_hash(Path(source['path'])) != source['fingerprint']:
+                        raise ValueError('Datei geändert. Bitte erneut einlesen.')
+                    doc = documents.extract_document(source['path'], providers.settings_dir() / 'extraction-cache', cancel_event=event, mode=payload.get('extraction_modes', {}).get(source['id'], 'auto'))
+                    runtime.check_cancel()
+                    course_dir = destination / (slugify(course) + '--' + hashlib.sha256(course.encode()).hexdigest()[:8])
+                    synthetic = course_dir / ('source-' + source['id'] + Path(source['name']).suffix.lower())
+                    extracted.append((source, doc, course_dir, synthetic))
+                    description.update(words=generate_exams.count_words(doc['text']), characters=len(doc['text']), metadata=doc.get('metadata', {}), warnings=doc.get('warnings', []), method=doc.get('method'), cache_hit=doc.get('cache_hit'))
+                except runtime.Canceled:
+                    raise
+                except Exception as exc:
+                    if event.is_set():
+                        raise runtime.Canceled() from exc
+                    description.update(failed=True, metadata=documents.profile_document(source['path'], event), warnings=[str(exc)])
+                descriptions.append(description)
+                description['size_bytes'] = description.get('metadata', {}).get('size_bytes', source.get('size_bytes', 0))
+                description['warnings'] = list(dict.fromkeys(description['warnings'] + description.get('metadata', {}).get('warnings', [])))
+            exams = planning.describe_tasks(extracted, options, signature, manifest, destination, payload)
+            all_groups = {payload.get('course_assignments', {}).get(s['id'], s['course']) if options['mode'] == 'finals' else s['id'] for s in sources}
+            valid = len(exams)
+            ready_groups = {exam['course'] if options['mode'] == 'finals' else exam['key'] for exam in exams}
+            for missing in sorted(all_groups - ready_groups):
+                affected = [s for s in sources if (payload.get('course_assignments', {}).get(s['id'], s['course']) if options['mode'] == 'finals' else s['id']) == missing]
+                exams.append({'key': 'unavailable:' + missing, 'course': payload.get('course_assignments', {}).get(affected[0]['id'], affected[0]['course']), 'sources': [{k: s[k] for k in ('id', 'name', 'relative_path')} for s in affected], 'available': False, 'reused': False, 'target_mc': 0, 'target_open': 0, 'nominal_calls': 0, 'phases': []})
+            fit_checks = [model_checks.check_context(execution, n['prompt_chars'], n['output_tokens']) for e in exams if not e['reused'] for n in e['phases']]
+            incompatible = any(c['ok'] is False for c in fit_checks)
+            key = planning.metrics_key(payload, execution, limits[1], limits[0])
+            history = planning.load_measurements(key)
+            known_phases = {r.get('phase') for r in history if r.get('status') == 'response' and r.get('exam_status') == 'generated'}
+            history += [r for r in planning.calibration_measurements(benchmark, limits[1]) if r['phase'] not in known_phases]
+            suitability = dict(benchmark or {'status': 'untested', 'sample_count': 0, 'checks': []})
+            suitability['checks'] = list(suitability.get('checks', [])) + [{'id': 'context', 'name': 'Kontext', 'ok': False if incompatible else None, 'detail': 'Vorläufiger Tokenbedarf mit Ausgabereserve geschätzt. Blueprint und frühere Fragen sind vorab unbekannt; der tatsächliche Prompt wird vor jeder KI-Anfrage erneut geprüft.'}]
+            if incompatible:
+                suitability['status'] = 'unsuitable'
+            reused = sum(e['reused'] for e in exams)
+            result = {'analysis_id': job.id, 'input_signature': planning.input_signature(payload, sources, options), 'material': planning.material_summary(descriptions), 'exams': exams, 'counts': {'planned': len(all_groups), 'valid': valid, 'new': valid - reused, 'reused': reused, 'unavailable': len(all_groups) - valid}, 'execution': execution, 'recommendation': planning.recommendation(execution, benchmark), 'estimate': planning.estimate(exams, history, *limits), 'suitability': suitability, 'warnings': execution.get('warnings', []) + (['Der Modellkontext reicht für diese Konfiguration voraussichtlich nicht aus. Fragen oder Material reduzieren.'] if incompatible else []), 'extraction_seconds': round(time.perf_counter() - started, 3)}
+            result['estimate']['extraction_seconds'] = result['extraction_seconds']
+            runtime.check_cancel()
+            with STATE.lock:
+                runtime.check_cancel()
+                STATE.analyses[job.id] = result
+                for old in list(STATE.analyses)[:-20]:
+                    STATE.analyses.pop(old, None)
+            job.result, job.status, job.progress, job.message = result, 'done', 100, 'Materialanalyse abgeschlossen'
+    except runtime.Canceled:
+        job.status, job.message = 'canceled', 'Analyse gestoppt'
+    except (Exception, runtime.ProviderFailure) as exc:
+        job.status, job.error, job.message = ('canceled' if event.is_set() else 'error'), str(exc), 'Analyse nicht abgeschlossen'
+    finally:
+        job.updated_at = now_iso()
+
+
+def calibration_path(payload, execution):
+    return providers.settings_dir() / 'calibrations' / (planning.digest({'model_identity': execution['model_identity'], 'version': planning.VERSION, 'reasoning_effort': planning.deepseek_effort(payload)}) + '.json')
+
+
+def load_calibration(payload, execution):
+    try:
+        data = json.loads(calibration_path(payload, execution).read_text(encoding='utf-8'))
+        if not isinstance(data, dict):
+            return None
+        data['timing_applicable'] = payload.get('language', 'de') == data.get('language', 'de')
+        if payload.get('language', 'de') != data.get('language', 'de') or payload.get('difficulty', 'balanced') != data.get('difficulty', 'balanced'):
+            data.update(status='limited', checks=list(data.get('checks', [])) + [{'name': 'Gültigkeit der Stichprobe', 'ok': None, 'detail': 'Die Stichprobe prüft deutsche Fakten- und Rechenaufgaben. Andere Sprachen und höhere Schwierigkeit wurden damit nicht bestätigt.'}])
+        return data
+    except (OSError, ValueError):
+        return None
+
+
+def run_calibration(job, payload):
+    from . import model_checks
+    event = STATE.events.setdefault(job.id, threading.Event())
+    try:
+        compare = payload.get('compare_concurrency', False)
+        if type(compare) is not bool:
+            raise ValueError('Parallelvergleich muss wahr oder falsch sein.')
+        profile = payload.get('profile_snapshot') or providers.get_profile(payload.get('profile_id', 'ollama'))
+        execution = model_checks.probe(profile, payload['model'], payload.get('location_override', 'auto'))
+        def progress(message):
+            job.message = message
+            job_log(job, message)
+        result = model_checks.calibrate(profile, payload['model'], event, execution, progress=progress, compare_concurrency=compare, reasoning_effort=planning.deepseek_effort(payload))
+        result.update(language='de', difficulty='balanced', measured_at=now_iso(), reasoning_effort=planning.deepseek_effort(payload))
+        if event.is_set():
+            raise runtime.Canceled()
+        after = model_checks.probe(profile, payload['model'], payload.get('location_override', 'auto'))
+        if all(after.get(k) == execution.get(k) for k in ('digest', 'quantization', 'location', 'maximum_context_length')):
+            # A first sample may load the model and reveal its configured context.
+            execution = after
+            result['model_identity'] = after['model_identity']
+        else:
+            result.update(status='limited', timing_applicable=False)
+            result['checks'].append({'name': 'Modellkonfiguration', 'ok': False, 'detail': 'Modellmetadaten änderten sich während der Stichprobe. Bitte erneut prüfen.'})
+        if event.is_set():
+            raise runtime.Canceled()
+        try:
+            runtime.atomic_json(calibration_path(payload, execution), result)
+        except OSError:
+            job_log(job, 'Modellstichprobe konnte nicht für spätere Läufe gespeichert werden.')
+        job.result, job.status, job.progress, job.message = {'execution': execution, 'suitability': result, 'sample': result.get('sample')}, 'done', 100, 'Modellstichprobe abgeschlossen; Fragen bitte prüfen'
+    except runtime.Canceled:
+        job.status, job.message = 'canceled', 'Modellstichprobe gestoppt'
+    except (Exception, runtime.ProviderFailure) as exc:
+        job.status, job.error, job.message = ('canceled' if event.is_set() else 'error'), str(exc), 'Modellstichprobe nicht abgeschlossen'
+    finally:
+        job.updated_at = now_iso()
 
 
 def run_generation(job: Job, payload: dict[str, Any]) -> None:
@@ -664,6 +815,9 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
     staging = None
     event = STATE.events.setdefault(job.id, threading.Event())
     started = time.perf_counter()
+    context = None
+    measurement_key = None
+    task_status = {}
     try:
         input_path = payload.get('input_path')
         if not input_path:
@@ -671,13 +825,26 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
         output = Path(payload.get('output_path') or DEFAULT_OUTPUT_DIR).expanduser().resolve()
         ensure_separate_output(input_path, str(output))
         options = generation_options(payload)
-        sources = payload.get('_sources') or scan_documents(payload)['sources']
-        if 'source_ids' in payload:
-            sources = [s for s in sources if s['id'] in payload['source_ids']]
-        if options['mode'] == 'example':
-            sources = sources[:1]
+        sources = planning.selected_sources(payload.get('_sources') or scan_documents(payload)['sources'], payload)
         if not sources:
             raise ValueError('Keine ausgewählten Dokumente gefunden.')
+        analysis = STATE.analyses.get(payload.get('analysis_id')) if payload.get('analysis_id') else None
+        if payload.get('analysis_id') and (not analysis or analysis['input_signature'] != planning.input_signature(payload, sources, options)):
+            raise ValueError('Die Vorbereitung ist nicht mehr aktuell. Bitte erneut analysieren.')
+        profile = payload.get('profile_snapshot') or next((p for p in providers.DEFAULT_PROFILES if p['id'] == payload.get('profile_id', 'ollama')), {})
+        execution = analysis['execution'] if analysis else {'location': 'cloud' if profile.get('kind') in {'deepseek', 'chatgpt'} else payload.get('location_override', 'unknown'), 'model_identity': payload.get('model'), 'context_length': None}
+        if not analysis and payload.get('profile_snapshot') and profile.get('base_url'):
+            from . import model_checks
+            execution = model_checks.probe(profile, payload.get('model') or DEFAULT_MODEL, payload.get('location_override', 'auto'))
+        if analysis:
+            from . import model_checks
+            current_execution = model_checks.probe(profile, payload.get('model') or DEFAULT_MODEL, payload.get('location_override', 'auto'))
+            if current_execution['model_identity'] != execution['model_identity']:
+                raise ValueError('Die Modellkonfiguration hat sich geändert. Bitte erneut analysieren.')
+        benchmark = load_calibration(payload, execution)
+        exam_slots, request_slots = planning.request_limits(payload, execution, benchmark)
+        measurement_key = planning.metrics_key(payload, execution, request_slots, exam_slots)
+        history_records = planning.load_measurements(measurement_key)
         src_root = Path(input_path).expanduser().resolve()
         workspace_id = hashlib.sha256((str(src_root) + '\0' + str(output)).encode()).hexdigest()[:16]
         destination = output / f'{slugify(src_root.name)}--{workspace_id}'
@@ -692,7 +859,7 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
         attach_job_log_path(job, generation_log_path(job, staging))
         model = payload.get('model') or DEFAULT_MODEL
         profile_id = payload.get('profile_id') or 'ollama'
-        settings = dict(options, profile_id=profile_id, model=model, profile_snapshot=payload.get('profile_snapshot'), extraction_modes=payload.get('extraction_modes', {}))
+        settings = planning.content_settings(payload, options)
         signature = hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()
         manifest_path = staging / 'workspace.json'
         try:
@@ -701,7 +868,7 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
             manifest = {'version': 2, 'id': workspace_id, 'name': src_root.name, 'sources': {}, 'exams': {}}
         summary = {'generated': [], 'reused': [], 'skipped': [], 'failed': []}
         extracted = []
-        with runtime.generation_context(profile_id=profile_id, model=model, cancel_event=event, language=options['language'], difficulty=options['difficulty'], profile_snapshot=payload.get('profile_snapshot')) as context:
+        with runtime.generation_context(profile_id=profile_id, model=model, cancel_event=event, language=options['language'], difficulty=options['difficulty'], profile_snapshot=payload.get('profile_snapshot'), request_limit=request_slots, context_length=execution.get('context_length'), reasoning_effort=planning.deepseek_effort(payload)) as context:
             for index, source in enumerate(sources):
                 runtime.check_cancel()
                 job.message = f'Material aufbereiten: {source["name"]}'
@@ -711,7 +878,7 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
                     # A scan is a snapshot, not permission to substitute changed content.
                     if generate_exams.pdf_file_hash(Path(source['path'])) != source['fingerprint']:
                         raise ValueError('Datei wurde seit dem Einlesen geändert. Bitte erneut einlesen.')
-                    doc = documents.extract_document(Path(source['path']), staging / '.exam-generator-cache', cancel_event=event, mode=payload.get('extraction_modes', {}).get(source['id'], 'auto'))
+                    doc = documents.extract_document(Path(source['path']), providers.settings_dir() / 'extraction-cache', cancel_event=event, mode=payload.get('extraction_modes', {}).get(source['id'], 'auto'))
                     runtime.check_cancel()
                     doc.update({k: source[k] for k in ('id', 'name', 'fingerprint', 'path')})
                     course = payload.get('course_assignments', {}).get(source['id'], source['course'])
@@ -731,72 +898,117 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
                     job_log(job, f'{source["name"]}: {exc}')
             if not extracted:
                 raise ValueError('Kein Dokument konnte aufbereitet werden. Bitte die Materialhinweise prüfen.')
-            tasks = []
-            if options['mode'] == 'finals':
-                groups = {}
-                for item in extracted:
-                    groups.setdefault(item[2], []).append(item)
-                for course_dir, items in groups.items():
-                    tasks.append((course_dir, items))
-            else:
-                tasks = [(item[2], [item]) for item in extracted]
-            for index, (course_dir, items) in enumerate(tasks):
+            tasks = planning.task_groups(extracted, options['mode'])
+            exam_descriptions = planning.describe_tasks(extracted, options, signature, manifest, staging, payload)
+            context['output_reserve'] = max((n['output_tokens'] for e in exam_descriptions for n in e['phases']), default=2000)
+            if analysis and any(c.get('id') == 'context' and c.get('ok') is False for c in analysis['suitability']['checks']):
+                raise ValueError('Der Modellkontext passt nicht zur Vorbereitung. Fragen oder Material reduzieren und erneut analysieren.')
+            def generate_task(course_dir, items):
                 runtime.check_cancel()
-                source, doc, _, synthetic = items[0]
-                key = ('final:' + course_dir.name) if options['mode'] == 'finals' else source['id']
-                fingerprint = hashlib.sha256(''.join(item[0]['fingerprint'] + hashlib.sha256(item[1]['text'].encode()).hexdigest() for item in items).encode()).hexdigest()
+                source, _, _, synthetic = items[0]
+                key, fingerprint, exam_dir = planning.exam_record(course_dir, items, options['mode'], signature)
                 entry = manifest['exams'].get(key, {})
-                exam_dir = course_dir / 'exams' / ('final-exam' if options['mode'] == 'finals' else synthetic.stem)
-                if entry.get('fingerprint') == fingerprint and entry.get('settings') == signature and (exam_dir / 'exam.json').exists() and not payload.get('overwrite'):
-                    summary['reused'].append(source['name'] if options['mode'] != 'finals' else course_dir.name)
-                    continue
-                job.message = f'Prüfung erstellen: {source["name"] if options["mode"] != "finals" else course_dir.name}'
-                job.progress = 25 + int(index / len(tasks) * 65)
-                job_log(job, job.message)
-                try:
-                    if options['mode'] == 'finals':
-                        args = final_args(staging, overwrite=True, model=model)
-                        args.course_label = manifest['sources'][source['id']]['course']
-                        if options['target_mode'] == 'manual':
-                            args.target_mc, args.target_open = options['target_mc'], options['target_open']
-                        args.source_entries = [dict(source_pdf=item[0]['name'], exam_folder=item[0]['id'], text=item[1]['text'], words=generate_exams.count_words(item[1]['text']), warning=' '.join(item[1].get('warnings', [])) or None, pages_total=item[1].get('page_count') or 0, visuals_detected=0) for item in items]
-                        result = generate_final_exams.write_final_exam(args, course_dir, debug=(lambda t, c: job_debug(job, t, c)) if job.diagnostics else None)
-                    else:
-                        args = generator_args(staging, overwrite=True, example=options['mode'] == 'example', model=model)
-                        args.coverage_mode = options['coverage_mode']
-                        args.target_mode = options['target_mode']
-                        args.target_mc, args.target_open = options.get('target_mc'), options.get('target_open')
-                        result = generate_exams.write_exam_folder(synthetic, staging, args, PACKAGE_DIR / 'templates', progress=lambda m: job_log(job, m), debug=(lambda t, c: job_debug(job, t, c)) if job.diagnostics else None)
+                if planning.is_reused(entry, fingerprint, signature, exam_dir, payload.get('overwrite')):
+                    return key, None
+                label = source['name'] if options['mode'] != 'finals' else course_dir.name
+                debug = (lambda t, c: job_debug(job, f'{label}: {t}', c)) if job.diagnostics else None
+                progress = lambda m: job_log(job, f'{label}: {m}')
+                if options['mode'] == 'finals':
+                    args = final_args(staging, overwrite=True, model=model)
+                    args.course_label = manifest['sources'][source['id']]['course']
+                    if options['target_mode'] == 'manual':
+                        args.target_mc, args.target_open = options['target_mc'], options['target_open']
+                    args.source_entries = planning.source_entries(items)
+                    result = generate_final_exams.write_final_exam(args, course_dir, debug=debug, progress=progress)
+                else:
+                    args = generator_args(staging, overwrite=True, example=options['mode'] == 'example', model=model)
+                    args.coverage_mode = options['coverage_mode']
+                    args.target_mode = options['target_mode']
+                    args.target_mc, args.target_open = options.get('target_mc'), options.get('target_open')
+                    result = generate_exams.write_exam_folder(synthetic, staging, args, PACKAGE_DIR / 'templates', progress=progress, debug=debug)
+                runtime.check_cancel()
+                if not result:
+                    raise ValueError('Keine Prüfung erzeugt.')
+                return key, {'fingerprint': fingerprint, 'settings': signature, 'path': str(exam_dir.relative_to(staging)), 'provider_id': profile_id, 'model': model}
+
+            next_index = completed = 0
+            stop_scheduling = False
+            def run_task(course_dir, items):
+                key, _, _ = planning.exam_record(course_dir, items, options['mode'], signature)
+                with runtime.request_context(task_key=key):
+                    return generate_task(course_dir, items)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=exam_slots) as executor:
+                pending = {}
+                while pending or (next_index < len(tasks) and not stop_scheduling):
                     runtime.check_cancel()
-                    if not result:
-                        raise ValueError('Keine Prüfung erzeugt.')
-                    previous_path = entry.get('path')
-                    if isinstance(previous_path, str):
-                        previous = (staging / previous_path).resolve()
+                    while len(pending) < exam_slots and next_index < len(tasks) and not stop_scheduling:
+                        runtime.check_cancel()
+                        course_dir, items = tasks[next_index]
+                        label = items[0][0]['name'] if options['mode'] != 'finals' else course_dir.name
+                        job.message = f'Prüfung erstellen: {label}'
+                        job_log(job, job.message)
+                        future = executor.submit(contextvars.copy_context().run, run_task, course_dir, items)
+                        pending[future] = next_index
+                        next_index += 1
+                    job.workload = {'total': len(tasks), 'completed': completed, 'active': len(pending), 'queued': len(tasks) - next_index}
+                    remaining = [e for e in exam_descriptions if e['key'] not in task_status]
+                    with context['usage_lock']:
+                        current_records = [dict(r, exam_status=task_status.get(r.get('task_key'), 'active')) for r in context['observations']]
+                    job.estimate = planning.estimate(remaining, history_records + current_records, exam_slots, request_slots)
+                    done, _ = concurrent.futures.wait(pending, timeout=0.1, return_when=concurrent.futures.FIRST_COMPLETED)
+                    for future in sorted(done, key=pending.get):
+                        course_dir, items = tasks[pending.pop(future)]
+                        source = items[0][0]
+                        task_key, _, _ = planning.exam_record(course_dir, items, options['mode'], signature)
+                        label = source['name'] if options['mode'] != 'finals' else course_dir.name
                         try:
-                            relative = previous.relative_to(staging.resolve())
-                        except ValueError:
-                            raise ValueError('Ungültiger Prüfungsort im Arbeitsbereich.')
-                        if previous != exam_dir.resolve() and previous.is_dir() and len(relative.parts) == 3 and relative.parts[1] == 'exams' and not any(part.startswith('.') for part in relative.parts):
-                            history = staging / '.history'
-                            history.mkdir(exist_ok=True)
-                            os.replace(previous, history / (source['id'] + '-' + uuid.uuid4().hex))
-                    manifest['exams'][key] = {'fingerprint': fingerprint, 'settings': signature, 'path': str(exam_dir.relative_to(staging)), 'provider_id': profile_id, 'model': model}
-                    summary['generated'].append(source['name'] if options['mode'] != 'finals' else course_dir.name)
-                except runtime.Canceled:
-                    raise
-                except runtime.ProviderFailure as exc:
-                    summary['failed'].append({'name': source['name'], 'error': str(exc)})
-                    summary['skipped'].extend(item[1][0][0]['name'] for item in tasks[index + 1:])
-                    job_log(job, f'KI-Verbindung fehlgeschlagen: {exc}')
-                    break
-                except Exception as exc:
-                    summary['failed'].append({'name': source['name'], 'error': str(exc)})
-                    job_log(job, f'Prüfung fehlgeschlagen: {exc}')
+                            key, record = future.result()
+                            runtime.check_cancel()
+                            if record is None:
+                                task_status[task_key] = 'reused'
+                                summary['reused'].append(label)
+                            else:
+                                exam_dir = staging / record['path']
+                                previous_path = manifest['exams'].get(key, {}).get('path')
+                                if isinstance(previous_path, str):
+                                    previous = (staging / previous_path).resolve()
+                                    try:
+                                        relative = previous.relative_to(staging.resolve())
+                                    except ValueError:
+                                        raise ValueError('Ungültiger Prüfungsort im Arbeitsbereich.')
+                                    if previous != exam_dir.resolve() and previous.is_dir() and len(relative.parts) == 3 and relative.parts[1] == 'exams' and not any(part.startswith('.') for part in relative.parts):
+                                        history = staging / '.history'
+                                        history.mkdir(exist_ok=True)
+                                        os.replace(previous, history / (source['id'] + '-' + uuid.uuid4().hex))
+                                manifest['exams'][key] = record
+                                summary['generated'].append(label)
+                                task_status[task_key] = 'generated'
+                                job_log(job, f'Prüfung fertig: {label}')
+                        except runtime.Canceled:
+                            raise
+                        except runtime.ProviderFailure as exc:
+                            task_status[task_key] = 'failed'
+                            summary['failed'].append({'name': source['name'], 'error': str(exc)})
+                            stop_scheduling = True
+                            job_log(job, f'{label}: KI-Verbindung fehlgeschlagen: {exc}')
+                        except Exception as exc:
+                            task_status[task_key] = 'failed'
+                            summary['failed'].append({'name': source['name'], 'error': str(exc)})
+                            job_log(job, f'{label}: Prüfung fehlgeschlagen: {exc}')
+                        completed += 1
+                        job.progress = 25 + int(completed / len(tasks) * 65)
+            if stop_scheduling:
+                summary['skipped'].extend(item[1][0][0]['name'] for item in tasks[next_index:])
+            job.workload = {'total': len(tasks), 'completed': completed, 'active': 0, 'queued': 0}
+            job.estimate = planning.estimate([], [], exam_slots, request_slots)
             runtime.check_cancel()
             if not summary['generated'] and not summary['reused']:
                 raise ValueError('Keine verwendbare Prüfung erstellt. Bitte Verbindung und Material prüfen.')
             manifest.update({'updated_at': now_iso(), 'settings': settings})
+            totals = runtime.usage_summary(context['usage'])
+            totals['incomplete'] = bool(summary['failed']) or any(not isinstance(u, dict) or not u for u in context['usage'])
+            runtime.atomic_json(staging / 'usage' / f'{job.id}.json', {'model': model, 'profile_id': profile_id, 'reasoning_effort': planning.deepseek_effort(payload), 'created_at': now_iso(), 'requests_with_reported_usage': sum(isinstance(u, dict) and bool(u) for u in context['usage']), 'totals': totals})
             runtime.atomic_json(manifest_path, manifest)
             generate_exams.write_index_pages(staging)
             with STATE.lock:
@@ -813,7 +1025,7 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
                     STATE.workspaces.pop(workspace_id, None)
                     raise
                 job.log_path = str(destination / 'logs' / f'generation-{job.id}.log')
-                job.result = dict(summary, workspace_id=workspace_id, project_root=str(destination), index_url='/preview/' + workspace_id + '/exam_index.html', usage=context['usage'])
+                job.result = dict(summary, workspace_id=workspace_id, project_root=str(destination), index_url='/preview/' + workspace_id + '/exam_index.html', usage=context['usage'], usage_summary=totals)
                 job.status = 'partial' if summary['failed'] else 'done'
                 job.progress = 100
                 job.message = 'Mit Hinweisen abgeschlossen' if summary['failed'] else 'Abgeschlossen'
@@ -828,6 +1040,12 @@ def run_generation(job: Job, payload: dict[str, Any]) -> None:
         job_log(job, str(exc))
         job_debug(job, 'Traceback', traceback.format_exc())
     finally:
+        if context and measurement_key:
+            records = [dict(r, exam_status=task_status.get(r.get('task_key'), 'canceled' if job.status == 'canceled' else 'failed')) for r in context['observations']]
+            try:
+                planning.save_measurements(measurement_key, records)
+            except (OSError, ValueError):
+                job_log(job, 'Laufzeitmessungen konnten nicht gespeichert werden.')
         if staging and staging.exists():
             # Preserve logs even though incomplete exam output is discarded.
             try:

@@ -28,3 +28,14 @@ backend/*.egg-info/
 backend/sidecar-bin/
 
 .venv-*/
+
+# Installers and local generation staging
+*.app/
+*.dmg
+**/.exam-generator-cache/
+**/.exam-run-*/
+**/.exam-stage-*/
+**/.attempts/
+
+# Private operational notes
+.local-notes/

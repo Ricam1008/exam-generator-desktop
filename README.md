@@ -12,6 +12,20 @@ Die aktuelle Entwicklungsversion wird als Apple-Silicon-`.app` und `.dmg` gebaut
 4. Unter **Prüfung erstellen** Quellen, Sprache, Schwierigkeit, Abdeckung und Fragenanzahl festlegen. Zuerst eine kurze Beispielprüfung erstellen.
 5. Unter **Lernen** Prüfungen öffnen, Antworten eingeben und bei Bedarf KI-Feedback anfordern. Lernstände werden lokal gespeichert; eine geänderte Antwort verliert ihre alte Bewertung.
 
+## Vorbereitung und parallele Verarbeitung
+
+Die Generierung verarbeitet höchstens zwei Prüfungen gleichzeitig. Bei Gesamtprüfungen entstehen nach dem gemeinsamen Prüfungsplan Multiple-Choice- und offene Fragen parallel, mit insgesamt bis zu vier gleichzeitigen KI-Anfragen. Anfragelimits und Antwortzeiten des Anbieters beeinflussen die tatsächliche Beschleunigung.
+
+Vor dem Start zeigt die Vorbereitung die Anzahl geplanter Prüfungen. **Material analysieren** liest die Auswahl lokal und zeigt Seiten, Folien, Wörter, eingebettete Rasterbilder, Tabellen, Quellen pro Prüfung und Leseprobleme. Unveränderte Prüfungen werden als wiederverwendbar ausgewiesen. Bei fehlenden Messungen bleibt die Dauer ausdrücklich „noch nicht kalibriert“; vorhandene Messungen oder eine optionale synthetische Modellstichprobe liefern einen vorläufigen Zeitbereich. Cloud-Ausführung startet mit einer Empfehlung für zwei Prüfungen und vier Anfragen; lokale oder unbekannte Ausführung zunächst mit einer Prüfung und einer Anfrage. Beides lässt sich innerhalb dieser Grenzen einstellen.
+
+Die ausdrücklich gestartete **Modellstichprobe** verwendet künstliche deutsche Quelldaten, prüft bekannte Antwortschlüssel und kann den Durchsatz mit einer und zwei Anfragen vergleichen. Sie kann bei Cloud-Anbietern Kosten verursachen. Die erzeugten Fragen bleiben zur eigenen Prüfung sichtbar: gültiges JSON oder bestandene Faktenaufgaben bestätigen weder Sprachqualität noch fachlichen Anspruch. Es werden keine Modelle automatisch geladen oder gewechselt.
+
+## Denktiefe und Tokenverbrauch
+
+Für DeepSeek lässt sich unter **Prüfung erstellen → Denktiefe (DeepSeek)** zwischen **Aus, Niedrig, Hoch und Maximal** wählen. **Niedrig** ist der Standard und bleibt als persönliche Auswahl gespeichert. DeepSeek behandelt „Medium“ wie „Hoch“, daher gibt es dafür keine eigene Auswahl. Die Einstellung gilt auch für Modellstichproben; Laufzeitmessungen und Stichprobenergebnisse werden je Denktiefe getrennt. Neu erstellte Prüfungen speichern die Denktiefe für spätere Bewertungen über dieselbe Verbindung. Niedrig ist ein sparsamer Ausgangspunkt, keine bestätigte Qualitätsgleichheit mit Hoch.
+
+Stabile Quellen- und Prüfungsplan-Präfixe verbessern die Möglichkeit von Anbieter-Cache-Treffern, ohne den Quelleninhalt oder die geforderte Fragenqualität zu kürzen. Neue Läufe speichern gemeldete Eingabe-, Ausgabe-, Denk- und Cache-Tokenzahlen unter `usage/` im Arbeitsbereich. Diese Angaben sind keine Rechnung; bei Fehlern oder fehlenden Anbieterfeldern kann die Abrechnung zusätzliche Tokens enthalten.
+
 Unterstützte Eingaben: PDF, DOCX, PPTX, TXT, Markdown, PNG, JPEG, TIFF und WebP. PDF-Seiten, PowerPoint-Folien und Text-/Word-Abschnitte bleiben als Quellenstellen erhalten, soweit die Extraktion sie liefert. Word-Seitenzahlen werden nicht erfunden.
 
 ## KI-Verbindungen
@@ -91,4 +105,6 @@ Eigenständige Tests des gebündelten Dienstes:
 
 Der zweite Test verwendet einen lokalen simulierten KI-Anbieter und einen einmaligen Dummy-Schlüssel im Schlüsselbund. Er liest keine vorhandenen Zugangsdaten und löscht seinen eigenen Testeintrag wieder. Er ersetzt keinen Live-Test mit einem echten Anbieter oder ChatGPT-Konto.
 
-Aktueller Prüfstand: `docs/UPGRADE_STATUS.md`.
+Die [GitHub-Checks](.github/workflows/checks.yml) prüfen Backend und Frontend ohne echte KI-Anfragen. Native OCR und das Mac-Paket werden zusätzlich auf macOS verifiziert.
+
+Weitere Dokumentation: [Prüfstand](docs/UPGRADE_STATUS.md), [Planung und Laufzeit](docs/PREFLIGHT_PLAN.md), [Laufzeit und Kosten](docs/PERFORMANCE.md), [Sicherheitsgrenzen](docs/SAFETY.md) und [Beitragen](CONTRIBUTING.md).

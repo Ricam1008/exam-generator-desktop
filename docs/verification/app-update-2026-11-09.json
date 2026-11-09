@@ -1,0 +1,28 @@
+{
+  "verified_at": "2026-11-09T11:11:20.602505+01:00",
+  "installed_app": "/Applications/Exam Generator.app",
+  "signature_verification": "strict deep verification passed",
+  "backend_sha256": "972995bd5753aa187b909c28b47861b07ba2302ce002cc2717bcac75bcc1d586",
+  "packaged_generation": {
+    "status": "pass",
+    "checks_passed": 8,
+    "remote_ai_requests": 0,
+    "dummy_keychain_entry_removed": true
+  },
+  "packaged_documents": {
+    "ok": true,
+    "passed": 18,
+    "total": 18
+  },
+  "native_observations": [
+    "App starts with local service ready",
+    "Low thinking control visible",
+    "Preparation and concurrency controls visible",
+    "Existing exam library remained available",
+    "Keychain access and DeepSeek model discovery verified",
+    "Selected model restored to deepseek-flash and Low thinking"
+  ],
+  "paid_inference_tested": false,
+  "disk_image": "DMG bundler failed; signed app bundle installed directly",
+  "previous_app_backup_retained": true
+}

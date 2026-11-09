@@ -10,6 +10,7 @@ import importlib.metadata
 import importlib.util
 import json
 import os
+import posixpath
 import re
 import statistics
 import sys
@@ -21,7 +22,7 @@ from typing import Any
 
 SUPPORTED_EXTENSIONS = frozenset({'.pdf', '.docx', '.pptx', '.txt', '.md', '.markdown', '.png', '.jpg', '.jpeg', '.tif', '.tiff', '.webp'})
 IMAGE_EXTENSIONS = frozenset({'.png', '.jpg', '.jpeg', '.tif', '.tiff', '.webp'})
-EXTRACTOR_VERSION = 'documents-1'
+EXTRACTOR_VERSION = 'documents-2'
 MAX_SOURCE_BYTES = 512 * 1024 * 1024
 MAX_UNPACKED_BYTES = 1024 * 1024 * 1024
 MAX_IMAGE_PIXELS = 80_000_000
@@ -283,6 +284,112 @@ def _check_office_archive(path: Path) -> None:
         raise DocumentError('Das Office-Dokument ist beschädigt oder verschlüsselt. Bitte erneut als DOCX/PPTX speichern.') from exc
 
 
+def profile_document(path: str | Path, cancel_event: Any = None) -> dict[str, Any]:
+    """Count document structure without rendering images or contacting a provider."""
+    path = Path(path)
+    suffix = path.suffix.lower()
+    result = dict.fromkeys(('pages', 'slides', 'paragraphs', 'sections', 'tables', 'image_occurrences', 'unique_images'))
+    result.update(format=suffix.lstrip('.'), size_bytes=None, warnings=[])
+    check_cancel(cancel_event)
+    try:
+        result['size_bytes'] = path.stat().st_size
+        if result['size_bytes'] > MAX_SOURCE_BYTES:
+            raise DocumentError('Datei zu groß für die Materialanalyse.')
+        if suffix in {'.docx', '.pptx'}:
+            _check_office_archive(path)
+            from xml.etree import ElementTree as ET
+            with zipfile.ZipFile(path) as archive:
+                xml_bytes = 0
+                def xml(name):
+                    nonlocal xml_bytes
+                    check_cancel(cancel_event)
+                    size = archive.getinfo(name).file_size
+                    xml_bytes += size
+                    if size > 16 * 1024 * 1024 or xml_bytes > 64 * 1024 * 1024:
+                        raise DocumentError('XML-Metadaten sind zu groß für die Materialanalyse.')
+                    data = archive.read(name)
+                    if b'<!DOCTYPE' in data or b'<!ENTITY' in data or b'\x00' in data:
+                        raise DocumentError('XML-Entitäten werden in der Materialanalyse nicht verarbeitet.')
+                    return ET.fromstring(data)
+                if suffix == '.pptx':
+                    presentation = xml('ppt/presentation.xml')
+                    relations = {r.get('Id'): r.get('Target') for r in xml('ppt/_rels/presentation.xml.rels')}
+                    ids = presentation.findall('.//{http://schemas.openxmlformats.org/presentationml/2006/main}sldId')
+                    parts = [posixpath.normpath(posixpath.join('ppt', relations[item.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id')])).lstrip('/') for item in ids]
+                    result['slides'] = len(parts)
+                    paragraph_tag, table_tag = 'a:p', 'a:tbl'
+                else:
+                    parts = ['word/document.xml'] + sorted(name for name in archive.namelist() if re.fullmatch(r'word/(header|footer|footnotes|endnotes)\d*\.xml', name))
+                    paragraph_tag, table_tag = 'w:p', 'w:tbl'
+                ns = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main', 'a': 'http://schemas.openxmlformats.org/drawingml/2006/main'}
+                paragraphs = tables = pictures = sections = 0
+                images = set()
+                for part in parts:
+                    tree = xml(part)
+                    paragraphs += len(tree.findall('.//' + paragraph_tag, ns))
+                    tables += len(tree.findall('.//' + table_tag, ns))
+                    sections += len(tree.findall('.//w:sectPr', ns))
+                    relpath = posixpath.join(posixpath.dirname(part), '_rels', posixpath.basename(part) + '.rels')
+                    relations = {r.get('Id'): r.get('Target') for r in xml(relpath) if r.get('Type', '').endswith('/image')} if relpath in archive.namelist() else {}
+                    for element in tree.iter():
+                        check_cancel(cancel_event)
+                        rid = element.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed') if element.tag.endswith('}blip') else element.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id') if element.tag.endswith('}imagedata') else None
+                        if rid:
+                            pictures += 1
+                            if rid not in relations:
+                                raise DocumentError('Eine Bildverknüpfung konnte nicht zugeordnet werden.')
+                            target = posixpath.normpath(posixpath.join(posixpath.dirname(part), relations[rid])).lstrip('/')
+                            if target not in archive.namelist():
+                                raise DocumentError('Ein eingebettetes Bild fehlt im Dokument.')
+                            images.add(target)
+                result.update(paragraphs=paragraphs, tables=tables, image_occurrences=pictures, unique_images=len(images))
+                if suffix == '.docx':
+                    result['sections'] = sections
+                    result['warnings'].append('Word-Seitenzahlen sind ohne gerenderte Datei nicht bekannt. Bildvorkommen zählen Platzierungen im Dokument, nicht Wiederholungen eines Kopfzeilenbildes auf gedruckten Seiten.')
+        elif suffix == '.pdf':
+            result['warnings'].append('Bildzahlen erfassen Rasterbilder; Vektordiagramme werden nicht zuverlässig gezählt.')
+            if _installed('pdfplumber'):
+                import pdfplumber
+                with pdfplumber.open(path) as pdf:
+                    result['pages'] = len(pdf.pages)
+                    occurrences, images, unknown_identity = 0, set(), False
+                    for page in pdf.pages:
+                        check_cancel(cancel_event)
+                        for image in page.images:
+                            check_cancel(cancel_event)
+                            occurrences += 1
+                            stream = image.get('stream')
+                            identity = getattr(stream, 'objid', None)
+                            if identity is not None:
+                                images.add(identity)
+                            else:
+                                unknown_identity = True
+                    result['image_occurrences'] = occurrences
+                    result['unique_images'] = None if unknown_identity else len(images)
+            else:
+                from pypdf import PdfReader
+                reader = PdfReader(path)
+                if reader.is_encrypted:
+                    raise DocumentError('PDF ist verschlüsselt.')
+                result['pages'] = len(reader.pages)
+                result['warnings'].append('Rasterbildvorkommen konnten ohne PDF-Strukturanalyse nicht ermittelt werden.')
+        elif suffix in IMAGE_EXTENSIONS:
+            from PIL import Image
+            with Image.open(path) as image:
+                result.update(width=image.width, height=image.height, image_occurrences=1, unique_images=1, frames=getattr(image, 'n_frames', 1))
+        elif suffix in {'.txt', '.md', '.markdown'}:
+            text = path.read_text(encoding='utf-8-sig')
+            result.update(paragraphs=sum(bool(p.strip()) for p in re.split(r'\n\s*\n', text)), image_occurrences=0, unique_images=0)
+        else:
+            raise DocumentError('Dateiformat wird in der Materialanalyse nicht unterstützt.')
+        check_cancel(cancel_event)
+    except ExtractionCanceled:
+        raise
+    except Exception as exc:
+        result['warnings'].append(f'Materialbeschreibung unvollständig: {type(exc).__name__}.')
+    return result
+
+
 def _docling_office(path: Path) -> Any:
     if not _installed('docling'):
         raise DocumentError('Die Word-/PowerPoint-Werkzeuge fehlen. Bitte die App mit Dokumentwerkzeugen installieren.')
@@ -405,10 +512,13 @@ def extract_document(path: str | Path, cache_root: str | Path, cancel_event: Any
     if not blocks or not any(_usable_text(block['text']) for block in blocks):
         reason = ' '.join(warnings[:3])
         raise DocumentError('Kein nutzbarer Lerntext gefunden. Bitte Texterkennung prüfen oder eine lesbare Datei verwenden.' + (f' {reason}' if reason else ''))
+    # Do not cache a partially unreadable scan: installing OCR must make the next run retry it.
+    metadata = profile_document(source, cancel_event)
+    if suffix == '.pdf':
+        metadata['tables'] = sum(len(re.findall(r'\[TABLE page=\d+ index=\d+\]', b['text'])) for b in blocks) if _installed('pdfplumber') and not any(b['kind'] == 'ocr' for b in blocks) else None
     if file_fingerprint(source, cancel_event) != fingerprint:
         raise DocumentError('Die Quelldatei wurde während der Verarbeitung geändert. Bitte erneut starten.')
-    # Do not cache a partially unreadable scan: installing OCR must make the next run retry it.
-    payload = {'id': hashlib.sha256(str(source).encode()).hexdigest()[:20], 'path': str(source), 'name': source.name, 'format': suffix.lstrip('.'), 'fingerprint': fingerprint, 'text': _serialized_text(blocks), 'blocks': blocks, 'warnings': warnings, 'method': method, 'page_count': max((b.get('total_pages', b['locator']['index']) for b in blocks if b['locator']['kind'] == 'page'), default=None), 'cache_key': key, 'cache_hit': False}
+    payload = {'id': hashlib.sha256(str(source).encode()).hexdigest()[:20], 'path': str(source), 'name': source.name, 'format': suffix.lstrip('.'), 'fingerprint': fingerprint, 'text': _serialized_text(blocks), 'blocks': blocks, 'warnings': warnings, 'method': method, 'page_count': metadata['pages'] if metadata['pages'] is not None else max((b.get('total_pages', b['locator']['index']) for b in blocks if b['locator']['kind'] == 'page'), default=None), 'metadata': metadata, 'cache_key': key, 'cache_hit': False}
     if not warnings:
         cache.mkdir(parents=True, exist_ok=True)
         temp_name = None

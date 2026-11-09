@@ -1,5 +1,9 @@
 # Mac app upgrade — development delivery
 
+Latest update 2026-11-09: installed the new signed app bundle in `/Applications/Exam Generator.app` and reopened it. The Low-default thinking selector, material planning and concurrency controls are visible; the existing exam library remains available. The user approved Keychain access and DeepSeek model discovery succeeded. The updated backend passed 18 packaged document checks and eight simulated-generation checks, following 162 source backend tests and 11 frontend tests. No paid inference was run. A recoverable backup of the previous app was retained. DMG creation failed at the disk-image helper, so the verified app bundle was installed directly. Evidence: `docs/verification/app-update-2026-11-09.json`.
+
+The following records the earlier development delivery.
+
 Implemented in source: German four-area workflow; Ollama, DeepSeek, compatible APIs and official ChatGPT sign-in; Keychain credentials; PDF/Office/text/image extraction; native OCR; source IDs/fingerprints; atomic output replacement; cancellation; scoped previews; and saved attempts.
 
 Fresh verification: all 123 backend tests passed with normal macOS permissions, including native document tests and 18 real HTTP/subprocess integration tests. Frontend build and all four frontend tests passed. Rust check passed for the current launcher. Dependency audit reported zero findings.

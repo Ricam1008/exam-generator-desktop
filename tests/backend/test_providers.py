@@ -71,11 +71,42 @@ class ProviderTests(unittest.TestCase):
         def handler(request):
             self.assertEqual(request.headers["Authorization"], "Bearer secret-example")
             self.assertEqual(str(request.url), "https://api.deepseek.com/chat/completions")
+            body = json.loads(request.content)
+            self.assertEqual(body['thinking'], {'type': 'enabled'})
+            self.assertEqual(body['reasoning_effort'], 'low')
             return httpx.Response(200, text='data: {"choices":[{"delta":{"content":"{\\"ok\\":true}"},"finish_reason":null}]}\n\ndata: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"total_tokens":5}}\n\ndata: [DONE]\n\n')
         self.transport(handler)
         result = providers.complete("deepseek", "deepseek-flash", [{"role": "user", "content": "test"}])
         self.assertEqual(result.text, '{"ok":true}')
         self.assertEqual(result.usage["total_tokens"], 5)
+
+    def test_deepseek_thinking_choices_reach_the_actual_request(self):
+        import httpx
+        self.deepseek()
+        observed = []
+        def handler(request):
+            observed.append(json.loads(request.content))
+            return httpx.Response(200, text='data: {"choices":[{"delta":{"content":"{}"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+        self.transport(handler)
+        for effort in ('off', 'low', 'high', 'max'):
+            providers.complete('deepseek', 'deepseek-flash', [{'role': 'user', 'content': 'JSON'}], reasoning_effort=effort)
+            self.assertEqual(observed[-1]['thinking']['type'], 'disabled' if effort == 'off' else 'enabled')
+            if effort == 'off':
+                self.assertNotIn('reasoning_effort', observed[-1])
+            else:
+                self.assertEqual(observed[-1]['reasoning_effort'], effort)
+        with patch.object(providers, '_stream') as stream:
+            for invalid in ('medium', 'random', True, 1, None):
+                with self.subTest(invalid=invalid), self.assertRaises(providers.ProviderError):
+                    providers.complete('deepseek', 'deepseek-flash', [{'role': 'user', 'content': 'JSON'}], reasoning_effort=invalid)
+            stream.assert_not_called()
+
+    def test_deepseek_thinking_controls_do_not_leak_to_other_providers(self):
+        profile = {'kind': 'compatible', 'id': 'compatible', 'base_url': 'http://127.0.0.1:1234/v1'}
+        with patch.object(providers, '_credentials', return_value={}):
+            _, _, payload = providers._request(profile, 'test', [{'role': 'user', 'content': 'JSON'}], .2, reasoning_effort='max')
+        self.assertNotIn('reasoning_effort', payload)
+        self.assertNotIn('thinking', payload)
 
     def test_ollama_stream(self):
         import httpx
