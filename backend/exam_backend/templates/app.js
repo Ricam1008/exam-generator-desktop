@@ -58,8 +58,10 @@ function sourceDetails(question) {
   const meta = question._meta || {};
   const refs = asArray(meta.source_refs);
   const pages = asArray(meta.evidence_pages);
-  const reference = refs.length ? refs.map(ref => `${ref.source_name || ''} · ${ref.locator?.kind || ''} ${ref.locator?.index ?? ''}`).join(', ') : pages.length ? `${t('Seite', 'Page')} ${pages.join(', ')}` : t('Keine genaue Quellenstelle bestätigt.', 'No exact source reference confirmed.');
-  return `<details class="source-details"><summary>${t('Quelle prüfen', 'Review source')}</summary><p>${escapeHtml(reference)}</p>${meta.source_excerpt ? `<blockquote>${escapeHtml(meta.source_excerpt)}</blockquote>` : ''}</details>`;
+  const labels = { page: t('Seite', 'Page'), slide: t('Folie', 'Slide'), paragraph: t('Absatz', 'Paragraph'), section: t('Abschnitt', 'Section') };
+  const passages = refs.map(ref => `<p>${escapeHtml(ref.source_name || '')} · ${escapeHtml(labels[ref.locator?.kind] || ref.locator?.kind || '')} ${escapeHtml(ref.locator?.index ?? '')}</p>${ref.quote ? `<blockquote>${escapeHtml(ref.quote)}</blockquote>` : ''}`).join('');
+  const fallback = pages.length ? `${t('Seite', 'Page')} ${pages.join(', ')}` : t('Keine genaue Quellenstelle bestätigt.', 'No exact source reference confirmed.');
+  return `<details class="source-details"><summary>${t('Quelle prüfen', 'Review source')}</summary>${passages || `<p>${escapeHtml(fallback)}</p>`}${!refs.some(ref => ref.quote) && meta.source_excerpt ? `<blockquote>${escapeHtml(meta.source_excerpt)}</blockquote>` : ''}</details>`;
 }
 function renderExam() {
   const metadata = exam.metadata || {};

@@ -15,6 +15,17 @@ from exam_backend.cli import Job, backup_existing_project, ensure_separate_outpu
 
 
 class BackendSafetyTests(unittest.TestCase):
+    def setUp(self):
+        # These tests isolate generation/scheduling; the review transport has its own tests.
+        from unittest.mock import patch
+        from test_question_quality import approved_response
+        from exam_backend import question_quality
+        original = question_quality.review_questions
+        def review(questions, text, name, ask, warnings, existing_stems=None):
+            return original(questions, text, name, approved_response, warnings, existing_stems)
+        self.addCleanup(patch.stopall)
+        patch.object(question_quality, 'review_questions', side_effect=review).start()
+
     def test_materialize_copies_pdfs_without_touching_input(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             tmp_path = Path(temp)
@@ -518,9 +529,9 @@ class BackendSafetyTests(unittest.TestCase):
             assert result is not None
             exam = json.loads((Path(result["exam_dir"]) / "exam.json").read_text(encoding="utf-8"))
             self.assertEqual(exam["audit"]["pages_total"], 2)
-            self.assertEqual(exam["audit"]["pages_used"], [])
+            self.assertEqual(exam["audit"]["pages_used"], [1])
             self.assertEqual(exam["audit"]["pages_covered_by_chunks"], [1, 2])
-            self.assertEqual(exam["audit"]["pages_with_evidence"], [])
+            self.assertEqual(exam["audit"]["pages_with_evidence"], [1])
             self.assertEqual(exam["audit"]["chunks_processed"], 1)
             self.assertEqual(exam["multiple_choice"][0]["_meta"]["chunk_id"], "representative-001")
             self.assertTrue(any(title == "AUDIT SUMMARY: source.pdf" and "AUDIT SUMMARY" in content for title, content in events))
@@ -673,7 +684,7 @@ class BackendSafetyTests(unittest.TestCase):
         self.assertEqual(calls["merged"], 2)
         self.assertEqual(exam["coverage_notes"][0]["topic"], "Thema 1")
         self.assertEqual(exam["audit"]["pages_total"], 2)
-        self.assertEqual(exam["audit"]["pages_used"], [])
+        self.assertEqual(exam["audit"]["pages_used"], [1, 2])
         self.assertEqual(exam["audit"]["pages_covered_by_chunks"], [1, 2])
         self.assertEqual(exam["audit"]["chunks_processed"], 2)
         self.assertEqual(exam["multiple_choice"][0]["_meta"]["chunk_id"], "chunk-001")

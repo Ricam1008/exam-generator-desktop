@@ -148,6 +148,9 @@ class LoopbackServiceTests(unittest.TestCase):
         self.assertNotIn('text', job['result']['material']['documents'][0])
         def complete(*args, **kwargs):
             self.assertEqual(kwargs['reasoning_effort'], 'low')
+            if args[2][-1]['content'].startswith('QUALITY_REVIEW:'):
+                from test_question_quality import approved_response
+                return providers.ProviderResult(json.dumps(approved_response(args[2][-1]['content'])), {}, 'stop')
             return providers.ProviderResult(json.dumps({'major_topics': ['Lernen'], 'multiple_choice': [{'question': 'Was fördert Lernen?', 'explanation': 'Übung verbessert den Abruf.', 'options': [{'text': str(i), 'is_correct': i == 0} for i in range(4)]}], 'open_ended': [{'question': 'Erkläre Lernen.', 'expected_answer': 'Begriffe mit Belegen verbinden.', 'key_concepts': ['Lernen']}]}), {}, 'stop')
         payload['analysis_id'] = job['result']['analysis_id']
         with patch.object(providers, 'complete', side_effect=complete):

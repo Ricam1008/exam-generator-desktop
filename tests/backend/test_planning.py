@@ -133,7 +133,7 @@ class PlanningTests(unittest.TestCase):
     def test_small_final_does_not_assume_a_maximum_size_blueprint(self):
         args = cli.final_args(self.root)
         nodes = planning.phases('Eine kurze Quelle über Lernen.', 'finals', 1, 1, args)
-        self.assertTrue(all(n['prompt_chars'] < 6000 for n in nodes))
+        self.assertTrue(all(n['prompt_chars'] < 6000 for n in nodes if n['phase'] != 'quality_review'))
 
     def test_prompt_prefix_is_stable_and_all_evidence_is_preserved(self):
         from exam_backend import generate_final_exams as finals
@@ -146,7 +146,7 @@ class PlanningTests(unittest.TestCase):
             self.assertIn('Generate 3', two)
 
     def test_calibration_improves_provisional_estimate_and_local_recommendation(self):
-        benchmark = {'status': 'sample_passed', 'checks': [{'ok': True}], 'observations': [{'phase': 'calibration_' + phase, 'duration_seconds': 5, 'prompt_chars': 300, 'response_chars': 120, 'concurrency': 1} for phase in ('blueprint', 'mc', 'open')], 'concurrency_comparison': [{'active_requests': 1, 'valid': True, 'duration_seconds': 10}, {'active_requests': 2, 'valid': True, 'duration_seconds': 6}]}
+        benchmark = {'status': 'sample_passed', 'checks': [{'ok': True}], 'observations': [{'phase': 'calibration_' + phase, 'duration_seconds': 5, 'prompt_chars': 300, 'response_chars': 120, 'concurrency': 1} for phase in ('blueprint', 'mc', 'open', 'quality_review')], 'concurrency_comparison': [{'active_requests': 1, 'valid': True, 'duration_seconds': 10}, {'active_requests': 2, 'valid': True, 'duration_seconds': 6}]}
         records = planning.calibration_measurements(benchmark, 4)
         args = cli.final_args(self.root)
         exams = [{'key': 'x', 'available': True, 'phases': planning.phases('Kurz', 'finals', 1, 1, args)}]
