@@ -24,6 +24,14 @@ class StateDirectoryTests(unittest.TestCase):
 
 class UpgradeTests(unittest.TestCase):
     def setUp(self):
+        from test_question_quality import approved_response
+        from exam_backend import question_quality
+        original = question_quality.review_questions
+        def review(questions, text, name, ask, warnings, existing_stems=None):
+            return original(questions, text, name, approved_response, warnings, existing_stems)
+        self.review_patch = patch.object(question_quality, 'review_questions', side_effect=review)
+        self.review_patch.start()
+        self.addCleanup(self.review_patch.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.state = patch.object(cli, 'STATE', cli.State()); self.state.start()

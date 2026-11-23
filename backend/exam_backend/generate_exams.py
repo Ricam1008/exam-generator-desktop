@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 import contextvars
-from exam_backend import runtime
+from exam_backend import runtime, question_quality
 import concurrent.futures
 import datetime as dt
 import hashlib
@@ -27,7 +27,7 @@ from typing import Any, Callable
 DEFAULT_ENDPOINT = "http://localhost:11434/api/chat"
 DEFAULT_MODEL = "gemma4:31b-cloud"
 GENERATOR_VERSION = "0.1.0"
-PROMPT_VERSION = "merged-chunk-v1"
+PROMPT_VERSION = question_quality.VERSION
 MIN_WORDS_FOR_FULL_EXAM = 3000
 LOW_TEXT_WORD_THRESHOLD = 800
 MAX_PROMPT_TEXT_CHARS = 52000
@@ -182,7 +182,7 @@ Distractors must be plausible and based on common misconceptions or nearby conce
 Formula and JSON safety: prefer plain-text formula notation over LaTeX commands. If a JSON string must contain a backslash, emit it as a doubled JSON backslash.
 
 Return only valid JSON. Do not use markdown. Do not include commentary outside JSON.
-The first character must be {. The final character must be }. Do not wrap JSON in code fences."""
+The first character must be {. The final character must be }. Do not wrap JSON in code fences.""" + "\n\n" + question_quality.POLICY
 
 
 def build_generation_prompt(
@@ -203,15 +203,15 @@ Source PDF: {source_pdf}
 Text extraction warning: {warning_note}
 
 Question counts:
-- Create exactly {target_mc} multiple-choice questions if the source text supports it.
-- Create exactly {target_open} open-ended questions if the source text supports it.
+- Create up to {target_mc} multiple-choice questions if the source text supports it.
+- Create up to {target_open} open-ended questions if the source text supports it.
 - If the source text is too thin or repetitive, create fewer high-quality questions and rely on the metadata warning.
 
 Source handling:
 - Treat [TABLE ...] blocks as structured source evidence; preserve row/column relationships when creating questions.
 - If a chart, curve, or graphic is only visible visually and not described in the extracted text or table blocks, do not invent its details.
 - Return per-question _meta where possible. evidence_pages must only contain pages that directly support the question. If exact pages are unknown, use [].
-- source_excerpt should be a short source-backed phrase, formula, table row summary, or sentence where possible.
+- source_excerpt must be a verbatim supporting passage copied from the source, never a summary.
 - source_type must be one of text, formula, table, diagram, mixed, unknown. Use unknown when unsure.
 
 Multiple-choice requirements:
@@ -960,6 +960,23 @@ def source_type_from_text(text: str) -> str:
     return "unknown"
 
 
+def review_generated_questions(mc_questions, open_questions, source_text, source_name, args,
+                               progress=None, debug=None, warnings=None, timing=None, existing_stems=None):
+    warnings = warnings if warnings is not None else []
+    if progress:
+        progress("Fragen auf Lernziele und Quellenbelege prüfen")
+    combined = mc_questions + open_questions
+    def ask(prompt):
+        with runtime.request_context(phase="quality_review", output_reserve=4500):
+            return call_json_with_retries(args, prompt, f"{source_name} quality review", progress, debug, warnings, timing)
+    question_quality.review_questions(combined, source_text, source_name, ask, warnings, existing_stems)
+    if len(combined) < len(mc_questions) + len(open_questions):
+        warnings.append(f"Quality review retained {len(combined)}/{len(mc_questions) + len(open_questions)} question(s); fewer questions are preferable to unsupported content.")
+    retained = {id(question) for question in combined}
+    mc_questions[:] = [question for question in mc_questions if id(question) in retained]
+    open_questions[:] = [question for question in open_questions if id(question) in retained]
+
+
 def question_source_meta(source_text: str, chunk_id: str) -> dict[str, Any]:
     pages = source_pages_from_text(source_text)
     return {
@@ -1173,6 +1190,7 @@ def source_traceability(exam: dict[str, Any]) -> dict[str, int]:
                 with_excerpt += 1
     return {
         "questions_total": len(questions),
+        "questions_with_verified_references": sum(bool(q.get("_meta", {}).get("source_refs")) and q.get("_meta", {}).get("quality_review", {}).get("approved") is True for q in questions),
         "questions_with_evidence_pages": with_evidence,
         "questions_without_evidence_pages": len(questions) - with_evidence,
         "mc_without_evidence_pages": mc_without,
@@ -1310,6 +1328,8 @@ def apply_exam_audit(
         "skill_tags": skill_tags(exam),
         "answer_modes": answer_modes(exam),
         "source_traceability": source_traceability(exam),
+        "quality_policy": question_quality.VERSION,
+        "quality_exclusions": [w for w in audit_warnings if w.startswith("Quality excluded")],
         "question_distribution": question_distribution(exam),
         "topic_distribution": topic_distribution(exam),
         "repair_generation": repair_generation
@@ -1803,13 +1823,13 @@ Source PDF: {source_pdf}
 Chunk: {chunk_index} of {chunk_count}
 
 Internal analysis:
-- First analyze the chunk internally for exam-relevant concepts, formulas, traps, diagrams, tables, examples, and likely exam targets.
+- First identify central learning objectives and their supporting source passages. Exclude incidental details before selecting questions.
 - Do not output your analysis process.
 - Return only the final JSON object.
 
 Question counts:
-- Generate exactly {target_mc} multiple-choice questions.
-- Generate exactly {target_open} open-ended questions.
+- Generate up to {target_mc} multiple-choice questions.
+- Generate up to {target_open} open-ended questions.
 - If a count is 0, return an empty array for that section.
 
 Language requirements:
@@ -1822,7 +1842,7 @@ Source handling:
 - coverage_notes must summarize the exam-relevant coverage behind the generated questions.
 - If you generate any question, coverage_notes must contain at least one note.
 - evidence_pages in per-question _meta should include only pages that directly support the question. If exact evidence pages are unknown, use an empty array.
-- source_excerpt should be a short source-backed phrase, formula, table row summary, or sentence where possible.
+- source_excerpt must be a verbatim supporting passage copied from the source, never a summary.
 - source_type must be one of text, formula, table, diagram, mixed, unknown. Use unknown when unsure.
 - chunk_page_range is broad provenance, not exact evidence.
 
@@ -1833,7 +1853,7 @@ Multiple-choice requirements:
 - Include answer_mode: "single_correct" when exactly one option is correct, otherwise "multiple_correct".
 - Distractors must be plausible and source-adjacent.
 - Prefer a balanced exam-like mix: basic recall, conceptual traps, application questions, calculation/formula questions, and graph/table/diagram interpretation where the source supports it.
-- Useful traps include near-miss distractors, common formula mistakes, sign mistakes, confusing similar concepts, MC/TC swaps, fixed-cost/marginal-cost mistakes, Pmax via P=0 instead of Q=0, Cournot/Bertrand swaps, substitution/income-effect swaps, normal/inferior/Giffen confusion, elastic/inelastic revenue direction mistakes, monopoly P/MR/MC confusion, and graph-reading traps when supported.
+- Use misconceptions about central concepts; do not introduce unrelated subject examples or wording tricks.
 - Do not make every question hard and do not make every question a trap.
 
 Open-ended requirements:
@@ -1928,8 +1948,8 @@ Course: {course}
 Source PDF: {source_pdf}
 
 Missing counts:
-- Generate exactly {missing_mc} multiple-choice questions.
-- Generate exactly {missing_open} open-ended questions.
+- Generate up to {missing_mc} multiple-choice questions.
+- Generate up to {missing_open} open-ended questions.
 - If a count is 0, return an empty array for that section.
 
 Prefer these underrepresented topics when the source supports them:
@@ -2289,6 +2309,8 @@ def refill_missing_questions(
         new_open = normalize_open_items(first_list(data, ["open_ended", "open_ended_questions", "open_questions", "short_answer", "essay_questions"]), {question_signature(q["question"]) for q in open_questions})
         attach_question_metadata(new_mc, text, "repair-001")
         attach_question_metadata(new_open, text, "repair-001")
+        review_generated_questions(new_mc, new_open, text, source_pdf, args, progress, debug, audit_warnings, timing,
+                                   [q["question"] for q in mc_questions + open_questions])
         mc_questions.extend(new_mc[:missing_mc])
         open_questions.extend(new_open[:missing_open])
         add_seconds(timing, "validation_seconds", validation_started)
@@ -2384,6 +2406,8 @@ def generate_full_coverage_exam(
         new_open = normalize_open_items(raw_open, seen_open)
         attach_question_metadata(new_mc, chunk, chunk_id)
         attach_question_metadata(new_open, chunk, chunk_id)
+        review_generated_questions(new_mc, new_open, chunk, source_pdf, args, progress, debug, audit_warnings, timing,
+                                   [q["question"] for q in mc_questions + open_questions])
         notes = normalized_coverage_notes(data)
         coverage_notes.extend(notes)
         pages_covered_by_chunks.update(source_pages_from_text(chunk))
@@ -2636,6 +2660,17 @@ def write_exam_folder(
                     raise ValueError("Die KI hat keine Fragen der gewählten Art erzeugt.")
                 attach_question_metadata(exam["multiple_choice"], prompt_text, "representative-001")
                 attach_question_metadata(exam["open_ended"], prompt_text, "representative-001")
+                review_generated_questions(exam["multiple_choice"], exam["open_ended"], prompt_text, pdf_path.name,
+                                           args, progress, debug, audit_warnings, timing)
+                if not exam["multiple_choice"] and not exam["open_ended"]:
+                    exam = None
+                    raise ValueError("Keine fachlich geeigneten Fragen mit bestätigtem Quellenbeleg. Bitte Material prüfen.")
+                assign_question_ids(exam["multiple_choice"], exam["open_ended"])
+                exam["metadata"]["question_count"] = question_counts(exam)
+                if len(exam["multiple_choice"]) < target_mc or len(exam["open_ended"]) < target_open:
+                    warning = f"Generated {len(exam['multiple_choice'])} MC and {len(exam['open_ended'])} open questions instead of target {target_mc}/{target_open}; only suitable questions with confirmed evidence were retained."
+                    audit_warnings.append(warning)
+                    exam["metadata"]["coverage_warning"] = warning
                 exam = apply_coverage_metadata(exam, "representative", 1, 1, 0, None)
                 add_seconds(timing, "validation_seconds", validation_started)
                 exam = apply_exam_audit(exam, pdf_path.name, text, page_count, 1, 1, 0, audit_warnings, timing=timing, target_planning=target_planning)
@@ -2643,6 +2678,7 @@ def write_exam_folder(
                     progress(f"Ollama returned usable exam JSON for {pdf_path.name}")
                 break
             except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError, OSError) as exc:
+                exam = None
                 last_error = exc
                 audit_warnings.append(f"Representative attempt {attempt + 1} failed validation or parsing: {type(exc).__name__}: {exc}")
                 if debug:
@@ -2663,6 +2699,10 @@ def write_exam_folder(
         exam = heuristic_exam(course, pdf_path.name, text, extraction_warning, word_count)
         attach_question_metadata(exam["multiple_choice"], text, "heuristic-001")
         attach_question_metadata(exam["open_ended"], text, "heuristic-001")
+        review_generated_questions(exam["multiple_choice"], exam["open_ended"], text, pdf_path.name,
+                                   args, progress, debug, audit_warnings, timing)
+        if not exam["multiple_choice"] and not exam["open_ended"]:
+            raise ValueError("Keine fachlich geeigneten Fragen mit bestätigtem Quellenbeleg.")
         audit_warnings.append("Heuristic fallback exam generated after model output could not be used.")
         exam = apply_coverage_metadata(exam, "heuristic", 1, 1, 0, None)
         if target_planning is None:

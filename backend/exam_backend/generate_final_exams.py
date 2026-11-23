@@ -37,7 +37,7 @@ Questions must test deep understanding, distinctions, mechanisms, applications, 
 Avoid trivial recognition questions unless the concept is foundational.
 Distractors must be plausible and reflect nearby concepts or common misconceptions.
 
-Return valid JSON only. No markdown. No prose outside JSON."""
+Return valid JSON only. No markdown. No prose outside JSON.""" + "\n\n" + generate_exams.question_quality.POLICY
 
 
 def parse_args() -> argparse.Namespace:
@@ -257,7 +257,7 @@ Return JSON with this shape:
   ]
 }}
 
-Make the blueprint dense and useful for a very hard final exam.
+Identify central learning objectives and supporting passages. Exclude incidental numerical, bibliographic and slide-layout details; do not turn every table row into an exam target.
 
 SOURCE CHUNK:
 <<<SOURCE
@@ -307,7 +307,7 @@ SOURCE EXCERPT FOR THIS BATCH:
 {source_excerpt}
 SOURCE>>>
 
-Generate {count} very hard final-exam multiple-choice questions.
+Generate {count} or fewer high-quality final-exam multiple-choice questions.
 
 Course: {course}
 Batch: {batch_index}
@@ -322,6 +322,9 @@ These are true multiple-choice questions:
 - One, several, or all options may be correct if justified by the source.
 - Avoid single-obvious-answer patterns across the whole batch.
 - Explanations must explain why the correct and incorrect choices matter.
+
+Quality requirements:
+{generate_exams.question_quality.POLICY}
 
 Difficulty requirements:
 - Integrate concepts across lectures where possible.
@@ -366,7 +369,7 @@ SOURCE EXCERPT FOR THIS BATCH:
 {source_excerpt}
 SOURCE>>>
 
-Generate {count} very hard final-exam open-ended questions.
+Generate {count} or fewer high-quality final-exam open-ended questions.
 
 Course: {course}
 Batch: {batch_index}
@@ -376,6 +379,7 @@ Language requirements:
 - Preserve established technical terms, model names, formulas, author names, and source quotations in the original language where appropriate.
 
 Requirements:
+{generate_exams.question_quality.POLICY}
 - Questions should demand precise explanation, transfer, comparison, mechanism, interpretation, or application.
 - Avoid vague essay prompts; each question must be gradeable from the provided expected answer.
 - Include strict expected answers, key concepts, grading rubric, and max_score 100.
@@ -457,6 +461,8 @@ def generate_mc(
         raw_questions = data.get("multiple_choice")
         new_questions = normalize_mc(raw_questions, seen)
         generate_exams.attach_question_metadata(new_questions, excerpt, f"final-mc-batch-{batch_index:03d}")
+        generate_exams.review_generated_questions(new_questions, [], excerpt, course, args,
+                                                debug=debug, warnings=audit_warnings, existing_stems=stems)
         questions.extend(new_questions)
         raw_count = len(raw_questions) if isinstance(raw_questions, list) else 0
         if audit_warnings is not None and raw_count > len(new_questions):
@@ -466,7 +472,7 @@ def generate_mc(
             empty_batches += 1
         else:
             empty_batches = 0
-        if empty_batches >= 3:
+        if empty_batches >= 3 or (new_questions and len(new_questions) < count and batch_index >= len(source_chunks)):
             break
     for index, question in enumerate(questions[:target], start=1):
         question["id"] = f"final-mc-{index:03d}"
@@ -523,6 +529,8 @@ def generate_open(
         raw_questions = data.get("open_ended")
         new_questions = normalize_open(raw_questions, seen)
         generate_exams.attach_question_metadata(new_questions, excerpt, f"final-open-batch-{batch_index:03d}")
+        generate_exams.review_generated_questions([], new_questions, excerpt, course, args,
+                                                debug=debug, warnings=audit_warnings, existing_stems=stems)
         questions.extend(new_questions)
         raw_count = len(raw_questions) if isinstance(raw_questions, list) else 0
         if audit_warnings is not None and raw_count > len(new_questions):
@@ -532,7 +540,7 @@ def generate_open(
             empty_batches += 1
         else:
             empty_batches = 0
-        if empty_batches >= 3:
+        if empty_batches >= 3 or (new_questions and len(new_questions) < count and batch_index >= len(source_chunks)):
             break
     for index, question in enumerate(questions[:target], start=1):
         question["id"] = f"final-open-{index:03d}"
@@ -601,12 +609,20 @@ def write_final_exam(args: argparse.Namespace, course_dir: Path, debug: DebugLog
         progress('Prüfungsplan erstellen')
     blueprint = build_blueprint(args, course, entries, aggregate, debug=debug, audit_warnings=audit_warnings)
 
+    # Standalone finals also retain per-document provenance, even without desktop context.
+    source_documents = (runtime.CONTEXT.get() or {}).get('documents') or {
+        entry['exam_folder']: {
+            'id': entry['exam_folder'], 'name': entry['source_pdf'],
+            'blocks': [{'text': record['text'], 'locator': record['locator']}
+                       for record in generate_exams.question_quality.source_catalogue(entry['text'], entry['source_pdf'])],
+        } for entry in entries
+    }
     question_cancel = threading.Event()
     mc_warnings, open_warnings = [], []
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         try:
             # Child requests share usage and sources, but can stop without canceling other exams.
-            token = runtime.CONTEXT.set(dict(runtime.CONTEXT.get() or {}, cancel_event=question_cancel))
+            token = runtime.CONTEXT.set(dict(runtime.CONTEXT.get() or {}, cancel_event=question_cancel, documents=source_documents))
             try:
                 if progress:
                     progress('MC- und offene Fragen erstellen')

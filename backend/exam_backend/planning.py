@@ -27,7 +27,7 @@ def selected_sources(sources, payload):
 
 
 def content_settings(payload, options):
-    settings = dict(options, profile_id=payload.get('profile_id') or 'ollama', model=payload.get('model') or 'gemma4:31b-cloud', profile_snapshot=payload.get('profile_snapshot'), extraction_modes=payload.get('extraction_modes', {}))
+    settings = dict(options, quality_policy=g.PROMPT_VERSION, profile_id=payload.get('profile_id') or 'ollama', model=payload.get('model') or 'gemma4:31b-cloud', profile_snapshot=payload.get('profile_snapshot'), extraction_modes=payload.get('extraction_modes', {}))
     if (effort := deepseek_effort(payload)) is not None:
         settings['reasoning_effort'] = effort
     return settings
@@ -130,6 +130,9 @@ def phases(text, mode, mc, opened, args):
         key = str(len(nodes))
         nodes.append({'id': key, 'phase': phase, 'prompt_chars': chars, 'output_tokens': output, 'deps': deps})
         return key
+    def review_chars(excerpt, count):
+        catalogue = g.question_quality.source_catalogue(excerpt, '')
+        return len(json.dumps(catalogue, ensure_ascii=False)) + 5000 + min(6, count) * 1000
     if mode == 'finals':
         deps = []
         for chunk in finals.chunk_text(text, finals.BLUEPRINT_CHARS):
@@ -143,12 +146,19 @@ def phases(text, mode, mc, opened, args):
                 chars = len(builder('', {}, excerpt, count, index + 1, []))
                 # Blueprint size and later stems are unknown until generation; runtime checks the actual prompt.
                 previous = [add(kind, chars, count * tokens, previous)]
+                for offset in range(0, count, 6):
+                    previous = [add('quality_review', review_chars(excerpt, count - offset), 4500, previous)]
     elif mode == 'full_coverage':
         chunks = g.chunk_text(text)
         for chunk in chunks:
-            add('exam', len(chunk) + 8000, math.ceil(mc / len(chunks)) * 220 + math.ceil(opened / len(chunks)) * 400, [])
+            draft = add('exam', len(chunk) + 8000, math.ceil(mc / len(chunks)) * 220 + math.ceil(opened / len(chunks)) * 400, [])
+            previous = [draft]
+            for _ in range(math.ceil((math.ceil(mc / len(chunks)) + math.ceil(opened / len(chunks))) / 6)):
+                previous = [add('quality_review', review_chars(chunk, 6), 4500, previous)]
     else:
-        add('exam', len(g.build_generation_prompt('', '', g.chunk_for_prompt(text), mc, opened, None)), mc * 220 + opened * 400, [])
+        previous = [add('exam', len(g.build_generation_prompt('', '', g.chunk_for_prompt(text), mc, opened, None)), mc * 220 + opened * 400, [])]
+        for _ in range(math.ceil((mc + opened) / 6)):
+            previous = [add('quality_review', review_chars(g.chunk_for_prompt(text), 6), 4500, previous)]
     return nodes
 
 

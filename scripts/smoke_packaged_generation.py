@@ -66,6 +66,13 @@ def exam_answer():
 
 def response_for(messages):
     user = '\n'.join(str(item.get('content', '')) for item in messages if item.get('role') == 'user')
+    if user.startswith('QUALITY_REVIEW:'):
+        catalogue = json.loads(user.split('SOURCE CATALOGUE:\n')[1].split('\nEXISTING ACCEPTED QUESTIONS:')[0])
+        drafts = json.loads(user.split('DRAFT QUESTIONS:\n')[1])
+        return {'reviews': [dict(index=q['index'], relevant=True, supported=True,
+                                self_contained=True, unambiguous=True, non_duplicate=True,
+                                learning_objective='Explain memory and retrieval concepts', reason='Synthetic transport fixture',
+                                evidence=[{'id': catalogue[0]['id'], 'quote': catalogue[0]['text']}]) for q in drafts]}, 'quality-review'
     if 'Return exactly this JSON object:' in user:
         return {'ok': True}, 'connection-test'
     if 'Antwort der lernenden Person:' in user:
@@ -254,6 +261,8 @@ def check_counts(path):
     exam = json.loads(path.read_text(encoding='utf-8'))
     if len(exam.get('multiple_choice', [])) != 2 or len(exam.get('open_ended', [])) != 1:
         raise AssertionError('The custom2 MC/1 open targets were not preserved.')
+    if any(not q.get('_meta', {}).get('quality_review', {}).get('approved') or not q.get('_meta', {}).get('source_refs') for q in exam['multiple_choice'] + exam['open_ended']):
+        raise AssertionError('Packaged generation bypassed the evidence review.')
     if any(type(option.get('is_correct')) is not bool for question in exam['multiple_choice'] for option in question['options']):
         raise AssertionError('Generated answer keys are not strict booleans.')
     return exam
